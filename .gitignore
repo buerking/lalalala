@@ -1,0 +1,25 @@
+# 默认忽略本目录下所有内容
+*
+# 但保留 Git 自身与必要工程文件
+!.gitignore
+!main.py
+!src/
+!src/**
+!tools/
+!tools/**
+
+# tools 里驱动较大且可本机准备时，可取消下一行注释以不上传 exe
+# *.exe
+
+# 保险：即使上面误放行，也绝不提交这些
+config.yaml
+data/
+logs/
+docs/
+*.log
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.zip
+*.7z

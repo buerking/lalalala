@@ -1,0 +1,1104 @@
+# -*- coding: utf-8 -*-
+"""
+乐天书店（books.rakuten.co.jp）：多商品 → 购物车 → 结算确认 → 一键注文確定 → 注文完了。
+"""
+
+from __future__ import annotations
+
+import random
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.support.ui import WebDriverWait
+
+from src.browser.browser_manager import BrowserManager
+from src.notification.feishu_notifier import FeishuNotifier
+from src.notification.ticket_creator import TicketCreator
+from src.order.add_no_callback import send_add_no_callback
+from src.order.added_cart_callback import send_added_cart_callback
+from src.order.update_goods_no_callback import send_update_goods_no_callback
+from src.payment.confirm_page_verifier import (
+    take_full_page_screenshot,
+    upload_screenshot_get_url,
+    check_cart_goods_simple,
+)
+from src.auth.rakuten_session import RakutenLoginError, RakutenSessionGuard
+from src.utils.logger import LoggerMixin
+
+_RB_ID_RE = re.compile(r"/rb/(?P<id>\d+)", re.IGNORECASE)
+_BOOK_SHOP_ID_RE = re.compile(
+    r"item\.rakuten\.co\.jp/book/(?P<id>\d+)", re.IGNORECASE
+)
+_BOOK_SHOP_ID_ENCODED_RE = re.compile(
+    r"item\.rakuten\.co\.jp(?:/|%2[Ff])book(?:/|%2[Ff])(?P<id>\d+)",
+    re.IGNORECASE,
+)
+
+
+def extract_rakuten_book_id(url: str) -> Optional[str]:
+    """从 books.../rb/{id}、item.../book/{id} 或联盟 pc 参数中提取书店商品 ID。"""
+    if not url:
+        return None
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    candidates = [str(url).strip()]
+    try:
+        candidates.append(unquote(candidates[0]))
+    except Exception:
+        pass
+    try:
+        parsed = urlparse(candidates[0])
+        if "afl.rakuten.co.jp" in (parsed.netloc or "").lower():
+            qs = parse_qs(parsed.query)
+            for key in ("pc", "m"):
+                val = (qs.get(key) or [""])[0].strip()
+                if not val:
+                    continue
+                candidates.append(val)
+                try:
+                    candidates.append(unquote(val))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    seen = set()
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        m = _RB_ID_RE.search(c)
+        if m:
+            return m.group("id")
+        m2 = _BOOK_SHOP_ID_RE.search(c)
+        if m2:
+            return m2.group("id")
+        m3 = _BOOK_SHOP_ID_ENCODED_RE.search(c)
+        if m3:
+            return m3.group("id")
+    return None
+
+
+def normalize_rakuten_books_product_url(url: str) -> str:
+    """统一为 books.rakuten.co.jp/rb/{id}/，便于书店加购页选择器生效。"""
+    raw = (url or "").strip()
+    bid = extract_rakuten_book_id(raw)
+    if bid:
+        return "https://books.rakuten.co.jp/rb/%s/" % bid
+    return raw
+
+
+def _parse_yen_int(text: str) -> int:
+    if not text:
+        return 0
+    s = re.sub(r"[^\d]", "", str(text).strip())
+    return int(s) if s else 0
+
+
+class RakutenBooksOrderProcessor(LoggerMixin):
+    def __init__(self, config: Dict[str, Any], browser_manager: BrowserManager):
+        self.config = config
+        self.browser_manager = browser_manager
+        self.rb_cfg = config.get("rakuten_books") or {}
+        self.ticket_creator = TicketCreator(config)
+        self.feishu_notifier = FeishuNotifier(config)
+        self.session_guard = (
+            RakutenSessionGuard(browser_manager, config)
+            if RakutenSessionGuard.is_enabled(config)
+            else None
+        )
+
+    def _navigate(self, driver, url: str) -> None:
+        target = (url or "").split("#")[0]
+        BrowserManager.navigate_allow_timeout(driver, target, self.logger)
+        self._ensure_rakuten_session(resume_url=target)
+
+    def _ensure_rakuten_session(self, resume_url=None) -> None:
+        if not self.session_guard:
+            return
+        self.session_guard.ensure_logged_in(resume_url=resume_url)
+
+
+    def _random_pre_click_wait(self, action: str) -> None:
+        pay_cfg = self.config.get("payment") or {}
+        rng = self.rb_cfg.get("pre_click_wait_seconds_range") or pay_cfg.get(
+            "pre_click_wait_seconds_range", [0.7, 1.8]
+        )
+        try:
+            mn = float(rng[0])
+            mx = float(rng[1])
+        except Exception:
+            mn, mx = 0.7, 1.8
+        sec = random.uniform(min(mn, mx), max(mn, mx))
+        self.logger.info("乐天书店：关键点击前随机等待 %.2f 秒（%s）", sec, action)
+        time.sleep(sec)
+
+    def _store_name(self) -> str:
+        return (self.rb_cfg.get("store_name") or "乐天书店").strip()
+
+    def _credit_card_label(self) -> str:
+        return (self.rb_cfg.get("add_no_credit_card") or "rakuten_books").strip()
+
+    def _make_summary(
+        self,
+        order: Dict[str, Any],
+        *,
+        success: bool = False,
+        failure_reason: str = "",
+        payment_method: str = "rakuten_one_click",
+        check_cart_requested: bool = False,
+        check_cart_response: str = "未请求",
+        add_no_requested: bool = False,
+        add_no_response: str = "未请求",
+        update_errors: Optional[List[str]] = None,
+        runner_pause_requested: bool = False,
+    ) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "order_no": str(order.get("order_no") or order.get("order_id") or ""),
+            "success": success,
+            "payment_method": payment_method,
+            "failure_reason": failure_reason,
+            "check_cart_requested": check_cart_requested,
+            "check_cart_response": check_cart_response,
+            "add_no_requested": add_no_requested,
+            "add_no_response": add_no_response,
+            "update_errors": update_errors or [],
+        }
+        if runner_pause_requested:
+            d["runner_pause_requested"] = True
+        return d
+
+    def _clear_cart(self, driver) -> None:
+        cart_url = (self.rb_cfg.get("cart_url") or "").strip() or (
+            "https://books.step.rakuten.co.jp/rms/mall/book/bs/Cart"
+        )
+        self._navigate(driver, cart_url.split("#")[0])
+        time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+        # 空车常见文案，直接跳过清空
+        try:
+            src = driver.page_source or ""
+            empty_hints = (
+                "買い物かごに商品がありません",
+                "カートに商品がありません",
+                "商品が入っていません",
+            )
+            if any(h in src for h in empty_hints):
+                self.logger.info("乐天书店：购物车已为空，跳过清空")
+                return
+        except Exception:
+            pass
+        sel = (self.rb_cfg.get("clear_cart_button_css") or "button[name=basket_clear]").strip()
+        try:
+            btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+            driver.execute_script("arguments[0].click();", btn)
+            time.sleep(2)
+        except Exception as e:
+            self.logger.warning("乐天书店：清空购物车失败（可能本就为空）: %s", e)
+
+    def _add_product_to_cart(self, driver, product_url: str, quantity: int) -> None:
+        self._navigate(driver, product_url.split("?")[0].rstrip("/") + "/")
+        time.sleep(float(self.rb_cfg.get("wait_after_pdp_load_seconds", 2)))
+        units_sel = (self.rb_cfg.get("units_select_css") or "select#units").strip()
+        add_btn = (self.rb_cfg.get("add_to_cart_button_css") or "button.new_addToCart").strip()
+        try:
+            sel_el = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, units_sel))
+            )
+            Select(sel_el).select_by_value(str(max(1, min(100, int(quantity or 1)))))
+        except Exception:
+            pass
+        self._random_pre_click_wait("買い物かごに入れる")
+        btn = WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.CSS_SELECTOR, add_btn)))
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(float(self.rb_cfg.get("wait_after_add_cart_seconds", 3)))
+
+    def _is_books_confirm_page(self, driver) -> bool:
+        """是否已在注文内容の確認（可点「注文を確定する」）。"""
+        for el in driver.find_elements(
+            By.CSS_SELECTOR, "button.btn-red[name='commit_order'], button[name='commit_order']"
+        ):
+            try:
+                if el.is_displayed():
+                    return True
+            except Exception:
+                continue
+        try:
+            title = (driver.title or "").strip()
+            if "注文内容の確認" in title:
+                return True
+        except Exception:
+            pass
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            return False
+        return "注文内容の確認" in src and "name=\"commit_order\"" in src.replace("'", '"')
+
+    def _is_books_success_page(self, driver) -> bool:
+        """注文完了（step5 thankyou）页。"""
+        try:
+            title = (driver.title or "").strip()
+            if "注文完了" in title:
+                return True
+        except Exception:
+            pass
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, "div.order-number"):
+                return True
+        except Exception:
+            pass
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, "#ratOrderId")
+            if (el.get_attribute("value") or "").strip():
+                return True
+        except Exception:
+            pass
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            return False
+        success_kw = (self.rb_cfg.get("success_page_text") or "注文完了").strip()
+        markers = (
+            success_kw,
+            "ご注文ありがとうございました",
+            "step5_purchase_complete",
+            "cart__main__step5",
+            'id="ratOrderId"',
+        )
+        return any(m and m in src for m in markers)
+
+    def _extract_books_order_info(self, driver) -> Tuple[str, str]:
+        """
+        从注文完了页解析注文番号与详情 URL。
+        优先用「ご注文内容の変更・確認」/注文番号链接（含 back_number）。
+        """
+        purchase_no = ""
+        detail_url = ""
+
+        # 1) 変更・確認 按钮
+        try:
+            for el in driver.find_elements(
+                By.CSS_SELECTOR, "div.order-number a.white-btn, a.white-btn"
+            ):
+                try:
+                    txt = (el.text or "").strip()
+                    href = (el.get_attribute("href") or "").strip()
+                    if "ご注文内容の変更" in txt or "変更・確認" in txt:
+                        if href:
+                            detail_url = href
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 2) 注文番号链接文字 + href
+        num_sel = (self.rb_cfg.get("order_number_css") or "div.order-number dd a").strip()
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, num_sel)
+            purchase_no = (el.text or "").strip()
+            href = (el.get_attribute("href") or "").strip()
+            if href and not detail_url:
+                detail_url = href
+        except Exception:
+            pass
+
+        # 3) RAT / 正文兜底
+        if not purchase_no:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, "#ratOrderId")
+                purchase_no = (el.get_attribute("value") or "").strip()
+            except Exception:
+                pass
+        if not purchase_no:
+            try:
+                m = re.search(r"(\d{6}-\d{8}-\d{10})", driver.page_source or "")
+                if m:
+                    purchase_no = m.group(1)
+            except Exception:
+                pass
+
+        if detail_url:
+            detail_url = detail_url.replace("&amp;", "&")
+        return purchase_no, detail_url
+
+    def _open_books_order_detail_for_screenshot(self, driver, detail_url: str) -> None:
+        """
+        打开注文详情页再截图（用户要求：先点「ご注文内容の変更・確認」）。
+        """
+        wait_s = float(self.rb_cfg.get("wait_after_detail_load_seconds", 3))
+        clicked = False
+        try:
+            for el in driver.find_elements(
+                By.XPATH,
+                "//a[contains(@class,'white-btn') and contains(.,'ご注文内容の変更')]"
+                " | //div[contains(@class,'order-number')]//a[contains(.,'ご注文内容の変更')]"
+                " | //a[contains(.,'ご注文内容の変更・確認')]",
+            ):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    href = (el.get_attribute("href") or "").strip()
+                    self.logger.info("乐天书店：打开ご注文内容の変更・確認 %s", href or "(click)")
+                    driver.execute_script("arguments[0].click();", el)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if not clicked:
+            url = (detail_url or "").strip()
+            if not url:
+                raise RuntimeError("无注文详情 URL，无法打开変更・確認页")
+            self.logger.info("乐天书店：直连注文详情 %s", url)
+            self._navigate(driver, url)
+
+        time.sleep(max(1.0, wait_s))
+        # 等待离开完了页或出现配送/详情特征
+        deadline = time.time() + max(8.0, wait_s + 5)
+        while time.time() < deadline:
+            try:
+                url = (driver.current_url or "").lower()
+                src = driver.page_source or ""
+                if "delivery/status" in url or "mypage" in url:
+                    break
+                if "注文完了" not in (driver.title or "") and "ご注文ありがとうございました" not in src:
+                    break
+            except Exception:
+                break
+            time.sleep(0.5)
+
+    def _pass_books_checkout_intermediates(self, driver) -> None:
+        """
+        购物车「ご購入手続き」后，可能先停在「支払いと配送」等中间页。
+        自动点「次へ」类按钮直到出现注文確認页。
+        """
+        max_rounds = int(self.rb_cfg.get("checkout_intermediate_max_rounds", 3) or 3)
+        for round_idx in range(max(1, max_rounds)):
+            if self._is_books_confirm_page(driver):
+                if round_idx == 0:
+                    self.logger.debug("乐天书店：已在注文確認页")
+                else:
+                    self.logger.info("乐天书店：已进入注文確認页")
+                return
+
+            next_btn = None
+            # 优先：文案为「次へ」/进入确认
+            xpaths = (
+                "//button[normalize-space(.)='次へ' or contains(normalize-space(.),'次へ')]",
+                "//input[@type='submit' and (contains(@value,'次へ') or contains(@value,'確認'))]",
+                "//a[normalize-space(.)='次へ' or contains(normalize-space(.),'次へ')]",
+                "//button[contains(normalize-space(.),'注文内容の確認')]",
+                "//button[contains(@class,'btn-red') and not(@name='commit_order')]",
+            )
+            for xp in xpaths:
+                for el in driver.find_elements(By.XPATH, xp):
+                    try:
+                        if not el.is_displayed() or not el.is_enabled():
+                            continue
+                        name = (el.get_attribute("name") or "").strip()
+                        # 避免点到变更/清空类按钮
+                        if name in (
+                            "edit_sender",
+                            "edit_delivery",
+                            "edit_payment",
+                            "edit_wrapping",
+                            "edit_orderer",
+                            "edit_quantity",
+                            "basket_clear",
+                            "commit_order",
+                        ):
+                            continue
+                        next_btn = el
+                        break
+                    except Exception:
+                        continue
+                if next_btn is not None:
+                    break
+
+            if next_btn is None:
+                self.logger.warning(
+                    "乐天书店：未在注文確認页且未找到「次へ」类按钮（URL=%s）",
+                    getattr(driver, "current_url", ""),
+                )
+                return
+
+            self.logger.info(
+                "乐天书店：检测到结算中间页，点击下一步（第 %s 次）", round_idx + 1
+            )
+            self._random_pre_click_wait("书店结算次へ")
+            try:
+                driver.execute_script("arguments[0].click();", next_btn)
+            except Exception:
+                next_btn.click()
+            time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
+
+        if not self._is_books_confirm_page(driver):
+            raise RuntimeError(
+                "未能进入乐天书店注文確認页（仍停在中间步骤），URL=%s"
+                % (getattr(driver, "current_url", "") or "")
+            )
+
+    def _rat_field_values(self, driver, field_id: str) -> List[str]:
+        """读取确认页 RAT 隐藏域（如 ratItemManageNo / ratItemPrice）。"""
+        out: List[str] = []
+        for sel in ("#%s" % field_id, "input#%s" % field_id):
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                raw = (el.get_attribute("value") or "").strip()
+                if not raw:
+                    continue
+                out.extend([x.strip() for x in re.split(r"\s*,\s*", raw) if x.strip()])
+                break
+            except Exception:
+                continue
+        return out
+
+    def _rat_manage_nos(self, driver) -> List[str]:
+        """确认页 RAT 隐藏域中的书店商品管理号（常即 /rb/{id}）。"""
+        out: List[str] = []
+        for x in self._rat_field_values(driver, "ratItemManageNo"):
+            # 兼容 18681632 或 213310/22002624
+            if "/" in x:
+                x = x.split("/")[-1].strip()
+            if x.isdigit():
+                out.append(x)
+        seen = set()
+        uniq: List[str] = []
+        for x in out:
+            if x not in seen:
+                seen.add(x)
+                uniq.append(x)
+        return uniq
+
+    def _parse_books_confirm_totals(self, driver) -> Tuple[int, int, int]:
+        """
+        乐天书店确认页（注文内容の確認）金额：
+          - 総合計 → Total（dl.cost-detail__head）
+          - 商品合計 → GoodsFee（#js-totalPrice）
+          - 送料 / ポイント利用 → OperateFee 组成
+        与乐天市场（小計 / 支払い金額 / number-display）结构不同，不可混用。
+        """
+        goods_fee = 0
+        shipping = 0
+        point_use = 0
+        total = 0
+
+        try:
+            tp = driver.find_element(By.CSS_SELECTOR, "#js-totalPrice")
+            goods_fee = _parse_yen_int(tp.text)
+        except Exception:
+            pass
+
+        try:
+            head_dd = driver.find_element(By.CSS_SELECTOR, "dl.cost-detail__head dd")
+            total = _parse_yen_int(head_dd.text)
+        except Exception:
+            pass
+
+        # 侧栏明细：商品合計 / 送料 / ポイント利用
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "ul.cost-detail__body li")
+        except Exception:
+            rows = []
+        for row in rows:
+            try:
+                txt = (row.text or "").replace("\n", " ").strip()
+            except Exception:
+                continue
+            if not txt:
+                continue
+            if "商品合計" in txt and goods_fee <= 0:
+                goods_fee = _parse_yen_int(txt)
+            elif "送料" in txt:
+                if "送料無料" in txt:
+                    shipping = 0
+                else:
+                    shipping = _parse_yen_int(txt)
+            elif "ポイント利用" in txt:
+                if "利用なし" in txt or "なし" in txt:
+                    point_use = 0
+                else:
+                    # 常见「-123円」或「123円」
+                    point_use = abs(_parse_yen_int(txt))
+
+        # RAT 兜底总价
+        if total <= 0:
+            for raw in self._rat_field_values(driver, "ratTotalPrice"):
+                total = _parse_yen_int(raw)
+                if total > 0:
+                    break
+
+        if goods_fee <= 0 and total > 0 and shipping == 0 and point_use == 0:
+            goods_fee = total
+        if total <= 0 and goods_fee > 0:
+            total = goods_fee + shipping - point_use
+
+        operate_fee = int(shipping) - int(point_use)
+        # 后端要求 GoodsFee + OperateFee == Total
+        if total > 0 and goods_fee > 0 and goods_fee + operate_fee != total:
+            operate_fee = total - goods_fee
+
+        return goods_fee, operate_fee, total
+
+    def _parse_goods_list_from_confirm_page(
+        self, driver
+    ) -> Tuple[List[Dict[str, Any]], int, int, int]:
+        """
+        从乐天书店「注文内容の確認」解析 GoodsList + 金额。
+
+        页面结构（books.step）：
+          - 商品块：.item-part（单价 .price.txt-red span，数量 span.quantity）
+          - 确认页常无商品链接，No 优先取 #ratItemManageNo
+          - 合计：総合計 / 商品合計(#js-totalPrice) / 送料
+        """
+        goods: List[Dict[str, Any]] = []
+        store = self._store_name()
+        manage_nos = self._rat_manage_nos(driver)
+        rat_prices = [
+            _parse_yen_int(x) for x in self._rat_field_values(driver, "ratItemPrice")
+        ]
+        rat_counts = []
+        for x in self._rat_field_values(driver, "ratItemCount"):
+            try:
+                rat_counts.append(int(float(x)))
+            except Exception:
+                rat_counts.append(0)
+
+        try:
+            parts = driver.find_elements(
+                By.CSS_SELECTOR, ".cart__main__item .item-part, .item-list .item-part"
+            )
+        except Exception:
+            parts = []
+
+        for idx, part in enumerate(parts):
+            bid = ""
+            try:
+                link = part.find_element(By.CSS_SELECTOR, ".item-info a, a[href*='/rb/']")
+                href = (link.get_attribute("href") or "").strip()
+                bid = extract_rakuten_book_id(href) or ""
+            except Exception:
+                href = ""
+
+            if not bid and idx < len(manage_nos):
+                bid = manage_nos[idx]
+            if not bid and len(parts) == 1 and len(manage_nos) == 1:
+                bid = manage_nos[0]
+
+            if not bid:
+                # 图片柜路径偶发含商品 CD，仅作最后兜底（优先 manage no）
+                try:
+                    img = part.find_element(By.CSS_SELECTOR, ".item-img img")
+                    src = (img.get_attribute("src") or "") + " " + (
+                        img.get_attribute("alt") or ""
+                    )
+                    m = re.search(r"/rb/(\d+)", src)
+                    if m:
+                        bid = m.group(1)
+                except Exception:
+                    pass
+
+            price = 0
+            try:
+                price_el = part.find_element(
+                    By.CSS_SELECTOR, ".price-unit .price span, .price.txt-red span"
+                )
+                price = _parse_yen_int(price_el.text)
+            except Exception:
+                price = 0
+            if price <= 0 and idx < len(rat_prices):
+                price = rat_prices[idx]
+
+            num = 1
+            try:
+                qty_el = part.find_element(By.CSS_SELECTOR, "span.quantity")
+                num = int(re.sub(r"[^\d]", "", (qty_el.text or "1").strip()) or "1")
+            except Exception:
+                num = 1
+            if num <= 0 and idx < len(rat_counts) and rat_counts[idx] > 0:
+                num = rat_counts[idx]
+            if num <= 0:
+                num = 1
+
+            if not bid:
+                self.logger.warning(
+                    "乐天书店：确认页第 %s 件无法解析 bookId，仍保留价格数量供对账",
+                    idx + 1,
+                )
+                # 用占位 No，避免整行丢弃导致 GoodsFee 对不上
+                bid = "unknown_%s" % (idx + 1)
+
+            goods.append({"No": bid, "Num": num, "StoreName": store, "Price": price})
+
+        # DOM 无 .item-part 时：完全走 RAT
+        if not goods and manage_nos:
+            for i, bid in enumerate(manage_nos):
+                price = rat_prices[i] if i < len(rat_prices) else 0
+                num = rat_counts[i] if i < len(rat_counts) and rat_counts[i] > 0 else 1
+                goods.append(
+                    {"No": bid, "Num": num, "StoreName": store, "Price": price}
+                )
+
+        goods_fee, operate_fee, total = self._parse_books_confirm_totals(driver)
+
+        line_sum = sum(int(g.get("Price") or 0) * int(g.get("Num") or 1) for g in goods)
+        # 侧栏「商品合計」优先；缺失或与行合计几乎一致时用行合计
+        if goods_fee <= 0 and line_sum > 0:
+            goods_fee = line_sum
+        elif line_sum > 0 and abs(line_sum - goods_fee) <= 1:
+            goods_fee = line_sum
+        if total <= 0:
+            total = goods_fee + operate_fee
+        if total > 0 and goods_fee > 0 and goods_fee + operate_fee != total:
+            operate_fee = total - goods_fee
+
+        self.logger.info(
+            "乐天书店：确认页解析 goods=%s GoodsFee=%s OperateFee=%s Total=%s",
+            len(goods),
+            goods_fee,
+            operate_fee,
+            total,
+        )
+        return goods, total, goods_fee, operate_fee
+
+    def process_order(self, order: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+        order_id = order.get("order_id", "未知")
+        products: List[Dict[str, Any]] = order.get("products") or []
+        self.logger.info("乐天书店：开始处理订单 %s，商品数 %s", order_id, len(products))
+        if not products:
+            return False, self._make_summary(order, failure_reason="订单无商品")
+
+        driver = self.browser_manager.get_driver()
+        use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
+
+        try:
+            driver = self.browser_manager.ensure_alive(restart_if_dead=True)
+        except Exception as e:
+            msg = "浏览器窗口不可用，无法继续: %s" % e
+            self.logger.error("乐天书店：%s order=%s", msg, order_id)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [msg],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店：Chrome 窗口已关闭，请检查浏览器后重试。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(order, failure_reason=msg)
+
+        try:
+            self._ensure_rakuten_session()
+        except RakutenLoginError as e:
+            msg = "乐天登录失败: %s" % e
+            self.logger.error("乐天书店：%s order=%s", msg, order_id)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [msg],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店：请检查 login.password 或手动完成登录后重试。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(order, failure_reason=msg)
+
+        try:
+            self._clear_cart(driver)
+        except Exception as e:
+            msg = "清空购物车失败: %s" % e
+            self.logger.error("乐天书店：%s order=%s", msg, order_id)
+            return False, self._make_summary(order, failure_reason=msg)
+
+        for idx, product in enumerate(products, 1):
+            purl = normalize_rakuten_books_product_url(
+                str(product.get("url") or "").strip()
+            )
+            if not purl:
+                continue
+            qty = int(product.get("quantity") or 1)
+            bid = extract_rakuten_book_id(purl) or ""
+            source_lines: List[Dict[str, Any]] = list(
+                product.get("_source_lines") or [product]
+            )
+            try:
+                self.logger.info(
+                    "乐天书店：加购 %s/%s（合并数量=%s，接口行=%s） %s",
+                    idx,
+                    len(products),
+                    qty,
+                    len(source_lines),
+                    purl,
+                )
+                self._add_product_to_cart(driver, purl, qty)
+            except Exception as e:
+                msg = "加购失败: %s url=%s" % (e, purl)
+                self.logger.error(msg)
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id), [msg], user_id=order.get("user_id"), extra="乐天书店"
+                    )
+                except Exception:
+                    pass
+                return False, self._make_summary(order, failure_reason=msg)
+
+            for line in source_lines:
+                line_qty = max(1, int(line.get("quantity") or 1))
+                line_url = normalize_rakuten_books_product_url(
+                    str(line.get("url") or purl)
+                )
+                line_bid = extract_rakuten_book_id(line_url) or bid
+                callback_product = dict(line or {})
+                callback_product["url"] = line_url
+                callback_product["goods_id"] = line_bid or str(
+                    callback_product.get("goods_id") or ""
+                ).strip()
+                callback_product["goods_no"] = (
+                    str(
+                        callback_product.get("goods_no")
+                        or callback_product.get("no")
+                        or ""
+                    ).strip()
+                    or line_bid
+                )
+                callback_product["shop_id"] = self._store_name()
+                callback_product["quantity"] = line_qty
+                try:
+                    ok_cb = send_added_cart_callback(
+                        order,
+                        callback_product,
+                        config=self.config,
+                        is_lack=0,
+                        is_limit=0,
+                        use_curl=use_curl,
+                    )
+                except Exception as e:
+                    return False, self._make_summary(
+                        order, failure_reason="加购回调异常: %s" % e
+                    )
+                if not ok_cb:
+                    msgs = [
+                        "乐天书店：addedCartCallbackSimple 未成功（商品 %s）"
+                        % (line_bid or line_url)
+                    ]
+                    try:
+                        self.ticket_creator.create_ticket(
+                            str(order_id), msgs, user_id=order.get("user_id")
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self.feishu_notifier.notify_order_issue(
+                            str(order_id),
+                            msgs,
+                            user_id=order.get("user_id"),
+                            extra="乐天书店加购回调失败",
+                        )
+                    except Exception:
+                        pass
+                    return False, self._make_summary(
+                        order, failure_reason="addedCartCallbackSimple 未成功"
+                    )
+
+        cart_url = (self.rb_cfg.get("cart_url") or "").strip() or (
+            "https://books.step.rakuten.co.jp/rms/mall/book/bs/Cart"
+        )
+        self._navigate(driver, cart_url.split("#")[0])
+        time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+
+        checkout_sel = (self.rb_cfg.get("checkout_button_css") or "button#js-cartBtn").strip()
+        try:
+            self._random_pre_click_wait("ご購入手続き")
+            ck = WebDriverWait(driver, 25).until(EC.element_to_be_clickable((By.CSS_SELECTOR, checkout_sel)))
+            driver.execute_script("arguments[0].click();", ck)
+            time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
+        except Exception as e:
+            return False, self._make_summary(order, failure_reason="进入结算失败: %s" % e)
+
+        # 偶发停在「支払いと配送」等中间页，需点「次へ」才到注文確認
+        try:
+            self._pass_books_checkout_intermediates(driver)
+        except Exception as e:
+            msg = "进入注文確認失败: %s" % e
+            self.logger.error("乐天书店：%s", msg)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [msg],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店：购物车后未到达注文内容の確認页。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(order, failure_reason=msg)
+
+        goods_list: List[Dict[str, Any]] = []
+        total = goods_fee = operate_fee = 0
+        try:
+            goods_list, total, goods_fee, operate_fee = (
+                self._parse_goods_list_from_confirm_page(driver)
+            )
+        except Exception as e:
+            self.logger.warning("乐天书店：解析结算页商品列表失败: %s", e)
+
+        if not goods_list:
+            for p in products:
+                purl = (p.get("url") or "").strip()
+                bid = extract_rakuten_book_id(purl)
+                if not bid:
+                    continue
+                try:
+                    price_int = int(round(float(p.get("price") or 0)))
+                except Exception:
+                    price_int = 0
+                q = int(p.get("quantity") or 1)
+                goods_list.append(
+                    {
+                        "No": bid,
+                        "Num": max(1, q),
+                        "StoreName": self._store_name(),
+                        "Price": price_int,
+                    }
+                )
+            try:
+                gf, of, tot = self._parse_books_confirm_totals(driver)
+                goods_fee = gf or goods_fee
+                operate_fee = of
+                total = tot or total
+            except Exception:
+                pass
+            if goods_fee <= 0:
+                goods_fee = sum(int(x["Price"]) * int(x["Num"]) for x in goods_list)
+            if total <= 0:
+                total = goods_fee + operate_fee
+            if total > 0 and goods_fee + operate_fee != total:
+                operate_fee = total - goods_fee
+
+        shot_path = None
+        try:
+            shot_path = take_full_page_screenshot(driver)
+            screen_url = upload_screenshot_get_url(shot_path, self.config)
+            if not screen_url:
+                return False, self._make_summary(order, failure_reason="截图上传失败")
+            ok_chk, chk_err, chk_raw = check_cart_goods_simple(
+                order,
+                total=total,
+                goods_fee=goods_fee,
+                operate_fee=operate_fee,
+                screenshot_url=screen_url,
+                config=self.config,
+                goods_list_override=goods_list,
+                use_curl=use_curl,
+            )
+        finally:
+            if shot_path:
+                try:
+                    import os
+
+                    os.remove(shot_path)
+                except Exception:
+                    pass
+
+        if not ok_chk:
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [chk_err or "checkCartGoodsSimple 失败"],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店结算校验失败",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(
+                order,
+                failure_reason=chk_err or "checkCartGoodsSimple 失败",
+                check_cart_requested=True,
+                check_cart_response=(chk_raw or "")[:500],
+            )
+
+        commit_sel = (
+            self.rb_cfg.get("commit_order_button_css")
+            or "button.btn-red[name='commit_order'], button[name='commit_order']"
+        ).strip()
+        try:
+            if not self._is_books_confirm_page(driver):
+                self._pass_books_checkout_intermediates(driver)
+            self._random_pre_click_wait("注文を確定する")
+            commit_btn = None
+            # 多选择器兜底（与你提供的确认页 HTML 一致：button.btn-red[name=commit_order]）
+            for sel in [s.strip() for s in commit_sel.split(",") if s.strip()]:
+                try:
+                    commit_btn = WebDriverWait(driver, 12).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
+                    )
+                    if commit_btn:
+                        break
+                except Exception:
+                    continue
+            if commit_btn is None:
+                # 文案兜底
+                for el in driver.find_elements(
+                    By.XPATH,
+                    "//button[contains(normalize-space(.),'注文を確定する')]",
+                ):
+                    try:
+                        if el.is_displayed() and el.is_enabled():
+                            commit_btn = el
+                            break
+                    except Exception:
+                        continue
+            if commit_btn is None:
+                raise RuntimeError("未找到「注文を確定する」按钮")
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", commit_btn)
+            time.sleep(0.2)
+            driver.execute_script("arguments[0].click();", commit_btn)
+        except Exception as e:
+            return False, self._make_summary(
+                order,
+                failure_reason="点击注文確定失败: %s" % e,
+                check_cart_requested=True,
+                check_cart_response="ok",
+            )
+
+        sec = int(self.rb_cfg.get("success_page_wait_seconds", 120))
+        deadline = time.time() + max(10, sec)
+        ok_page = False
+        while time.time() < deadline:
+            if self._is_books_success_page(driver):
+                ok_page = True
+                break
+            time.sleep(1.5)
+
+        if not ok_page:
+            msg = "乐天书店：超时未检测到注文完了页"
+            self.logger.error("%s URL=%s", msg, getattr(driver, "current_url", ""))
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [msg, driver.current_url or ""],
+                    user_id=order.get("user_id"),
+                    extra="将跳过本单并继续后续订单（非暂停）。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(
+                order,
+                failure_reason=msg,
+                check_cart_requested=True,
+                check_cart_response="ok",
+                runner_pause_requested=False,
+            )
+
+        purchase_no, detail_url = self._extract_books_order_info(driver)
+        if not purchase_no:
+            msg = "乐天书店：成功页未解析到注文番号"
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id), [msg], user_id=order.get("user_id"), extra="乐天书店"
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(
+                order,
+                failure_reason=msg,
+                check_cart_requested=True,
+                check_cart_response="ok",
+            )
+
+        if not detail_url:
+            tpl = (self.rb_cfg.get("purchase_url_template") or "").strip() or (
+                "https://books.rakuten.co.jp/mypage/delivery/status?order_number={purchase_no}"
+            )
+            detail_url = tpl.format(purchase_no=purchase_no)
+        self.logger.info(
+            "乐天书店：注文完了 purchase_no=%s detail=%s", purchase_no, detail_url
+        )
+        purchase_nobs = [{"no": purchase_no, "url": detail_url}]
+
+        ok_add, add_err, add_raw = send_add_no_callback(
+            order,
+            purchase_nobs,
+            credit_card=self._credit_card_label(),
+            config=self.config,
+            use_curl=use_curl,
+        )
+        if not ok_add:
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [add_err or "addNoCallbackSimple 失败"],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(
+                order,
+                failure_reason=add_err or "addNoCallbackSimple 失败",
+                check_cart_requested=True,
+                check_cart_response="ok",
+                add_no_requested=True,
+                add_no_response=(add_raw or "")[:500],
+            )
+
+        shot2 = None
+        update_errors: List[str] = []
+        goods_no_list = [
+            {"no": str(g.get("No") or ""), "price": int(g.get("Price") or 0), "num": int(g.get("Num") or 1)}
+            for g in goods_list
+            if str(g.get("No") or "").strip()
+        ]
+        if not goods_no_list:
+            goods_no_list = [{"no": purchase_no, "price": total or goods_fee, "num": 1}]
+        try:
+            # 成功截图：优先打开「ご注文内容の変更・確認」详情页（含 back_number）
+            self._open_books_order_detail_for_screenshot(driver, detail_url)
+            shot2 = take_full_page_screenshot(driver)
+            detail_shot_url = upload_screenshot_get_url(shot2, self.config)
+            ok_u, uerr = send_update_goods_no_callback(
+                order,
+                purchase_no,
+                goods_no_list,
+                detail_shot_url or "",
+                self._store_name(),
+                self.config,
+                use_curl=use_curl,
+            )
+            if not ok_u:
+                update_errors.append(uerr or "updateGoodsNoCallback 失败")
+        except Exception as e:
+            update_errors.append(str(e))
+        finally:
+            if shot2:
+                try:
+                    import os
+
+                    os.remove(shot2)
+                except Exception:
+                    pass
+
+        if update_errors:
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id), update_errors, user_id=order.get("user_id"), extra="乐天书店分单回调异常"
+                )
+            except Exception:
+                pass
+
+        return True, self._make_summary(
+            order,
+            success=True,
+            payment_method="rakuten_one_click",
+            check_cart_requested=True,
+            check_cart_response="ok",
+            add_no_requested=True,
+            add_no_response=(add_raw or "")[:500],
+            update_errors=update_errors,
+        )
