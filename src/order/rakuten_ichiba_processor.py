@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 乐天市场（item.rakuten.co.jp / cart.step.rakuten.co.jp）：
-清空购物车 → 逐品加购（含 SKU 弹窗/备用按钮）→ 领券 → 店铺结算 → checkCart → 注文確定 → 回调。
+清空购物车 → 逐品加购（含 SKU 弹窗/备用按钮）→ 领券 → 购物车取金额并 checkCart → 店铺结算 → 注文確定 → 回调。
 """
 
 from __future__ import annotations
@@ -63,31 +63,59 @@ def _parse_yen_int(text: str) -> int:
     return int(s) if s else 0
 
 
+def _strip_phone_and_postal_noise(text: str) -> str:
+    """去掉电话/邮编等，避免把 080-7535-8884 误当成金额 8884。"""
+    raw = str(text or "")
+    # 日式电话：080-7535-8884 / 03-1234-5678 / 0120-xxx-xxx
+    raw = re.sub(r"\b0\d{1,4}-\d{1,4}-\d{3,4}\b", " ", raw)
+    raw = re.sub(r"\b0\d{9,11}\b", " ", raw)
+    # 邮编 〒550-0022
+    raw = re.sub(r"〒?\s*\d{3}-\d{4}", " ", raw)
+    return raw
+
+
 def _extract_yen_candidates(text: str) -> List[int]:
     """
     从一行文案中提取金额候选。
-    避免把「5点」「5個」等数量误当成「小計=5」。
-    优先识别带千分位/円/¥ 的金额；否则再取纯数字里较大者。
+    避免把「5点」「电话号」「邮编」误当成金额。
+    优先识别带 円/¥/千分位 的金额。
     """
-    raw = str(text or "")
+    raw = _strip_phone_and_postal_noise(text)
     found: List[int] = []
-    # ¥9,418 / 9,418円 / 9418円
+    explicit: List[int] = []
+
+    # 明确货币：¥9,418 / 9,418円 / 9418円
     for m in re.finditer(
-        r"(?:[¥￥]\s*)?([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円?",
+        r"[¥￥]\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)|([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円",
         raw,
     ):
+        g = m.group(1) or m.group(2) or ""
         try:
-            v = int(m.group(1).replace(",", ""))
+            v = int(g.replace(",", ""))
         except Exception:
             continue
-        # 过滤紧跟「点/個/个」的数量（如 5点）
         end = m.end()
         tail = raw[end : end + 2]
         if tail.startswith(("点", "個", "个")):
             continue
+        explicit.append(v)
+
+    if explicit:
+        out: List[int] = []
+        for v in explicit:
+            if v not in out:
+                out.append(v)
+        return out
+
+    # 退路：千分位数字（9,418）；避免匹配电话残留碎数字
+    for m in re.finditer(r"\b([0-9]{1,3}(?:,[0-9]{3})+)\b", raw):
+        try:
+            v = int(m.group(1).replace(",", ""))
+        except Exception:
+            continue
         found.append(v)
-    # 去重保序
-    out: List[int] = []
+
+    out = []
     for v in found:
         if v not in out:
             out.append(v)
@@ -1476,6 +1504,293 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             expected[key] = expected.get(key, 0) + quantity
         return expected
 
+    def _read_initial_state(self, driver) -> Optional[Dict[str, Any]]:
+        try:
+            state = driver.execute_script("return window.__INITIAL_STATE__ || null;")
+        except Exception:
+            return None
+        return state if isinstance(state, dict) else None
+
+    def _parse_cart_totals(self, driver) -> Tuple[int, int, int]:
+        """
+        从购物车页读取金额（优先 window.__INITIAL_STATE__.shopItemSubtotals）。
+        返回 (goods_fee, operate_fee, total)。
+
+        确认页含电话号，易把 080-7535-8884 误解析成运费；购物车侧栏更干净。
+        """
+        self._ensure_cart_page(driver, quick=True)
+        info = None
+        try:
+            info = driver.execute_script(
+                """
+                try {
+                  var st = window.__INITIAL_STATE__ || {};
+                  var subs = st.shopItemSubtotals || {};
+                  var out = {
+                    payment: 0, shipping: 0, itemTotal: 0, lineSum: 0,
+                    shippingKnown: false, itemKnown: false, paymentKnown: false,
+                    shopCount: 0, sampleKeys: []
+                  };
+                  function num(v) {
+                    if (v === true || v === false || v === null || v === undefined) return null;
+                    if (typeof v === 'string' && !v.trim()) return null;
+                    var n = Number(v);
+                    return isFinite(n) ? n : null;
+                  }
+                  function pick(obj, names) {
+                    for (var i = 0; i < names.length; i++) {
+                      var n = num(obj[names[i]]);
+                      if (n !== null) return n;
+                    }
+                    return null;
+                  }
+                  Object.keys(subs).forEach(function(k) {
+                    var s = subs[k] || {};
+                    out.shopCount += 1;
+                    if (out.sampleKeys.length < 12) {
+                      try { out.sampleKeys = out.sampleKeys.concat(Object.keys(s).slice(0, 12)); } catch (e) {}
+                    }
+                    var pay = pick(s, [
+                      'paymentAmount', 'totalPaymentAmount', 'payment',
+                      'totalAmount', 'total', 'orderAmount'
+                    ]);
+                    var ship = pick(s, [
+                      'shippingFee', 'shippingFeeTaxIncluded', 'postage',
+                      'shippingCost', 'deliveryFee', 'shipping'
+                    ]);
+                    if (s.isShippingFree === true || s.shippingFree === true || s.freeShipping === true) {
+                      ship = 0;
+                    }
+                    var it = pick(s, [
+                      'itemTotal', 'itemsTotal', 'goodsTotal', 'merchandiseTotal',
+                      'subTotal', 'subtotal', 'itemsPrice', 'itemPriceTotal'
+                    ]);
+                    if (pay !== null) { out.payment += pay; out.paymentKnown = true; }
+                    if (ship !== null) { out.shipping += ship; out.shippingKnown = true; }
+                    if (it !== null) { out.itemTotal += it; out.itemKnown = true; }
+                  });
+                  var shopItems = st.shopItems || {};
+                  Object.keys(shopItems).forEach(function(sk) {
+                    var shop = shopItems[sk] || {};
+                    var container = shop.items;
+                    var items = {};
+                    if (container && container.items && typeof container.items === 'object') {
+                      items = container.items;
+                    } else if (container && typeof container === 'object') {
+                      items = container;
+                    }
+                    Object.keys(items).forEach(function(ik) {
+                      var it = items[ik] || {};
+                      var price = Number(it.price) || 0;
+                      var qty = Number(it.quantity) || 1;
+                      if (qty < 1) qty = 1;
+                      out.lineSum += price * qty;
+                    });
+                  });
+                  return out;
+                } catch (e) {
+                  return { error: String(e) };
+                }
+                """
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：读取购物车 INITIAL_STATE 金额失败: %s", e)
+            info = None
+
+        goods_fee = operate_fee = total = 0
+        if isinstance(info, dict) and not info.get("error"):
+            line_sum = int(info.get("lineSum") or 0)
+            item_total = int(info.get("itemTotal") or 0) if info.get("itemKnown") else 0
+            shipping = int(info.get("shipping") or 0) if info.get("shippingKnown") else None
+            payment = int(info.get("payment") or 0) if info.get("paymentKnown") else 0
+
+            goods_fee = item_total or line_sum
+            if payment > 0:
+                total = payment
+            elif goods_fee > 0 and shipping is not None:
+                total = goods_fee + int(shipping)
+            elif goods_fee > 0:
+                total = goods_fee
+
+            if total > 0 and goods_fee > 0:
+                operate_fee = total - goods_fee
+            elif shipping is not None:
+                operate_fee = int(shipping)
+
+            self.logger.info(
+                "乐天市场：购物车金额 state goods=%s operate=%s total=%s "
+                "(itemTotal=%s lineSum=%s shipping=%s payment=%s keys=%s)",
+                goods_fee,
+                operate_fee,
+                total,
+                item_total,
+                line_sum,
+                shipping,
+                payment,
+                list(dict.fromkeys(info.get("sampleKeys") or []))[:20],
+            )
+
+        # DOM 兜底：购物车摘要区（仍做电话噪声过滤）
+        if total <= 0 or goods_fee <= 0:
+            try:
+                src = driver.page_source or ""
+            except Exception:
+                src = ""
+            # 送料無料
+            shipping_dom = None
+            if "送料無料" in src:
+                shipping_dom = 0
+            # 尝试侧栏数字
+            try:
+                # 常见「支払い金額」「合計」展示
+                for sel in (
+                    "[class*='number-display']",
+                    "[class*='payment']",
+                ):
+                    els = self._find_elements_now(driver, By.CSS_SELECTOR, sel)
+                    vals = []
+                    for el in els[:30]:
+                        try:
+                            if not el.is_displayed():
+                                continue
+                            v = _pick_row_yen_amount(el.text or "")
+                            if v > 0:
+                                vals.append(v)
+                        except Exception:
+                            continue
+                    if vals:
+                        # 取最大的作为应付总额候选
+                        cand_total = max(vals)
+                        if total <= 0:
+                            total = cand_total
+                        break
+            except Exception:
+                pass
+            if goods_fee <= 0 and total > 0 and shipping_dom == 0:
+                goods_fee = total
+                operate_fee = 0
+            elif goods_fee <= 0 and total > 0 and shipping_dom is not None:
+                goods_fee = max(0, total - int(shipping_dom))
+                operate_fee = int(shipping_dom)
+
+        if total > 0 and goods_fee > 0 and goods_fee + operate_fee != total:
+            operate_fee = total - goods_fee
+
+        if total <= 0 or goods_fee <= 0:
+            raise RuntimeError(
+                "购物车页未能解析总金额/商品金额（INITIAL_STATE/DOM），"
+                "请确认已在 cart.step 且 shopItemSubtotals 可用"
+            )
+        return goods_fee, operate_fee, total
+
+    def _cart_unit_prices_by_key(self, driver) -> Dict[str, int]:
+        """购物车各商品 key → 单价（来自 INITIAL_STATE.shopItems）。"""
+        state = self._read_initial_state(driver)
+        out: Dict[str, int] = {}
+        if not isinstance(state, dict):
+            return out
+        shop_items = state.get("shopItems")
+        if not isinstance(shop_items, dict):
+            return out
+        for shop_data in shop_items.values():
+            if not isinstance(shop_data, dict):
+                continue
+            items_container = shop_data.get("items")
+            if isinstance(items_container, dict) and isinstance(
+                items_container.get("items"), dict
+            ):
+                items = items_container.get("items") or {}
+            elif isinstance(items_container, dict):
+                items = items_container
+            else:
+                continue
+            for item in items.values():
+                if not isinstance(item, dict):
+                    continue
+                key = self._product_cart_key(str(item.get("itemUrl") or ""))
+                if not key:
+                    continue
+                try:
+                    price = int(round(float(item.get("price") or 0)))
+                except Exception:
+                    price = 0
+                if price > 0:
+                    out[key] = price
+        return out
+
+    def _build_check_cart_from_cart(
+        self, cart_products: List[Dict[str, Any]], driver
+    ) -> Tuple[List[Dict[str, Any]], int, int, int]:
+        """在购物车页组装 checkCart 所需 GoodsList + 金额。"""
+        store = self._store_name()
+        price_by_key = self._cart_unit_prices_by_key(driver)
+        goods_list: List[Dict[str, Any]] = []
+        grouped: List[Dict[str, Any]] = []
+        group_by_key: Dict[str, Dict[str, Any]] = {}
+        for p in cart_products:
+            no = self._line_no_for_check_cart(p)
+            if not no:
+                continue
+            key = self._product_cart_key(str(p.get("url") or "")) or ("no:" + no)
+            try:
+                expected_num = max(1, int(p.get("quantity") or 1))
+            except Exception:
+                expected_num = 1
+            if key in group_by_key:
+                group_by_key[key]["quantity"] += expected_num
+                continue
+            group = {
+                "key": key,
+                "no": no,
+                "quantity": expected_num,
+                "product": p,
+            }
+            group_by_key[key] = group
+            grouped.append(group)
+
+        for group in grouped:
+            p = group["product"]
+            no = str(group["no"])
+            num = int(group["quantity"])
+            key = str(group["key"])
+            price = int(price_by_key.get(key) or 0)
+            if price <= 0:
+                # 宽松匹配：按商品 path 不含 variant
+                base = key.split("?")[0]
+                for ck, pv in price_by_key.items():
+                    if ck.split("?")[0] == base and pv > 0:
+                        price = int(pv)
+                        break
+            if price <= 0:
+                try:
+                    price = int(round(float(p.get("price") or 0)))
+                except Exception:
+                    price = 0
+            if num <= 0:
+                num = 1
+            goods_list.append({"No": no, "Num": num, "StoreName": store, "Price": price})
+
+        goods_fee, operate_fee, total = self._parse_cart_totals(driver)
+        if not goods_list:
+            return [], total, goods_fee, operate_fee
+        computed = sum(int(x["Price"]) * int(x["Num"]) for x in goods_list)
+        if goods_fee <= 0 and computed > 0:
+            goods_fee = computed
+            if total > 0:
+                operate_fee = total - goods_fee
+        if total <= 0 and computed > 0:
+            total = computed + operate_fee
+        if total > 0 and goods_fee > 0 and goods_fee + operate_fee != total:
+            operate_fee = total - goods_fee
+        self.logger.info(
+            "乐天市场：购物车组装 checkCart goods=%s GoodsFee=%s OperateFee=%s Total=%s",
+            len(goods_list),
+            goods_fee,
+            operate_fee,
+            total,
+        )
+        return goods_list, total, goods_fee, operate_fee
+
     def _actual_cart_quantities_from_state(self, driver) -> Optional[Dict[str, int]]:
         """
         从乐天购物车 window.__INITIAL_STATE__.shopItems 读取真实商品 URL、规格和数量。
@@ -2320,23 +2635,31 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         返回 (goods_fee, operate_fee, total)。
 
         页面常见：小計 / 送料 / クーポン・ポイント / 支払い金額。
-        后端 checkCart 要求 GoodsFee + OperateFee == Total；
-        有优惠券时小計≠实付，需把差额计入 OperateFee（可为负）或回退校正。
+        后端 checkCart 要求 GoodsFee + OperateFee == Total。
+        OperateFee 最终一律用 Total - GoodsFee，避免把电话号/积分文案误当成运费或优惠。
         """
-        goods_fee = operate_fee = total = 0
+        goods_fee = shipping = total = 0
         coupon = 0
 
-        def _row_amount(label: str) -> Tuple[int, bool]:
+        def _row_amount(label: str, *, exact: bool = True) -> Tuple[int, bool]:
             try:
-                row = driver.find_element(
-                    By.XPATH,
-                    "//span[normalize-space()='%s']/ancestor::div[contains(@class,'flex-row')][1]"
-                    % label,
-                )
+                if exact:
+                    xp = (
+                        "//span[normalize-space()='%s']"
+                        "/ancestor::div[contains(@class,'flex-row')][1]"
+                        % label
+                    )
+                else:
+                    xp = (
+                        "//span[contains(normalize-space(),'%s')]"
+                        "/ancestor::div[contains(@class,'flex-row')][1]"
+                        % label
+                    )
+                row = driver.find_element(By.XPATH, xp)
                 txt = row.text or ""
                 if label == "送料" and "送料無料" in txt:
                     return 0, True
-                # 行内优先找价格展示节点
+                # 只信任行内价格节点，避免整行混入电话/地址
                 try:
                     for sel in (
                         ".number-display--3UwWM",
@@ -2346,11 +2669,14 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         els = row.find_elements(By.CSS_SELECTOR, sel)
                         for el in els:
                             v = _pick_row_yen_amount(el.text or "")
-                            if v > 0 or (label == "送料" and el.text is not None):
-                                if v > 0:
-                                    return v, True
+                            if v > 0:
+                                return v, True
+                            # 送料免费常见显示 0
+                            if label == "送料" and _parse_yen_int(el.text or "") == 0:
+                                return 0, True
                 except Exception:
                     pass
+                # 整行兜底也先去电话噪声
                 return _pick_row_yen_amount(txt), True
             except Exception:
                 return 0, False
@@ -2360,26 +2686,20 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             goods_fee = v
         v, ok = _row_amount("送料")
         if ok:
-            operate_fee = v
+            shipping = v
 
-        # 优惠/积分：文案因店铺而异
-        for label in (
-            "クーポン",
-            "クーポン利用",
-            "ポイント利用",
-            "ポイント",
-            "値引き",
-            "割引",
+        # 优惠项：避免用过于宽泛的「ポイント」（会误伤获得积分/说明文案）
+        for label, exact in (
+            ("クーポン利用", True),
+            ("クーポン", True),
+            ("ポイント利用", True),
+            ("値引き", True),
+            ("割引", True),
         ):
             try:
-                row = driver.find_element(
-                    By.XPATH,
-                    "//span[contains(normalize-space(),'%s')]/ancestor::div[contains(@class,'flex-row')][1]"
-                    % label,
-                )
-                amt = _pick_row_yen_amount(row.text or "")
-                if amt > 0:
-                    coupon += amt
+                amt, found = _row_amount(label, exact=exact)
+                if found and amt > 0:
+                    coupon = amt
                     self.logger.info("乐天市场：确认页优惠项 %s = %s", label, amt)
                     break
             except Exception:
@@ -2399,33 +2719,33 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 total = v
 
         if goods_fee <= 0 and total > 0:
-            goods_fee = max(0, total - operate_fee + coupon)
+            goods_fee = max(0, total - shipping + coupon)
 
-        # 有优惠：小計 + 送料 - 优惠 ≈ 实付；OperateFee 用「送料 - 优惠」使等式成立
-        if coupon > 0:
-            operate_fee = operate_fee - coupon
+        # 关键：运费差额 = 实付 - 商品小计（优惠自然体现为 0 或负数）
+        # 不再用「送料 - 误解析的电话号」去减，避免 OperateFee=-8884 这类脏值
+        if total > 0 and goods_fee > 0:
+            operate_fee = total - goods_fee
+        else:
+            operate_fee = int(shipping) - int(coupon)
 
-        # 最终强制对齐后端校验：GoodsFee + OperateFee == Total
-        if total > 0 and (goods_fee + operate_fee) != total:
+        # 合理性兜底：若仍异常且能拿到送料，用送料-优惠再对齐一次
+        if total > 0 and goods_fee > 0 and abs(operate_fee) > max(total, goods_fee):
             self.logger.warning(
-                "乐天市场：确认页金额不平衡，校正前 goods=%s operate=%s total=%s coupon=%s",
-                goods_fee,
+                "乐天市场：OperateFee 异常(%s)，回退 shipping-coupon (%s-%s)",
                 operate_fee,
-                total,
+                shipping,
                 coupon,
             )
-            # 以实付为准：商品费 = 总价 - 配送（配送已含优惠调整）
-            goods_fee = total - operate_fee
-            if goods_fee < 0:
-                # 极端：配送被解析过大，改把差额塞进 operate
-                operate_fee = total - max(goods_fee, 0)
-                goods_fee = max(0, total - operate_fee)
+            operate_fee = int(shipping) - int(coupon)
+            if goods_fee + operate_fee != total:
+                operate_fee = total - goods_fee
 
         self.logger.info(
-            "乐天市场：确认页金额 goods=%s operate=%s total=%s (coupon=%s)",
+            "乐天市场：确认页金额 goods=%s operate=%s total=%s (shipping=%s coupon=%s)",
             goods_fee,
             operate_fee,
             total,
+            shipping,
             coupon,
         )
         return goods_fee, operate_fee, total
@@ -3112,75 +3432,26 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         order, failure_reason="addedCartCallbackSimple 未成功"
                     )
 
+        # 在购物车页取总金额/运费并 checkCart（避免确认页电话号误解析成运费）
         try:
-            self._shop_checkout(driver)
+            self._ensure_cart_page(driver, quick=False)
+            self._dismiss_interruptions(driver, timeout=2.0)
+            goods_list, total, goods_fee, operate_fee = self._build_check_cart_from_cart(
+                cart_products, driver
+            )
         except Exception as e:
-            msg = "进入店铺结算失败: %s" % e
+            msg = "购物车组装结算校验失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
             try:
                 self.feishu_notifier.notify_order_issue(
                     str(order_id),
                     [msg],
                     user_id=order.get("user_id"),
-                    extra="乐天市场：购物车无法进入購入手続き（常见：限购导致按钮禁用）。",
+                    extra="乐天市场：请在购物车确认小计/送料后重试。",
                 )
             except Exception:
                 pass
             return False, self._make_summary(order, failure_reason=msg)
-
-        self._dismiss_interruptions(driver, timeout=3.0)
-        # 防御：若 _shop_checkout 内未吃到中间页（慢加载），再扫一次
-        try:
-            self._pass_delivery_address_step_if_present(driver)
-        except Exception as e:
-            self.logger.warning("乐天市场：处理お届け先中间页异常（继续）: %s", e)
-
-        # 若实际落在乐天书店确认页，按书店结构抓取（勿用市场「小計/支払い金額」）
-        try:
-            cur = (driver.current_url or "").lower()
-            try:
-                src_head = (driver.page_source or "")[:8000]
-            except Exception:
-                src_head = ""
-            src_norm = src_head.replace("'", '"')
-            on_books_confirm = (
-                "books.step.rakuten.co.jp" in cur
-                or 'name="commit_order"' in src_norm
-            ) and (
-                "注文内容の確認" in src_head
-                or "js-totalPrice" in src_head
-                or "cost-detail__head" in src_head
-            )
-        except Exception:
-            on_books_confirm = False
-
-        goods_list: List[Dict[str, Any]] = []
-        total = goods_fee = operate_fee = 0
-        if on_books_confirm:
-            self.logger.info("乐天市场：检测到书店注文確認页，改用书店确认页结构解析")
-            try:
-                from src.order.rakuten_books_processor import RakutenBooksOrderProcessor
-
-                books = RakutenBooksOrderProcessor(
-                    self._build_books_handoff_config(), self.browser_manager
-                )
-                goods_list, total, goods_fee, operate_fee = (
-                    books._parse_goods_list_from_confirm_page(driver)
-                )
-            except Exception as e:
-                self.logger.warning("乐天市场：书店确认页解析失败: %s", e)
-        else:
-            page_lines: List[Tuple[int, int]] = []
-            try:
-                page_lines = self._parse_confirm_page_lines(driver)
-            except Exception as e:
-                self.logger.warning("乐天市场：解析确认页商品行失败: %s", e)
-            try:
-                goods_list, total, goods_fee, operate_fee = self._build_check_cart_goods_list(
-                    cart_products, page_lines, driver
-                )
-            except Exception as e:
-                self.logger.warning("乐天市场：组装 checkCart 失败: %s", e)
 
         if not goods_list:
             return False, self._make_summary(
@@ -3219,7 +3490,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     str(order_id),
                     [chk_err or "checkCartGoodsSimple 失败"],
                     user_id=order.get("user_id"),
-                    extra="乐天市场结算校验失败",
+                    extra="乐天市场结算校验失败（购物车金额）",
                 )
             except Exception:
                 pass
@@ -3229,6 +3500,33 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 check_cart_requested=True,
                 check_cart_response=(chk_raw or "")[:500],
             )
+
+        try:
+            self._shop_checkout(driver)
+        except Exception as e:
+            msg = "进入店铺结算失败: %s" % e
+            self.logger.error("乐天市场：%s order=%s", msg, order_id)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [msg],
+                    user_id=order.get("user_id"),
+                    extra="乐天市场：购物车无法进入購入手続き（常见：限购导致按钮禁用）。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(
+                order,
+                failure_reason=msg,
+                check_cart_requested=True,
+                check_cart_response="ok",
+            )
+
+        self._dismiss_interruptions(driver, timeout=3.0)
+        try:
+            self._pass_delivery_address_step_if_present(driver)
+        except Exception as e:
+            self.logger.warning("乐天市场：处理お届け先中间页异常（继续）: %s", e)
 
         commit_sel = (
             self.ri_cfg.get("commit_order_button_css")
