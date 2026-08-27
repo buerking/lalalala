@@ -299,10 +299,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             pass
         self._ensure_rakuten_session(resume_url=target or None)
 
-    def _ensure_session_after_action(self, resume_url=None, wait_seconds: float = 3.0) -> None:
+    def _ensure_session_after_action(self, resume_url=None, wait_seconds: float = 1.0) -> None:
         """
         点击購入手続き/次へ/注文確定等后可能异步跳到 session/upgrade。
-        书店跑完再跑市场、或市场⇄书店 handoff 时尤其常见。
+        仅短等 URL 是否进登录域，不做业务页 DOM 扫描。
         """
         if not self.session_guard:
             return
@@ -322,7 +322,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         except Exception:
             pass
         self.session_guard.ensure_after_possible_redirect(
-            resume_url=target or None, wait_seconds=wait_seconds
+            resume_url=target or None, wait_seconds=min(float(wait_seconds), 1.5)
         )
 
     def _cart_url(self) -> str:
@@ -2998,7 +2998,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         driver.execute_script("arguments[0].click();", target)
         time.sleep(float(self.ri_cfg.get("wait_after_shop_checkout_seconds", 4)))
         # 购物车结算常触发 session/upgrade（client=shopcart）
-        self._ensure_session_after_action(wait_seconds=4.0)
+        self._ensure_session_after_action(wait_seconds=1.0)
         # 偶发中间页：お届け先 → 点「次へ」进入注文確認
         self._pass_delivery_address_step_if_present(driver)
 
@@ -3149,7 +3149,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             time.sleep(
                 float(self.ri_cfg.get("wait_after_delivery_next_seconds", 3) or 3)
             )
-            self._ensure_session_after_action(wait_seconds=3.0)
+            self._ensure_session_after_action(wait_seconds=1.0)
             self._dismiss_interruptions(driver, timeout=2.0)
 
         return clicked_any
@@ -3600,7 +3600,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 EC.element_to_be_clickable((By.CSS_SELECTOR, commit_sel))
             )
             driver.execute_script("arguments[0].click();", commit_btn)
-            self._ensure_session_after_action(wait_seconds=4.0)
+            self._ensure_session_after_action(wait_seconds=1.0)
         except Exception as e:
             msg = "点击注文確定失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)

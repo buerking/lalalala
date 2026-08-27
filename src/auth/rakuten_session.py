@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""乐天会话守卫：按域名识别登录页，自动填写密码并继续。
+"""乐天会话守卫：仅在登录域名出现时自动填密。
 
-兼容场景（市场⇄书店、购物车 SSO）：
-- login.account.rakuten.com/session/upgrade（ようこそ + 仅密码）
-- 密码框 #password_current / name=password
-- 主按钮多为 div#cta011（role=button），不是 <button>
+兼容 session/upgrade（#password_current + div#cta011）。
+重要：非登录页禁止扫 DOM；find_elements 必须 implicit_wait=0，
+否则默认 10s 隐式等待会把清空购物车/加购拖成数分钟。
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional, Tuple
 from urllib.parse import urlparse
 
 from selenium.webdriver.common.by import By
@@ -24,11 +24,6 @@ class RakutenLoginError(Exception):
 
 
 class RakutenSessionGuard(LoggerMixin):
-    """
-    用于 adapter=rakuten / rakuten_books。
-    主要通过当前 URL 域名判断是否落在乐天统一登录（如 login.account.rakuten.com）。
-    """
-
     LOGIN_HOST_HINTS = (
         "login.account.rakuten.com",
         "login.rakuten.co.jp",
@@ -36,53 +31,41 @@ class RakutenSessionGuard(LoggerMixin):
         "glogin.rakuten.co.jp",
         "id.rakuten.co.jp",
     )
+    # 仅精确登录路径；不要加 /widget 等会误伤业务页的宽泛片段
     LOGIN_PATH_HINTS = (
         "/session/upgrade",
         "/sso/authorize",
         "/sso/login",
-        "/login",
         "/signin",
-        "/widget",
     )
     PASSWORD_SELECTORS = (
         "#password_current",
-        'input#password_current',
         'input[name="password"]',
         'input[type="password"]',
-        'input[name="p"]',
-        'input#password',
         'input[autocomplete="current-password"]',
     )
     USER_SELECTORS = (
         'input[type="email"]',
         'input[name="username"]',
         'input[name="user_id"]',
-        'input[name="u"]',
-        'input#user_id',
         'input[autocomplete="username"]',
     )
-    # 新登录 UI：主 CTA 常是 div[role=button]，优先用稳定 id/class
     CTA_SELECTORS = (
         "#cta011",
         "#cta01",
-        "#cta02",
         ".h4k5-e2e-button__submit",
         '[role="button"].h4k5-e2e-button__submit',
-        '[role="button"].sbt',
         'button[type="submit"]',
         'input[type="submit"]',
-        "button",
     )
     NEXT_TEXTS = (
-        "Next",
         "次へ",
-        "次へ進む",
+        "Next",
         "ログイン",
         "Sign in",
         "Sign In",
         "続行",
         "Continue",
-        "送信",
     )
     TWO_FACTOR_HINTS = (
         "二段階認証",
@@ -93,11 +76,6 @@ class RakutenSessionGuard(LoggerMixin):
         "two-step",
         "2-step",
     )
-    CHALLENGER_HINTS = (
-        "r10-challenger",
-        "omni-",
-        "challenge",
-    )
 
     def __init__(self, browser_manager, config: Dict[str, Any]):
         self.browser_manager = browser_manager
@@ -105,18 +83,17 @@ class RakutenSessionGuard(LoggerMixin):
         login_cfg = self._resolve_login_cfg(self.config)
         self.email = str(login_cfg.get("email") or "").strip()
         self.password = str(login_cfg.get("password") or "")
-        self.max_login_attempts = int(login_cfg.get("max_attempts") or 3)
-        self.max_upgrade_rounds = int(login_cfg.get("max_upgrade_rounds") or 4)
+        self.max_login_attempts = int(login_cfg.get("max_attempts") or 2)
+        self.max_upgrade_rounds = int(login_cfg.get("max_upgrade_rounds") or 3)
         self.wait_after_submit_seconds = float(
-            login_cfg.get("wait_after_submit_seconds") or 3
+            login_cfg.get("wait_after_submit_seconds") or 2
         )
-        self.login_timeout_seconds = float(login_cfg.get("timeout_seconds") or 30)
+        self.login_timeout_seconds = float(login_cfg.get("timeout_seconds") or 20)
         enabled = login_cfg.get("enabled")
         self.enabled = True if enabled is None else bool(enabled)
 
     @staticmethod
     def _resolve_login_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
-        """顶层 login 优先；否则从站点块 / 嵌套块兜底。"""
         cfg = config or {}
         top = cfg.get("login") or {}
         if isinstance(top, dict) and (top.get("password") or top.get("email")):
@@ -137,7 +114,6 @@ class RakutenSessionGuard(LoggerMixin):
         adapter = str(((config or {}).get("_site") or {}).get("adapter") or "").strip()
         if adapter in ("rakuten", "rakuten_books"):
             return True
-        # 市场转书店 handoff 时可能没有 _site.adapter，但配置里有 rakuten_ichiba / books
         if (config or {}).get("rakuten_ichiba") or (config or {}).get("rakuten_books"):
             login = RakutenSessionGuard._resolve_login_cfg(config or {})
             if login.get("password"):
@@ -147,7 +123,39 @@ class RakutenSessionGuard(LoggerMixin):
     def credentials_ready(self) -> bool:
         return bool(self.password)
 
+    @contextmanager
+    def _no_implicit_wait(self, driver) -> Iterator[None]:
+        """探测元素时关闭隐式等待，避免每个缺失选择器空等 10 秒。"""
+        prev = 0.0
+        try:
+            prev = float(
+                (self.config.get("browser") or {}).get("implicit_wait", 10) or 10
+            )
+        except Exception:
+            prev = 10.0
+        try:
+            driver.implicitly_wait(0)
+            yield
+        finally:
+            try:
+                driver.implicitly_wait(prev)
+            except Exception:
+                pass
+
+    def _url_is_login_host(self, driver=None) -> bool:
+        driver = driver or self.browser_manager.get_driver()
+        try:
+            url = (driver.current_url or "").strip().lower()
+        except Exception:
+            return False
+        if not url or url.startswith("data:") or url == "about:blank":
+            return False
+        return any(h in url for h in self.LOGIN_HOST_HINTS)
+
     def is_login_page(self, driver=None) -> bool:
+        """
+        只认登录域名。非 login.* 一律 False，绝不扫业务页 DOM。
+        """
         driver = driver or self.browser_manager.get_driver()
         try:
             url = (driver.current_url or "").strip().lower()
@@ -156,131 +164,62 @@ class RakutenSessionGuard(LoggerMixin):
         if not url or url.startswith("data:") or url == "about:blank":
             return False
 
-        host = ""
-        path = ""
         try:
             parsed = urlparse(url)
             host = (parsed.netloc or "").lower()
             path = (parsed.path or "").lower()
         except Exception:
-            host = url
-
-        host_hit = any(h in host for h in self.LOGIN_HOST_HINTS)
-        path_hit = any(p in path for p in self.LOGIN_PATH_HINTS)
-        if not host_hit and not (host.endswith("rakuten.com") and path_hit):
-            # 非登录域名：若出现明确 upgrade UI 仍识别（iframe 极少见）
-            if not self._has_upgrade_ui(driver):
-                return False
-
-        # 明确 UI：#password_current / #cta011 / ようこそ
-        if self._has_upgrade_ui(driver):
-            return True
-
-        # 域名已命中登录站：再确认有密码框或典型文案，减少误判
-        try:
-            for css in self.PASSWORD_SELECTORS:
-                for el in driver.find_elements(By.CSS_SELECTOR, css):
-                    if self._visible(el):
-                        return True
-        except Exception:
-            pass
-
-        try:
-            html = (driver.page_source or "").lower()
-        except Exception:
-            html = ""
-        markers = (
-            "password (required)",
-            "password_current",
-            "password",
-            "パスワード",
-            "ようこそ",
-            "welcome",
-            "sign in",
-            "ログイン",
-            "session/upgrade",
-            "cta011",
-        )
-        if host_hit and any(m in html for m in markers):
-            return True
-        return bool(host_hit and path_hit)
-
-    def _has_upgrade_ui(self, driver) -> bool:
-        try:
-            for css in ("#password_current", 'input[name="password"]', "#cta011"):
-                for el in driver.find_elements(By.CSS_SELECTOR, css):
-                    if self._visible(el):
-                        return True
-        except Exception:
-            pass
-        try:
-            html = driver.page_source or ""
-        except Exception:
             return False
-        if "password_current" in html and ("cta011" in html or "次へ" in html):
+
+        if not any(h in host for h in self.LOGIN_HOST_HINTS):
+            return False
+
+        # 登录域名即视为登录流程（upgrade/authorize 等）
+        if any(p in path for p in self.LOGIN_PATH_HINTS):
             return True
-        if "ようこそ" in html and "パスワード" in html and "次へ" in html:
-            # 避免业务页误伤：再要求登录域名或 password input
+        if "/login" in path or "/sso/" in path or "/session/" in path:
+            return True
+
+        # 其它登录域路径：有密码框才算
+        with self._no_implicit_wait(driver):
             try:
-                url = (driver.current_url or "").lower()
+                for css in self.PASSWORD_SELECTORS[:3]:
+                    for el in driver.find_elements(By.CSS_SELECTOR, css):
+                        if self._visible(el):
+                            return True
             except Exception:
-                url = ""
-            if any(h in url for h in self.LOGIN_HOST_HINTS):
-                return True
-        return False
+                pass
+        return True  # 仍在登录域，保守当作登录页
 
     def looks_like_two_factor(self, driver=None) -> bool:
         driver = driver or self.browser_manager.get_driver()
+        if not self._url_is_login_host(driver):
+            return False
         try:
             html = driver.page_source or ""
         except Exception:
             return False
-        if any(h in html for h in self.TWO_FACTOR_HINTS):
-            # 仍是密码登录页时不算 2FA
-            if self.is_login_page(driver):
-                try:
-                    for css in self.PASSWORD_SELECTORS:
-                        if any(
-                            self._visible(el)
-                            for el in driver.find_elements(By.CSS_SELECTOR, css)
-                        ):
-                            return False
-                except Exception:
-                    pass
-            return True
-        return False
-
-    def looks_like_challenger(self, driver=None) -> bool:
-        """登录页上的 r10-challenger / 人机组件。"""
-        driver = driver or self.browser_manager.get_driver()
-        try:
-            for css in ("r10-challenger", "omni-11-1-ja-jp", "[c-refresh-sec]"):
-                els = driver.find_elements(By.CSS_SELECTOR, css)
-                if els:
-                    return True
-        except Exception:
-            pass
-        try:
-            html = (driver.page_source or "").lower()
-        except Exception:
+        if not any(h in html for h in self.TWO_FACTOR_HINTS):
             return False
-        return any(h in html for h in self.CHALLENGER_HINTS) and self.is_login_page(
-            driver
-        )
+        # 密码页不算 2FA
+        with self._no_implicit_wait(driver):
+            try:
+                for css in self.PASSWORD_SELECTORS[:2]:
+                    if any(
+                        self._visible(el)
+                        for el in driver.find_elements(By.CSS_SELECTOR, css)
+                    ):
+                        return False
+            except Exception:
+                pass
+        return True
 
     def ensure_logged_in(self, resume_url: Optional[str] = None) -> bool:
-        """
-        若当前是乐天登录页则自动填密码继续；本来就不是登录页则直接 True。
-        市场⇄书店 / 购物车会反复出现 session/upgrade，支持连续多轮。
-        失败抛 RakutenLoginError。
-        """
+        """非登录页立即返回；仅 login 域才填密。"""
         if not self.enabled:
             return True
 
         driver = self.browser_manager.get_driver()
-        # SPA 可能稍后才渲染密码框：短等
-        if not self.is_login_page(driver):
-            self._wait_for_login_ui(driver, timeout=1.2)
         if not self.is_login_page(driver):
             return True
 
@@ -340,7 +279,7 @@ class RakutenSessionGuard(LoggerMixin):
                     attempt,
                     last_err,
                 )
-                time.sleep(1.2)
+                time.sleep(0.8)
 
             if not round_ok:
                 raise RakutenLoginError(
@@ -348,11 +287,11 @@ class RakutenSessionGuard(LoggerMixin):
                     % (upgrade_round, self.max_login_attempts, last_err)
                 )
 
-            # 登录后可能立刻再跳另一个 upgrade（市场⇄书店）
-            self._wait_for_login_ui(driver, timeout=2.0)
+            # 登录后若立刻又进 upgrade，继续；否则结束（不再固定空等）
+            time.sleep(0.6)
             if self.is_login_page(driver):
                 self.logger.warning(
-                    "登录后再次出现登录页，继续下一轮 upgrade（URL=%s）",
+                    "登录后再次出现登录页，继续下一轮（URL=%s）",
                     getattr(driver, "current_url", ""),
                 )
                 continue
@@ -364,20 +303,13 @@ class RakutenSessionGuard(LoggerMixin):
                 driver.get(target)
             except Exception as e:
                 self.logger.warning("登录后跳回目标页异常（继续）: %s", e)
-            time.sleep(1.5)
-            # 回到业务页后又可能被踢回 upgrade
-            for _ in range(self.max_upgrade_rounds):
-                if not self.is_login_page(driver):
-                    break
-                self.logger.warning(
-                    "回到目标页后又出现登录页，再次自动登录（URL=%s）",
-                    getattr(driver, "current_url", ""),
-                )
+            time.sleep(1.0)
+            if self.is_login_page(driver):
                 if not self._submit_login(driver):
                     raise RakutenLoginError(
                         "登录看似成功，但回到目标页后再次出现登录页且无法通过"
                     )
-                time.sleep(1.0)
+                time.sleep(0.8)
             if self.is_login_page(driver):
                 raise RakutenLoginError(
                     "登录看似成功，但回到目标页后再次出现登录页（会话可能仍无效）"
@@ -385,28 +317,21 @@ class RakutenSessionGuard(LoggerMixin):
         return True
 
     def ensure_after_possible_redirect(
-        self, resume_url: Optional[str] = None, wait_seconds: float = 3.0
+        self, resume_url: Optional[str] = None, wait_seconds: float = 1.0
     ) -> bool:
         """
-        点击「購入手続き/次へ」等后可能异步跳到 session/upgrade。
-        短轮询等待登录页出现，再 ensure。
+        点击后可能跳到 login 域：只按 URL 短轮询，不上业务页扫 DOM。
         """
         if not self.enabled:
             return True
         driver = self.browser_manager.get_driver()
-        deadline = time.time() + max(0.5, float(wait_seconds))
+        # 默认最多约 1 秒；已在登录域则立刻处理
+        deadline = time.time() + max(0.2, min(float(wait_seconds), 2.0))
         while time.time() < deadline:
-            if self.is_login_page(driver):
+            if self._url_is_login_host(driver):
                 break
-            time.sleep(0.35)
+            time.sleep(0.2)
         return self.ensure_logged_in(resume_url=resume_url)
-
-    def _wait_for_login_ui(self, driver, timeout: float = 2.0) -> None:
-        deadline = time.time() + max(0.2, float(timeout))
-        while time.time() < deadline:
-            if self.is_login_page(driver) or self._has_upgrade_ui(driver):
-                return
-            time.sleep(0.25)
 
     @staticmethod
     def _sanitize_resume_url(resume_url: Optional[str]) -> str:
@@ -414,40 +339,36 @@ class RakutenSessionGuard(LoggerMixin):
         if not target:
             return ""
         low = target.lower()
-        bad = (
-            "login.account.rakuten",
-            "login.rakuten.co.jp",
-            "member.id.rakuten",
-            "glogin.rakuten",
-            "id.rakuten.co.jp",
-        )
-        if any(h in low for h in bad):
+        if any(h in low for h in RakutenSessionGuard.LOGIN_HOST_HINTS):
             return ""
         return target
 
     def _submit_login(self, driver) -> bool:
-        # 等 SPA 渲染
-        self._wait_for_login_ui(driver, timeout=3.0)
-
-        # 部分流程先邮箱/用户名再密码
-        user_el = self._first_visible(driver, self.USER_SELECTORS)
-        password_el = self._first_visible(driver, self.PASSWORD_SELECTORS)
-
-        if user_el is not None and self.email and password_el is None:
-            self._fill_input(driver, user_el, self.email)
-            self._click_next(driver)
-            time.sleep(1.2)
-            password_el = self._first_visible(driver, self.PASSWORD_SELECTORS)
+        # 仅在已确认登录域时调用；短等密码框出现（SPA）
+        password_el = None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            with self._no_implicit_wait(driver):
+                password_el = self._first_visible(driver, self.PASSWORD_SELECTORS)
+                user_el = self._first_visible(driver, self.USER_SELECTORS)
+            if password_el is not None:
+                break
+            if user_el is not None and self.email:
+                self._fill_input(driver, user_el, self.email)
+                self._click_next(driver)
+                time.sleep(0.8)
+                continue
+            time.sleep(0.25)
 
         if password_el is None:
-            # 再等一轮（upgrade 页异步）
-            self._wait_for_login_ui(driver, timeout=2.5)
-            password_el = self._first_visible(driver, self.PASSWORD_SELECTORS)
+            with self._no_implicit_wait(driver):
+                password_el = self._first_visible(driver, self.PASSWORD_SELECTORS)
         if password_el is None:
             raise RakutenLoginError("登录页找不到密码输入框（#password_current）")
 
+        with self._no_implicit_wait(driver):
+            user_el = self._first_visible(driver, self.USER_SELECTORS)
         if user_el is not None and self.email:
-            # upgrade 页通常已显示账号，有用户框时也填一下
             try:
                 cur = (user_el.get_attribute("value") or "").strip()
             except Exception:
@@ -456,14 +377,7 @@ class RakutenSessionGuard(LoggerMixin):
                 self._fill_input(driver, user_el, self.email)
 
         self._fill_input(driver, password_el, self.password)
-        time.sleep(0.25)
         self._click_next(driver)
-
-        if self.looks_like_challenger(driver):
-            self.logger.warning(
-                "登录页存在 r10-challenger，等待其完成（最长 %.0fs）",
-                self.login_timeout_seconds,
-            )
 
         time.sleep(self.wait_after_submit_seconds)
         deadline = time.time() + self.login_timeout_seconds
@@ -472,25 +386,15 @@ class RakutenSessionGuard(LoggerMixin):
                 return False
             if not self.is_login_page(driver):
                 return True
-            try:
-                err = driver.find_elements(
-                    By.CSS_SELECTOR,
-                    '[role="alert"], .error, .error-message, .rf-form-error',
-                )
-                for el in err:
-                    text = (el.text or "").strip()
-                    if text:
-                        self.logger.warning("乐天登录页错误提示: %s", text[:200])
-            except Exception:
-                pass
-            time.sleep(0.8)
+            time.sleep(0.5)
         return False
 
     def _click_next(self, driver) -> None:
-        btn = self._find_next_button(driver)
+        with self._no_implicit_wait(driver):
+            btn = self._find_next_button(driver)
         if btn is None:
-            # 兜底：在密码框按 Enter
-            pwd = self._first_visible(driver, self.PASSWORD_SELECTORS)
+            with self._no_implicit_wait(driver):
+                pwd = self._first_visible(driver, self.PASSWORD_SELECTORS)
             if pwd is not None:
                 self.logger.info("未找到 Next 按钮，尝试在密码框回车")
                 pwd.send_keys(Keys.ENTER)
@@ -517,37 +421,25 @@ class RakutenSessionGuard(LoggerMixin):
                 btn.click()
 
     def _find_next_button(self, driver):
-        # 1) 稳定选择器（含 div#cta011）
         for css in self.CTA_SELECTORS:
             try:
                 for el in driver.find_elements(By.CSS_SELECTOR, css):
                     if not self._visible(el):
                         continue
-                    # 跳过「忘记密码 / 别的 ID」等次要链接
                     eid = (el.get_attribute("id") or "").lower()
                     if eid.startswith("textl_"):
                         continue
-                    text = (
-                        (el.text or "")
-                        + " "
-                        + (el.get_attribute("value") or "")
-                        + " "
-                        + (el.get_attribute("aria-label") or "")
-                        + " "
-                        + (el.get_attribute("class") or "")
-                    )
-                    # 明确 CTA id / e2e class 直接用
                     if eid.startswith("cta") or "h4k5-e2e-button__submit" in (
                         el.get_attribute("class") or ""
                     ):
                         return el
+                    text = ((el.text or "") + " " + (el.get_attribute("value") or "")).strip()
                     for t in self.NEXT_TEXTS:
                         if t.lower() in text.lower():
                             return el
             except Exception:
                 continue
 
-        # 2) 任意 role=button 文案匹配
         try:
             for el in driver.find_elements(By.CSS_SELECTOR, '[role="button"]'):
                 if not self._visible(el):
@@ -562,42 +454,22 @@ class RakutenSessionGuard(LoggerMixin):
         except Exception:
             pass
 
-        # 3) 传统 button / submit
-        candidates = []
         try:
-            candidates.extend(driver.find_elements(By.CSS_SELECTOR, "button"))
-            candidates.extend(
-                driver.find_elements(By.CSS_SELECTOR, 'input[type="submit"]')
-            )
-            candidates.extend(
-                driver.find_elements(By.CSS_SELECTOR, 'button[type="submit"]')
-            )
-        except Exception:
-            return None
-
-        for el in candidates:
-            if not self._visible(el):
-                continue
-            text = (
-                (el.text or "")
-                + " "
-                + (el.get_attribute("value") or "")
-                + " "
-                + (el.get_attribute("aria-label") or "")
-            ).strip()
-            for t in self.NEXT_TEXTS:
-                if t.lower() in text.lower():
+            for el in driver.find_elements(By.CSS_SELECTOR, "button, input[type='submit']"):
+                if not self._visible(el):
+                    continue
+                text = (
+                    (el.text or "")
+                    + " "
+                    + (el.get_attribute("value") or "")
+                ).strip()
+                for t in self.NEXT_TEXTS:
+                    if t.lower() in text.lower():
+                        return el
+                if (el.get_attribute("type") or "").lower() == "submit":
                     return el
-
-        for el in candidates:
-            if not self._visible(el):
-                continue
-            try:
-                typ = (el.get_attribute("type") or "").lower()
-            except Exception:
-                typ = ""
-            if typ == "submit":
-                return el
+        except Exception:
+            pass
         return None
 
     def _first_visible(self, driver, selectors: Tuple[str, ...]):
@@ -619,8 +491,7 @@ class RakutenSessionGuard(LoggerMixin):
         t = (target or "").lower()
         if not t:
             return False
-        # 已自然跳回业务域则不必再 get
-        if "login.account.rakuten" in cur or "member.id.rakuten" in cur:
+        if any(h in cur for h in RakutenSessionGuard.LOGIN_HOST_HINTS):
             return True
         try:
             th = urlparse(t).netloc.lower()
@@ -645,7 +516,6 @@ class RakutenSessionGuard(LoggerMixin):
                 element.send_keys(Keys.DELETE)
             except Exception:
                 pass
-        # React 受控输入：先 JS 设值再补键盘事件
         try:
             driver.execute_script(
                 """

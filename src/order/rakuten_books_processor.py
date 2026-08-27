@@ -170,7 +170,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         except Exception:
             pass
         self.session_guard.ensure_after_possible_redirect(
-            resume_url=target or None, wait_seconds=wait_seconds
+            resume_url=target or None, wait_seconds=min(float(wait_seconds), 1.5)
         )
 
 
@@ -409,7 +409,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
             # 给跳转一点时间；确定后常出现 session/upgrade
             time.sleep(1.2)
-            self._ensure_session_after_action(wait_seconds=3.5)
+            self._ensure_session_after_action(wait_seconds=1.0)
             if self._is_books_success_page(driver):
                 return
             if not self._is_books_confirm_page(driver):
@@ -713,7 +713,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 next_btn.click()
             time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
             # 中间页跳转后可能被踢到统一登录 / session/upgrade
-            self._ensure_session_after_action(wait_seconds=3.5)
+            self._ensure_session_after_action(wait_seconds=1.0)
 
         if not self._is_books_confirm_page(driver):
             raise RuntimeError(
