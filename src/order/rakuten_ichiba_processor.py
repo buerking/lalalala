@@ -266,13 +266,64 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         target = url.split("#")[0]
         BrowserManager.navigate_allow_timeout(driver, target, self.logger)
         # 跳转后若落到统一登录站：自动填密再回到目标业务页
-        self._ensure_rakuten_session(resume_url=target)
+        self._ensure_session_after_nav(driver, resume_url=target)
 
     def _ensure_rakuten_session(self, resume_url=None) -> None:
         """若落在乐天统一登录域名，则按配置自动填密码继续。"""
         if not self.session_guard:
             return
         self.session_guard.ensure_logged_in(resume_url=resume_url)
+
+    def _ensure_session_after_nav(self, driver, resume_url=None) -> None:
+        """任意跳转后：若落在登录站则自动填密（含 session/upgrade）。"""
+        target = (resume_url or "").strip()
+        if not target:
+            try:
+                target = (driver.current_url or "").strip()
+            except Exception:
+                target = ""
+        try:
+            low = target.lower()
+            if any(
+                h in low
+                for h in (
+                    "login.account.rakuten",
+                    "login.rakuten.co.jp",
+                    "member.id.rakuten",
+                    "glogin.rakuten",
+                    "id.rakuten.co.jp",
+                )
+            ):
+                target = ""
+        except Exception:
+            pass
+        self._ensure_rakuten_session(resume_url=target or None)
+
+    def _ensure_session_after_action(self, resume_url=None, wait_seconds: float = 3.0) -> None:
+        """
+        点击購入手続き/次へ/注文確定等后可能异步跳到 session/upgrade。
+        书店跑完再跑市场、或市场⇄书店 handoff 时尤其常见。
+        """
+        if not self.session_guard:
+            return
+        target = (resume_url or "").strip()
+        try:
+            low = target.lower()
+            if any(
+                h in low
+                for h in (
+                    "login.account.rakuten",
+                    "login.rakuten.co.jp",
+                    "member.id.rakuten",
+                    "glogin.rakuten",
+                )
+            ):
+                target = ""
+        except Exception:
+            pass
+        self.session_guard.ensure_after_possible_redirect(
+            resume_url=target or None, wait_seconds=wait_seconds
+        )
 
     def _cart_url(self) -> str:
         return (self.ri_cfg.get("cart_url") or "https://cart.step.rakuten.co.jp/cart").strip()
@@ -2946,6 +2997,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         self._random_pre_click_wait("购物车購入手続き")
         driver.execute_script("arguments[0].click();", target)
         time.sleep(float(self.ri_cfg.get("wait_after_shop_checkout_seconds", 4)))
+        # 购物车结算常触发 session/upgrade（client=shopcart）
+        self._ensure_session_after_action(wait_seconds=4.0)
         # 偶发中间页：お届け先 → 点「次へ」进入注文確認
         self._pass_delivery_address_step_if_present(driver)
 
@@ -3096,6 +3149,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             time.sleep(
                 float(self.ri_cfg.get("wait_after_delivery_next_seconds", 3) or 3)
             )
+            self._ensure_session_after_action(wait_seconds=3.0)
             self._dismiss_interruptions(driver, timeout=2.0)
 
         return clicked_any
@@ -3546,6 +3600,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 EC.element_to_be_clickable((By.CSS_SELECTOR, commit_sel))
             )
             driver.execute_script("arguments[0].click();", commit_btn)
+            self._ensure_session_after_action(wait_seconds=4.0)
         except Exception as e:
             msg = "点击注文確定失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)

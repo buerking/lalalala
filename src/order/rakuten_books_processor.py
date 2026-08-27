@@ -140,12 +140,38 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     "login.rakuten.co.jp",
                     "member.id.rakuten",
                     "glogin.rakuten",
+                    "id.rakuten.co.jp",
                 )
             ):
                 target = ""
         except Exception:
             pass
         self._ensure_rakuten_session(resume_url=target or None)
+
+    def _ensure_session_after_action(
+        self, resume_url: Optional[str] = None, wait_seconds: float = 3.0
+    ) -> None:
+        """点击確定/次へ后可能异步跳到 session/upgrade。"""
+        if not self.session_guard:
+            return
+        target = (resume_url or "").strip()
+        try:
+            low = target.lower()
+            if any(
+                h in low
+                for h in (
+                    "login.account.rakuten",
+                    "login.rakuten.co.jp",
+                    "member.id.rakuten",
+                    "glogin.rakuten",
+                )
+            ):
+                target = ""
+        except Exception:
+            pass
+        self.session_guard.ensure_after_possible_redirect(
+            resume_url=target or None, wait_seconds=wait_seconds
+        )
 
 
     def _random_pre_click_wait(self, action: str) -> None:
@@ -381,8 +407,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 time.sleep(1.2)
                 continue
 
-            # 给跳转一点时间
-            time.sleep(2.5)
+            # 给跳转一点时间；确定后常出现 session/upgrade
+            time.sleep(1.2)
+            self._ensure_session_after_action(wait_seconds=3.5)
             if self._is_books_success_page(driver):
                 return
             if not self._is_books_confirm_page(driver):
@@ -399,10 +426,13 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
 
     def _is_books_success_page(self, driver) -> bool:
-        """注文完了（step5 thankyou）页。"""
+        """注文完了（step5 thankyou）页，或已进入注文・配送状況の確認。"""
         try:
             title = (driver.title or "").strip()
             if "注文完了" in title:
+                return True
+            # 用户提供的最终详情页 title
+            if "注文配送状況の確認" in title or "注文・配送状況の確認" in title:
                 return True
         except Exception:
             pass
@@ -411,6 +441,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 return True
         except Exception:
             pass
+        # 配送状況確認页：有注文番号即可视为已下单成功
+        if self._is_books_delivery_status_page(driver):
+            return True
         try:
             el = driver.find_element(By.CSS_SELECTOR, "#ratOrderId")
             if (el.get_attribute("value") or "").strip():
@@ -428,16 +461,82 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             "step5_purchase_complete",
             "cart__main__step5",
             'id="ratOrderId"',
+            "注文・配送状況の確認",
+            "注文配送状況の確認",
+            'class="order-info__number"',
+            'name="rms_order_number"',
         )
         return any(m and m in src for m in markers)
 
+    def _is_books_delivery_status_page(self, driver) -> bool:
+        """
+        Myページ「注文・配送状況の確認」详情页（截图目标页）。
+        特征见用户提供的 HTML：.order-info__number / input[name=rms_order_number]
+        """
+        try:
+            for el in driver.find_elements(
+                By.CSS_SELECTOR,
+                "span.order-info__number, input[name='rms_order_number']",
+            ):
+                try:
+                    if el.tag_name.lower() == "input":
+                        val = (el.get_attribute("value") or "").strip()
+                    else:
+                        val = (el.text or "").strip()
+                    if val and re.search(r"\d{6}-\d{8}-\d+", val):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            title = (driver.title or "").strip()
+            if "配送状況" in title and "確認" in title:
+                return True
+        except Exception:
+            pass
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            return False
+        return ("注文・配送状況の確認" in src or "注文配送状況の確認" in src) and (
+            "order-info__number" in src or 'name="rms_order_number"' in src
+        )
+
     def _extract_books_order_info(self, driver) -> Tuple[str, str]:
         """
-        从注文完了页解析注文番号与详情 URL。
-        优先用「ご注文内容の変更・確認」/注文番号链接（含 back_number）。
+        从注文完了页或配送状況確認页解析注文番号与详情 URL。
         """
         purchase_no = ""
         detail_url = ""
+        back_number = ""
+
+        # 0) 配送状況確認页（用户提供的最终 HTML）
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, "span.order-info__number"):
+                t = (el.text or "").strip()
+                if re.search(r"\d{6}-\d{8}-\d+", t):
+                    purchase_no = t
+                    break
+        except Exception:
+            pass
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, "input[name='rms_order_number']")
+            v = (el.get_attribute("value") or "").strip()
+            if v:
+                purchase_no = purchase_no or v
+        except Exception:
+            pass
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, "input[name='back_number']")
+            back_number = (el.get_attribute("value") or "").strip()
+        except Exception:
+            pass
+        if purchase_no and back_number and not detail_url:
+            detail_url = (
+                "https://books.rakuten.co.jp/mypage/delivery/status"
+                "?order_number=%s&back_number=%s" % (purchase_no, back_number)
+            )
 
         # 1) 変更・確認 按钮
         try:
@@ -449,7 +548,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     href = (el.get_attribute("href") or "").strip()
                     if "ご注文内容の変更" in txt or "変更・確認" in txt:
                         if href:
-                            detail_url = href
+                            detail_url = detail_url or href
                         break
                 except Exception:
                     continue
@@ -460,7 +559,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         num_sel = (self.rb_cfg.get("order_number_css") or "div.order-number dd a").strip()
         try:
             el = driver.find_element(By.CSS_SELECTOR, num_sel)
-            purchase_no = (el.text or "").strip()
+            purchase_no = purchase_no or (el.text or "").strip()
             href = (el.get_attribute("href") or "").strip()
             if href and not detail_url:
                 detail_url = href
@@ -489,6 +588,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
     def _open_books_order_detail_for_screenshot(self, driver, detail_url: str) -> None:
         """
         打开注文详情页再截图（用户要求：先点「ご注文内容の変更・確認」）。
+        目标页：注文・配送状況の確認（.order-info__number / rms_order_number）。
         """
         wait_s = float(self.rb_cfg.get("wait_after_detail_load_seconds", 3))
         clicked = False
@@ -520,19 +620,33 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             self._navigate(driver, url)
 
         time.sleep(max(1.0, wait_s))
-        # 等待离开完了页或出现配送/详情特征
-        deadline = time.time() + max(8.0, wait_s + 5)
+        # 等待配送状況確認页关键节点出现（再截图）
+        deadline = time.time() + max(12.0, wait_s + 8)
         while time.time() < deadline:
+            if self._is_books_delivery_status_page(driver):
+                self.logger.info("乐天书店：已进入注文・配送状況の確認页，准备截图")
+                time.sleep(0.8)
+                return
             try:
                 url = (driver.current_url or "").lower()
-                src = driver.page_source or ""
-                if "delivery/status" in url or "mypage" in url:
-                    break
-                if "注文完了" not in (driver.title or "") and "ご注文ありがとうございました" not in src:
-                    break
+                if "delivery/status" in url or (
+                    "mypage" in url and "order_number=" in url
+                ):
+                    # URL 已到详情，再等 DOM
+                    if driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "span.order-info__number, .order-info, input[name='rms_order_number']",
+                    ):
+                        self.logger.info("乐天书店：详情页 DOM 已就绪，准备截图")
+                        time.sleep(0.8)
+                        return
             except Exception:
-                break
+                pass
             time.sleep(0.5)
+        self.logger.warning(
+            "乐天书店：等待配送状況確認页超时，仍尝试截图 URL=%s",
+            getattr(driver, "current_url", ""),
+        )
 
     def _pass_books_checkout_intermediates(self, driver) -> None:
         """
@@ -598,8 +712,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             except Exception:
                 next_btn.click()
             time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
-            # 中间页跳转后可能被踢到统一登录
-            self._ensure_session_after_nav(driver)
+            # 中间页跳转后可能被踢到统一登录 / session/upgrade
+            self._ensure_session_after_action(wait_seconds=3.5)
 
         if not self._is_books_confirm_page(driver):
             raise RuntimeError(
@@ -1269,6 +1383,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
         purchase_nobs = [{"no": purchase_no, "url": detail_url}]
 
+        self.logger.info(
+            "乐天书店：调用 addNoCallbackSimple CreditCard=%s PurchaseNo=%s",
+            self._credit_card_label(),
+            purchase_no,
+        )
         ok_add, add_err, add_raw = send_add_no_callback(
             order,
             purchase_nobs,
@@ -1276,13 +1395,20 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             config=self.config,
             use_curl=use_curl,
         )
+        self.logger.info(
+            "乐天书店：addNoCallbackSimple ok=%s err=%s body=%s",
+            ok_add,
+            add_err or "",
+            (add_raw or "")[:300],
+        )
         if not ok_add:
             try:
                 self.feishu_notifier.notify_order_issue(
                     str(order_id),
                     [add_err or "addNoCallbackSimple 失败"],
                     user_id=order.get("user_id"),
-                    extra="乐天书店",
+                    extra="乐天书店：页面已下单成功但完成回调失败，请人工核对后台。purchase_no=%s"
+                    % purchase_no,
                 )
             except Exception:
                 pass
@@ -1290,7 +1416,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 order,
                 failure_reason=add_err or "addNoCallbackSimple 失败",
                 check_cart_requested=True,
-                check_cart_response="ok",
+                check_cart_response="ok" if ok_chk else (chk_err or "checkCart失败"),
                 add_no_requested=True,
                 add_no_response=(add_raw or "")[:500],
             )
@@ -1298,17 +1424,74 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         shot2 = None
         update_errors: List[str] = []
         goods_no_list = [
-            {"no": str(g.get("No") or ""), "price": int(g.get("Price") or 0), "num": int(g.get("Num") or 1)}
+            {
+                "no": str(g.get("No") or ""),
+                "price": int(g.get("Price") or 0),
+                "num": int(g.get("Num") or 1),
+            }
             for g in goods_list
             if str(g.get("No") or "").strip()
         ]
         if not goods_no_list:
-            goods_no_list = [{"no": purchase_no, "price": total or goods_fee, "num": 1}]
+            goods_no_list = [
+                {"no": purchase_no, "price": total or goods_fee, "num": 1}
+            ]
+
+        detail_shot_url = ""
+        use_curl_upload = bool(
+            (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
+        )
         try:
             # 成功截图：优先打开「ご注文内容の変更・確認」详情页（含 back_number）
             self._open_books_order_detail_for_screenshot(driver, detail_url)
-            shot2 = take_full_page_screenshot(driver)
-            detail_shot_url = upload_screenshot_get_url(shot2, self.config)
+            for up_try in range(1, 4):
+                try:
+                    if shot2:
+                        try:
+                            import os
+
+                            os.remove(shot2)
+                        except Exception:
+                            pass
+                        shot2 = None
+                    shot2 = take_full_page_screenshot(driver)
+                    detail_shot_url = (
+                        upload_screenshot_get_url(
+                            shot2,
+                            self.config,
+                            use_curl=use_curl_upload,
+                            use_requests=not use_curl_upload,
+                        )
+                        or ""
+                    )
+                    if detail_shot_url:
+                        self.logger.info(
+                            "乐天书店：详情截图上传成功 try=%s url=%s",
+                            up_try,
+                            detail_shot_url[:120],
+                        )
+                        break
+                    self.logger.warning(
+                        "乐天书店：详情截图上传返回空 try=%s/%s", up_try, 3
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        "乐天书店：详情截图/上传异常 try=%s/%s: %s", up_try, 3, e
+                    )
+                    detail_shot_url = ""
+                time.sleep(1.0)
+
+            if not detail_shot_url:
+                msg = "详情页截图上传失败（将仍提交 updateGoodsNoCallback，ScreenShotUrls 为空）"
+                update_errors.append(msg)
+                self.logger.error("乐天书店：%s", msg)
+
+            self.logger.info(
+                "乐天书店：调用 updateGoodsNoCallback PurchaseNo=%s shot=%s goods=%s",
+                purchase_no,
+                "yes" if detail_shot_url else "no",
+                len(goods_no_list),
+            )
             ok_u, uerr = send_update_goods_no_callback(
                 order,
                 purchase_no,
@@ -1318,9 +1501,15 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 self.config,
                 use_curl=use_curl,
             )
+            self.logger.info(
+                "乐天书店：updateGoodsNoCallback ok=%s err=%s",
+                ok_u,
+                uerr or "",
+            )
             if not ok_u:
                 update_errors.append(uerr or "updateGoodsNoCallback 失败")
         except Exception as e:
+            self.logger.exception("乐天书店：分单回调阶段异常: %s", e)
             update_errors.append(str(e))
         finally:
             if shot2:
@@ -1334,7 +1523,14 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if update_errors:
             try:
                 self.feishu_notifier.notify_order_issue(
-                    str(order_id), update_errors, user_id=order.get("user_id"), extra="乐天书店分单回调异常"
+                    str(order_id),
+                    update_errors
+                    + [
+                        "purchase_no=%s" % purchase_no,
+                        "页面已下单；请核对 addNo/updateGoodsNo/截图是否落库",
+                    ],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店分单回调异常",
                 )
             except Exception:
                 pass
@@ -1344,7 +1540,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             success=True,
             payment_method="rakuten_one_click",
             check_cart_requested=True,
-            check_cart_response="ok",
+            check_cart_response="ok" if ok_chk else (chk_err or "checkCart失败仍下单"),
             add_no_requested=True,
             add_no_response=(add_raw or "")[:500],
             update_errors=update_errors,
