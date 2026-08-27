@@ -32,48 +32,152 @@ def _parse_yen_text(text: str) -> int:
     return int(s) if s else 0
 
 
+def _restore_window_rect(driver, rect: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(rect, dict):
+        return
+    try:
+        driver.set_window_rect(
+            x=int(rect.get("x") or 0),
+            y=int(rect.get("y") or 0),
+            width=int(rect.get("width") or 1280),
+            height=int(rect.get("height") or 800),
+        )
+    except Exception:
+        try:
+            driver.set_window_size(
+                int(rect.get("width") or 1280),
+                int(rect.get("height") or 800),
+            )
+        except Exception:
+            pass
+
+
+def _force_window_normal_size(driver, width: int, height: int) -> None:
+    """
+    最大化窗口下 Chrome 不允许 set_window_size（会报 failed to change window state）。
+    先用 CDP 退回 normal，再改尺寸。
+    """
+    w, h = int(width), int(height)
+    try:
+        info = driver.execute_cdp_cmd("Browser.getWindowForTarget", {})
+        wid = info.get("windowId")
+        if wid is not None:
+            driver.execute_cdp_cmd(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": wid,
+                    "bounds": {
+                        "windowState": "normal",
+                        "left": 0,
+                        "top": 0,
+                        "width": w,
+                        "height": h,
+                    },
+                },
+            )
+            return
+    except Exception:
+        pass
+    try:
+        driver.set_window_rect(x=0, y=0, width=w, height=h)
+        return
+    except Exception:
+        pass
+    # 仍失败则尝试先最小化再设尺寸
+    try:
+        driver.minimize_window()
+        import time
+
+        time.sleep(0.2)
+    except Exception:
+        pass
+    driver.set_window_size(w, h)
+
+
 def take_full_page_screenshot(driver, save_path: Optional[str] = None) -> str:
     """
     截取当前页面全部内容（包含不在视窗内的部分）。
-    通过临时放大窗口高度再截图实现。
 
-    Args:
-        driver: Selenium WebDriver
-        save_path: 保存路径；若为 None 则使用临时文件
-
-    Returns:
-        截图文件路径
+    优先用 CDP captureBeyondViewport（无需改窗口，最大化也可）；
+    失败再临时改窗口高度；再失败则退回视窗截图，避免整单因截图中断。
     """
+    import base64
+    import os
+    import time
+
     if not save_path:
         fd, save_path = tempfile.mkstemp(suffix=".png")
-        import os
         os.close(fd)
 
+    # 1) CDP 全页截图（最大化窗口也可）
     try:
-        total_height = driver.execute_script(
-            "return Math.max("
-            "document.body.scrollHeight, document.documentElement.scrollHeight,"
-            "document.body.offsetHeight, document.documentElement.offsetHeight"
-            ");"
+        metrics = driver.execute_cdp_cmd("Page.getLayoutMetrics", {}) or {}
+        content = (
+            metrics.get("cssContentSize")
+            or metrics.get("contentSize")
+            or {}
         )
+        w = int(content.get("width") or 0) or 1920
+        h = int(content.get("height") or 0) or 2000
+        w = max(800, min(w, 3840))
+        h = max(600, min(h, MAX_SCREENSHOT_HEIGHT))
+        result = driver.execute_cdp_cmd(
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "captureBeyondViewport": True,
+                "fromSurface": True,
+                "clip": {
+                    "x": 0,
+                    "y": 0,
+                    "width": w,
+                    "height": h,
+                    "scale": 1,
+                },
+            },
+        )
+        data = (result or {}).get("data") or ""
+        if data:
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(data))
+            return save_path
     except Exception:
-        total_height = 2000
-    height = min(int(total_height), MAX_SCREENSHOT_HEIGHT)
-    width = 1920
+        pass
+
+    # 2) 改窗口高度再截（先退出 maximized）
+    original_rect = None
     try:
-        original_size = driver.get_window_size()
-        driver.set_window_size(width, height)
-        import time
-        time.sleep(0.5)
+        try:
+            original_rect = driver.get_window_rect()
+        except Exception:
+            original_rect = None
+        try:
+            total_height = driver.execute_script(
+                "return Math.max("
+                "document.body.scrollHeight, document.documentElement.scrollHeight,"
+                "document.body.offsetHeight, document.documentElement.offsetHeight"
+                ");"
+            )
+        except Exception:
+            total_height = 2000
+        height = min(int(total_height or 2000), MAX_SCREENSHOT_HEIGHT)
+        width = 1920
+        _force_window_normal_size(driver, width, height)
+        time.sleep(0.4)
         driver.save_screenshot(save_path)
-        driver.set_window_size(
-            original_size.get("width", width),
-            original_size.get("height", 800),
-        )
+        return save_path
     except Exception:
-        driver.set_window_size(width, 800)
-        raise
-    return save_path
+        # 3) 视窗截图兜底：不让结算链路因截图失败整单崩掉
+        try:
+            driver.save_screenshot(save_path)
+            return save_path
+        except Exception:
+            raise
+    finally:
+        try:
+            _restore_window_rect(driver, original_rect)
+        except Exception:
+            pass
 
 
 def upload_screenshot_get_url(
