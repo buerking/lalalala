@@ -265,6 +265,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def _navigate(self, driver, url: str) -> None:
         target = url.split("#")[0]
         BrowserManager.navigate_allow_timeout(driver, target, self.logger)
+        # 跳转后若落到统一登录站：自动填密再回到目标业务页
         self._ensure_rakuten_session(resume_url=target)
 
     def _ensure_rakuten_session(self, resume_url=None) -> None:

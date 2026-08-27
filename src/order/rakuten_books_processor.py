@@ -115,12 +115,37 @@ class RakutenBooksOrderProcessor(LoggerMixin):
     def _navigate(self, driver, url: str) -> None:
         target = (url or "").split("#")[0]
         BrowserManager.navigate_allow_timeout(driver, target, self.logger)
-        self._ensure_rakuten_session(resume_url=target)
+        self._ensure_session_after_nav(driver, resume_url=target)
 
     def _ensure_rakuten_session(self, resume_url=None) -> None:
         if not self.session_guard:
             return
         self.session_guard.ensure_logged_in(resume_url=resume_url)
+
+    def _ensure_session_after_nav(self, driver, resume_url: Optional[str] = None) -> None:
+        """任意跳转后：若落在登录站则自动填密，再回到业务页。"""
+        target = (resume_url or "").strip()
+        if not target:
+            try:
+                target = (driver.current_url or "").strip()
+            except Exception:
+                target = ""
+        # 登录站本身不要当 resume 目标
+        try:
+            low = target.lower()
+            if any(
+                h in low
+                for h in (
+                    "login.account.rakuten",
+                    "login.rakuten.co.jp",
+                    "member.id.rakuten",
+                    "glogin.rakuten",
+                )
+            ):
+                target = ""
+        except Exception:
+            pass
+        self._ensure_rakuten_session(resume_url=target or None)
 
 
     def _random_pre_click_wait(self, action: str) -> None:
@@ -237,6 +262,141 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         except Exception:
             return False
         return "注文内容の確認" in src and "name=\"commit_order\"" in src.replace("'", '"')
+
+    def _find_books_commit_button(self, driver, commit_sel: str = ""):
+        """查找确认页红色「注文を確定する」（侧栏 float 也可能挡住 clickable 判定）。"""
+        sels = [
+            s.strip()
+            for s in str(commit_sel or "").split(",")
+            if s.strip()
+        ] or [
+            "button.btn-red[name='commit_order']",
+            "button[name='commit_order']",
+            "form[action*='ConfirmOrderFork'] button[name='commit_order']",
+            ".js-float-box button[name='commit_order']",
+            ".area-cost-detail button[name='commit_order']",
+        ]
+        for sel in sels:
+            try:
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if el.is_displayed():
+                            return el
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        try:
+            for el in driver.find_elements(
+                By.XPATH,
+                "//button[@name='commit_order' or contains(normalize-space(.),'注文を確定する')]",
+            ):
+                try:
+                    if el.is_displayed():
+                        return el
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+
+    def _click_books_commit_order(self, driver, commit_sel: str = "") -> None:
+        """
+        点击书店确认页「注文を確定する」。
+        不依赖 element_to_be_clickable（右侧绝对定位浮层常导致误判不可点）。
+        """
+        self._random_pre_click_wait("注文を確定する")
+        last_err = ""
+        for attempt in range(1, 4):
+            self._ensure_session_after_nav(driver)
+            if not self._is_books_confirm_page(driver):
+                # 已离开确认页视为成功
+                if self._is_books_success_page(driver):
+                    return
+                self._pass_books_checkout_intermediates(driver)
+
+            btn = self._find_books_commit_button(driver, commit_sel)
+            if btn is None:
+                last_err = "未找到「注文を確定する」按钮"
+                self.logger.warning("乐天书店：%s（第 %s 次）", last_err, attempt)
+                time.sleep(1.5)
+                continue
+
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', inline:'nearest'});",
+                    btn,
+                )
+            except Exception:
+                pass
+            time.sleep(0.35)
+
+            clicked = False
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+                clicked = True
+                self.logger.info(
+                    "乐天书店：JS 点击注文を確定する（第 %s 次）", attempt
+                )
+            except Exception as e:
+                last_err = "JS click 失败: %s" % e
+            if not clicked:
+                try:
+                    btn.click()
+                    clicked = True
+                    self.logger.info(
+                        "乐天书店：原生点击注文を確定する（第 %s 次）", attempt
+                    )
+                except Exception as e:
+                    last_err = "原生 click 失败: %s" % e
+            if not clicked:
+                # 带 commit_order 字段提交表单（与按钮 name/value 一致）
+                try:
+                    ok = driver.execute_script(
+                        """
+                        var b = document.querySelector("button[name='commit_order']");
+                        if (!b) return false;
+                        var f = b.form || b.closest('form');
+                        if (!f) { b.click(); return true; }
+                        var h = document.createElement('input');
+                        h.type = 'hidden';
+                        h.name = 'commit_order';
+                        h.value = 'true';
+                        f.appendChild(h);
+                        f.submit();
+                        return true;
+                        """
+                    )
+                    if ok:
+                        clicked = True
+                        self.logger.info(
+                            "乐天书店：表单 submit(commit_order)（第 %s 次）", attempt
+                        )
+                    else:
+                        last_err = "表单 submit 未找到 commit_order"
+                except Exception as e:
+                    last_err = "表单 submit 失败: %s" % e
+
+            if not clicked:
+                time.sleep(1.2)
+                continue
+
+            # 给跳转一点时间
+            time.sleep(2.5)
+            if self._is_books_success_page(driver):
+                return
+            if not self._is_books_confirm_page(driver):
+                self.logger.info("乐天书店：已离开注文確認页")
+                return
+            self.logger.warning(
+                "乐天书店：点击注文を確定する后仍在确认页，准备重试（%s/3）",
+                attempt,
+            )
+            time.sleep(1.5)
+
+        raise RuntimeError(
+            last_err or "多次点击「注文を確定する」后仍停留在确认页"
+        )
 
     def _is_books_success_page(self, driver) -> bool:
         """注文完了（step5 thankyou）页。"""
@@ -438,6 +598,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             except Exception:
                 next_btn.click()
             time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
+            # 中间页跳转后可能被踢到统一登录
+            self._ensure_session_after_nav(driver)
 
         if not self._is_books_confirm_page(driver):
             raise RuntimeError(
@@ -819,6 +981,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             ck = WebDriverWait(driver, 25).until(EC.element_to_be_clickable((By.CSS_SELECTOR, checkout_sel)))
             driver.execute_script("arguments[0].click();", ck)
             time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
+            self._ensure_session_after_nav(driver)
         except Exception as e:
             return False, self._make_summary(order, failure_reason="进入结算失败: %s" % e)
 
@@ -925,40 +1088,17 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
         commit_sel = (
             self.rb_cfg.get("commit_order_button_css")
-            or "button.btn-red[name='commit_order'], button[name='commit_order']"
+            or "button.btn-red[name='commit_order'], button[name='commit_order'], "
+            "form[action*='ConfirmOrderFork'] button[name='commit_order'], "
+            ".js-float-box button[name='commit_order'], "
+            ".area-cost-detail button[name='commit_order']"
         ).strip()
         try:
+            # 截图/校验期间若会话失效，先自动登录再点确定
+            self._ensure_session_after_nav(driver)
             if not self._is_books_confirm_page(driver):
                 self._pass_books_checkout_intermediates(driver)
-            self._random_pre_click_wait("注文を確定する")
-            commit_btn = None
-            # 多选择器兜底（与你提供的确认页 HTML 一致：button.btn-red[name=commit_order]）
-            for sel in [s.strip() for s in commit_sel.split(",") if s.strip()]:
-                try:
-                    commit_btn = WebDriverWait(driver, 12).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, sel))
-                    )
-                    if commit_btn:
-                        break
-                except Exception:
-                    continue
-            if commit_btn is None:
-                # 文案兜底
-                for el in driver.find_elements(
-                    By.XPATH,
-                    "//button[contains(normalize-space(.),'注文を確定する')]",
-                ):
-                    try:
-                        if el.is_displayed() and el.is_enabled():
-                            commit_btn = el
-                            break
-                    except Exception:
-                        continue
-            if commit_btn is None:
-                raise RuntimeError("未找到「注文を確定する」按钮")
-            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", commit_btn)
-            time.sleep(0.2)
-            driver.execute_script("arguments[0].click();", commit_btn)
+            self._click_books_commit_order(driver, commit_sel)
         except Exception as e:
             return False, self._make_summary(
                 order,
@@ -971,9 +1111,20 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         deadline = time.time() + max(10, sec)
         ok_page = False
         while time.time() < deadline:
+            try:
+                self._ensure_session_after_nav(driver)
+            except Exception:
+                pass
             if self._is_books_success_page(driver):
                 ok_page = True
                 break
+            # 仍停在确认页：再点一次确定（偶发第一次未真正提交）
+            if self._is_books_confirm_page(driver) and (deadline - time.time()) > 30:
+                try:
+                    self.logger.warning("乐天书店：等待完了页期间仍在确认页，再次点击确定")
+                    self._click_books_commit_order(driver, commit_sel)
+                except Exception as e:
+                    self.logger.warning("乐天书店：再次点击确定失败: %s", e)
             time.sleep(1.5)
 
         if not ok_page:
