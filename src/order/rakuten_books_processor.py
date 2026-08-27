@@ -709,6 +709,46 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
         return goods_fee, operate_fee, total
 
+    def _goods_list_from_order_products(
+        self, products: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        用订单接口行的 GoodsNo（后端对账键）组装 GoodsList。
+        市场→书店转交时尤其重要：确认页 DOM 常只有书目 ID/无链接，对不上接口 GoodsNo。
+        """
+        store = self._store_name()
+        out: List[Dict[str, Any]] = []
+        for p in products or []:
+            lines = list(p.get("_source_lines") or [p])
+            for line in lines:
+                no = str(
+                    line.get("goods_no")
+                    or line.get("no")
+                    or line.get("GoodsNo")
+                    or ""
+                ).strip()
+                if not no:
+                    no = (
+                        extract_rakuten_book_id(str(line.get("url") or ""))
+                        or str(line.get("goods_id") or "").strip()
+                    )
+                if not no:
+                    continue
+                try:
+                    price = int(round(float(line.get("price") or 0)))
+                except Exception:
+                    price = 0
+                qty = max(1, int(line.get("quantity") or 1))
+                out.append(
+                    {
+                        "No": no,
+                        "Num": qty,
+                        "StoreName": store,
+                        "Price": price,
+                    }
+                )
+        return out
+
     def _parse_goods_list_from_confirm_page(
         self, driver
     ) -> Tuple[List[Dict[str, Any]], int, int, int]:
@@ -1044,12 +1084,60 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             if total > 0 and goods_fee + operate_fee != total:
                 operate_fee = total - goods_fee
 
+        # checkCart 优先用接口 GoodsNo（市场转书店时确认页 DOM 常对不上）
+        order_goods = self._goods_list_from_order_products(products)
+        if order_goods:
+            # 页面有单价时覆写价格，数量以订单为准（合并后更稳）
+            if goods_list:
+                page_by_idx = list(goods_list)
+                for i, og in enumerate(order_goods):
+                    if i < len(page_by_idx):
+                        pp = int(page_by_idx[i].get("Price") or 0)
+                        if pp > 0:
+                            og["Price"] = pp
+            # 若订单价仍为 0 而总价已知且仅一行，用总价摊
+            if (
+                len(order_goods) == 1
+                and int(order_goods[0].get("Price") or 0) <= 0
+                and goods_fee > 0
+            ):
+                order_goods[0]["Price"] = int(goods_fee) // max(
+                    1, int(order_goods[0].get("Num") or 1)
+                )
+            goods_list = order_goods
+            self.logger.info(
+                "乐天书店：checkCart GoodsList 改用订单 GoodsNo store=%s n=%s sample=%s",
+                self._store_name(),
+                len(goods_list),
+                (goods_list[0].get("No") if goods_list else ""),
+            )
+
         shot_path = None
+        screen_url = ""
+        ok_chk = False
+        chk_err = ""
+        chk_raw = ""
         try:
-            shot_path = take_full_page_screenshot(driver)
-            screen_url = upload_screenshot_get_url(shot_path, self.config)
+            try:
+                shot_path = take_full_page_screenshot(driver)
+                screen_url = upload_screenshot_get_url(shot_path, self.config) or ""
+            except Exception as e:
+                self.logger.warning(
+                    "乐天书店：确认页截图/上传失败（不阻断下单）: %s", e
+                )
+                screen_url = ""
             if not screen_url:
-                return False, self._make_summary(order, failure_reason="截图上传失败")
+                self.logger.warning(
+                    "乐天书店：无 ScreenShotUrl，仍继续 checkCart / 点击确定"
+                )
+
+            self.logger.info(
+                "乐天书店：调用 checkCartGoodsSimple Total=%s GoodsFee=%s OperateFee=%s goods=%s",
+                total,
+                goods_fee,
+                operate_fee,
+                len(goods_list or []),
+            )
             ok_chk, chk_err, chk_raw = check_cart_goods_simple(
                 order,
                 total=total,
@@ -1079,11 +1167,19 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 )
             except Exception:
                 pass
-            return False, self._make_summary(
-                order,
-                failure_reason=chk_err or "checkCartGoodsSimple 失败",
-                check_cart_requested=True,
-                check_cart_response=(chk_raw or "")[:500],
+            allow_continue = bool(
+                self.rb_cfg.get("commit_even_if_check_cart_fails", False)
+            )
+            if not allow_continue:
+                return False, self._make_summary(
+                    order,
+                    failure_reason=chk_err or "checkCartGoodsSimple 失败",
+                    check_cart_requested=True,
+                    check_cart_response=(chk_raw or "")[:500],
+                )
+            self.logger.warning(
+                "乐天书店：checkCart 失败仍继续点「注文を確定する」 err=%s",
+                chk_err,
             )
 
         commit_sel = (

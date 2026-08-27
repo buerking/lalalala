@@ -3141,11 +3141,16 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def _build_books_handoff_config(self) -> Dict[str, Any]:
         """
         市场站点转交书店流程时的配置：
-        复用同一浏览器会话；回传信用卡标识沿用市场单（GroupId 246）。
+        复用同一浏览器会话；回传信用卡标识 / StoreName 沿用市场单（GroupId 246）。
         """
         cfg = dict(self.config)
         rb = dict(cfg.get("rakuten_books") or {})
-        rb.setdefault("store_name", "乐天书店")
+        # 市场订单 checkCart / 回调应对齐「乐天市场」，不要用独立书店站名
+        ichiba_store = (self.ri_cfg.get("store_name") or "乐天市场").strip()
+        rb["store_name"] = ichiba_store
+        rb["handoff_from_ichiba"] = True
+        # 市场转书店偶发 GoodsNo 形态不一致：校验失败仍尽量点确定，避免卡死确认页
+        rb.setdefault("commit_even_if_check_cart_fails", True)
         rb.setdefault(
             "purchase_url_template",
             "https://books.rakuten.co.jp/mypage/delivery/status?order_number={purchase_no}",
