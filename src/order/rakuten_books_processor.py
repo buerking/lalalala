@@ -907,6 +907,18 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
         return goods_fee, operate_fee, total
 
+    @staticmethod
+    def _api_goods_id_and_no(product: Dict[str, Any]) -> Tuple[str, str]:
+        """优先用 getOrderListSimple 行的 GoodsId/GoodsNo；勿用 URL 书号覆盖 GoodsId。"""
+        gid = str(product.get("goods_id") or product.get("GoodsId") or "").strip()
+        gno = str(
+            product.get("goods_no")
+            or product.get("no")
+            or product.get("GoodsNo")
+            or ""
+        ).strip()
+        return gid, gno
+
     def _goods_list_from_order_products(
         self,
         products: List[Dict[str, Any]],
@@ -921,12 +933,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         for p in products or []:
             lines = list(p.get("_source_lines") or [p])
             for line in lines:
-                no = str(
-                    line.get("goods_no")
-                    or line.get("no")
-                    or line.get("GoodsNo")
-                    or ""
-                ).strip()
+                _gid, no = self._api_goods_id_and_no(line)
                 if not no:
                     no = (
                         extract_rakuten_book_id(str(line.get("url") or ""))
@@ -1162,21 +1169,41 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     str(line.get("url") or purl)
                 )
                 line_bid = extract_rakuten_book_id(line_url) or bid
-                callback_product = dict(line or {})
-                callback_product["url"] = line_url
-                callback_product["goods_id"] = line_bid or str(
-                    callback_product.get("goods_id") or ""
-                ).strip()
-                callback_product["goods_no"] = (
-                    str(
-                        callback_product.get("goods_no")
-                        or callback_product.get("no")
-                        or ""
-                    ).strip()
-                    or line_bid
+                gid, gno = self._api_goods_id_and_no(line)
+                # GoodsId 必须用接口行；URL 书号仅作 GoodsNo 兜底，不可覆盖 GoodsId
+                if not gid:
+                    msg = (
+                        "订单商品缺少 GoodsId（getOrderListSimple List） "
+                        "goods_id=%r goods_no=%r url=%s"
+                        % (gid, gno, line_url or purl)
+                    )
+                    self.logger.error("乐天书店：%s order=%s", msg, order_id)
+                    try:
+                        self.feishu_notifier.notify_order_issue(
+                            str(order_id),
+                            [msg],
+                            user_id=order.get("user_id"),
+                            extra="乐天书店：接口 List 缺 GoodsId，已跳过本单。",
+                        )
+                    except Exception:
+                        pass
+                    return False, self._make_summary(order, failure_reason=msg)
+                if not gno:
+                    gno = line_bid or gid
+                callback_product: Dict[str, Any] = {
+                    "goods_id": gid,
+                    "goods_no": gno,
+                    "shop_id": self._store_name(order),
+                    "quantity": line_qty,
+                    "url": line_url,
+                }
+                self.logger.info(
+                    "乐天书店：加购回调 GoodsId=%s GoodsNo=%s qty=%s book_id=%s",
+                    gid,
+                    gno,
+                    line_qty,
+                    line_bid or "",
                 )
-                callback_product["shop_id"] = self._store_name(order)
-                callback_product["quantity"] = line_qty
                 try:
                     ok_cb = send_added_cart_callback(
                         order,
@@ -1192,8 +1219,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     )
                 if not ok_cb:
                     msgs = [
-                        "乐天书店：addedCartCallbackSimple 未成功（商品 %s）"
-                        % (line_bid or line_url)
+                        "乐天书店：addedCartCallbackSimple 未成功"
+                        "（GoodsId=%s GoodsNo=%s book=%s）"
+                        % (gid, gno, line_bid or line_url)
                     ]
                     try:
                         self.ticket_creator.create_ticket(

@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import subprocess
 from typing import Dict, Any, Optional, Tuple
 from urllib.parse import urlencode
@@ -13,6 +14,21 @@ from src.utils.retry import call_api_with_retries, is_transient_http_error
 
 # 加购回调：网络失败用长间隔；业务 Success=false 用短间隔再试几次（后端偶发）
 ADDED_CART_BUSINESS_RETRY_WAITS = (0.0, 2.0, 5.0, 10.0)
+_log = logging.getLogger("site.added_cart")
+
+
+def _cb_log(msg: str, *args) -> None:
+    try:
+        _log.info(msg, *args)
+    except Exception:
+        pass
+    try:
+        if args:
+            print("[加购回调]", msg % args)
+        else:
+            print("[加购回调]", msg)
+    except Exception:
+        print("[加购回调]", msg)
 
 
 def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30):
@@ -56,7 +72,7 @@ def _parse_added_cart_response(status_code: int, response_text: str) -> Tuple[bo
         (ok, retryable, message)
     """
     if status_code != 200:
-        print("[加购回调] 非 200，视为失败")
+        _cb_log("非 200，视为失败")
         return (
             False,
             is_transient_http_error(status_code, "HTTP %s" % status_code),
@@ -66,17 +82,15 @@ def _parse_added_cart_response(status_code: int, response_text: str) -> Tuple[bo
     try:
         data = json.loads(response_text) if (response_text or "").strip() else {}
     except Exception:
-        print("[加购回调] 响应非 JSON，视为失败")
+        _cb_log("响应非 JSON，视为失败")
         return False, True, "响应非 JSON"
 
     success = data.get("Success") is True
     msg = str(data.get("Message") or "")
-    print(
-        "[加购回调] Success:",
+    _cb_log(
+        "Success=%s Data=%s Message=%s",
         data.get("Success"),
-        "Data:",
         data.get("Data"),
-        "Message:",
         data.get("Message"),
     )
     # Success=false：短间隔可重试（签名/瞬时业务）；最终仍失败再报工单
@@ -110,10 +124,10 @@ def send_added_cart_callback(
     )
 
     if not url:
-        print("[加购回调] 未配置 order_api.added_cart_callback_url，跳过回调")
+        _cb_log("未配置 order_api.added_cart_callback_url，跳过回调")
         return False
     if not secret or not pc_mark:
-        print("[加购回调] 未配置 order_api.secret 或 pc_mark，跳过回调")
+        _cb_log("未配置 order_api.secret 或 pc_mark，跳过回调")
         return False
 
     order_id = str(order.get("order_id") or "").strip()
@@ -140,9 +154,12 @@ def send_added_cart_callback(
     sign = sign_gen.generate_sign(params)
     params["Sign"] = sign
 
-    print("[加购回调] 请求 URL:", url)
-    print("[加购回调] 请求参数(form-data):", " ".join(f"{k}={v}" for k, v in params.items()))
-    print("[加购回调] Sign:", sign)
+    _cb_log("请求 URL: %s", url)
+    _cb_log(
+        "请求参数(form-data): %s",
+        " ".join("%s=%s" % (k, v) for k, v in params.items()),
+    )
+    _cb_log("Sign: %s", sign)
 
     last_msg: Optional[str] = None
 
@@ -151,10 +168,10 @@ def send_added_cart_callback(
         _ = attempt_no
         try:
             status_code, response_text = _post_with_curl(url, params, timeout)
-            print("[加购回调] 响应状态码:", status_code)
-            print("[加购回调] 响应 body:", (response_text or "")[:500])
+            _cb_log("响应状态码: %s", status_code)
+            _cb_log("响应 body: %s", (response_text or "")[:500])
         except Exception as e:
-            print("[加购回调] 请求异常:", type(e).__name__, str(e))
+            _cb_log("请求异常: %s %s", type(e).__name__, str(e))
             last_msg = str(e)
             return False, is_transient_http_error(0, str(e)), False
 
@@ -171,5 +188,5 @@ def send_added_cart_callback(
         )
     )
     if not ok and last_msg:
-        print("[加购回调] 最终失败 Message:", last_msg)
+        _cb_log("最终失败 Message: %s", last_msg)
     return ok
