@@ -307,32 +307,54 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             d["runner_pause_requested"] = True
         return d
 
+    def _cart_item_count(self, driver) -> int:
+        """以商品行 / js-itemNum 为准；勿用 page_source 搜空车文案（隐藏 DOM 常驻）。"""
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, "#js-itemNum")
+            text = (el.text or "").strip()
+            if text.isdigit():
+                return int(text)
+        except Exception:
+            pass
+        try:
+            rows = driver.find_elements(
+                By.CSS_SELECTOR, ".item-list .js-item, .item-list .item.selected, .item-list .item"
+            )
+            return len(rows or [])
+        except Exception:
+            return -1
+
     def _clear_cart(self, driver) -> None:
         cart_url = (self.rb_cfg.get("cart_url") or "").strip() or (
             "https://books.step.rakuten.co.jp/rms/mall/book/bs/Cart"
         )
         self._navigate(driver, cart_url.split("#")[0])
         time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
-        # 空车常见文案，直接跳过清空
-        try:
-            src = driver.page_source or ""
-            empty_hints = (
-                "買い物かごに商品がありません",
-                "カートに商品がありません",
-                "商品が入っていません",
-            )
-            if any(h in src for h in empty_hints):
-                self.logger.info("乐天书店：购物车已为空，跳过清空")
-                return
-        except Exception:
-            pass
+        n = self._cart_item_count(driver)
+        if n == 0:
+            self.logger.info("乐天书店：购物车已为空（itemNum=0），跳过清空")
+            return
+        if n < 0:
+            self.logger.info("乐天书店：未能读取购物车件数，仍尝试清空按钮")
+        else:
+            self.logger.info("乐天书店：购物车有 %s 件，执行清空", n)
         sel = (self.rb_cfg.get("clear_cart_button_css") or "button[name=basket_clear]").strip()
         try:
             btn = WebDriverWait(driver, 8).until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
             driver.execute_script("arguments[0].click();", btn)
             time.sleep(2)
+            n2 = self._cart_item_count(driver)
+            if n2 == 0:
+                self.logger.info("乐天书店：清空购物车完成")
+            elif n2 > 0:
+                self.logger.warning("乐天书店：清空后仍有 %s 件", n2)
         except Exception as e:
-            self.logger.warning("乐天书店：清空购物车失败（可能本就为空）: %s", e)
+            # 仅当确认已空才当作可忽略
+            if self._cart_item_count(driver) == 0:
+                self.logger.info("乐天书店：无清空按钮且购物车为空")
+            else:
+                self.logger.warning("乐天书店：清空购物车失败: %s", e)
+                raise
 
     def _add_product_to_cart(self, driver, product_url: str, quantity: int) -> None:
         self._navigate(driver, product_url.split("?")[0].rstrip("/") + "/")

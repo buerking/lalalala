@@ -442,8 +442,10 @@ def check_cart_goods_simple(
     """
     api_config = config.get("order_api") or {}
     url = (api_config.get("check_cart_goods_url") or "").strip()
-    # 订单专属签名：优先使用 getOrderListSimple 返回的 order.secret
-    secret = str(order.get("secret") or api_config.get("secret") or "").strip()
+    from src.utils.api_sign import pick_sign_secret
+
+    # 与加购一致：优先全局/已验证密钥，勿死用拉单 order.secret
+    secret = pick_sign_secret(order, api_config)
     # 市场→书店转交：优先订单上锁定的拉单站 PcMark
     pull = order.get("_pull_site") if isinstance(order.get("_pull_site"), dict) else {}
     pc_mark = (
