@@ -1885,41 +1885,28 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def _build_check_cart_from_cart(
         self, cart_products: List[Dict[str, Any]], driver
     ) -> Tuple[List[Dict[str, Any]], int, int, int]:
-        """在购物车页组装 checkCart 所需 GoodsList + 金额。"""
+        """
+        在购物车页组装 checkCart 所需 GoodsList + 金额。
+
+        重要：按接口 List **逐行**组装（与 addedCartCallback 一致），不要按 URL 合并。
+        订单常把同 SKU 拆成多行（如 4 行×qty1）；合并成 1 条 Num=4 时，
+        后台按订单行对账易 Data=false（浏览器车已正确也会被拦）。
+        Price 用购物车单价；金额汇总仍以页面小计/实付为准。
+        """
         store = self._store_name()
         price_by_key = self._cart_unit_prices_by_key(driver)
         goods_list: List[Dict[str, Any]] = []
-        grouped: List[Dict[str, Any]] = []
-        group_by_key: Dict[str, Dict[str, Any]] = {}
         for p in cart_products:
             no = self._line_no_for_check_cart(p)
             if not no:
                 continue
             key = self._product_cart_key(str(p.get("url") or "")) or ("no:" + no)
             try:
-                expected_num = max(1, int(p.get("quantity") or 1))
+                num = max(1, int(p.get("quantity") or 1))
             except Exception:
-                expected_num = 1
-            if key in group_by_key:
-                group_by_key[key]["quantity"] += expected_num
-                continue
-            group = {
-                "key": key,
-                "no": no,
-                "quantity": expected_num,
-                "product": p,
-            }
-            group_by_key[key] = group
-            grouped.append(group)
-
-        for group in grouped:
-            p = group["product"]
-            no = str(group["no"])
-            num = int(group["quantity"])
-            key = str(group["key"])
+                num = 1
             price = int(price_by_key.get(key) or 0)
             if price <= 0:
-                # 宽松匹配：按商品 path 不含 variant
                 base = key.split("?")[0]
                 for ck, pv in price_by_key.items():
                     if ck.split("?")[0] == base and pv > 0:
@@ -1930,9 +1917,9 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     price = int(round(float(p.get("price") or 0)))
                 except Exception:
                     price = 0
-            if num <= 0:
-                num = 1
-            goods_list.append({"No": no, "Num": num, "StoreName": store, "Price": price})
+            goods_list.append(
+                {"No": no, "Num": num, "StoreName": store, "Price": price}
+            )
 
         goods_fee, operate_fee, total = self._parse_cart_totals(driver)
         if not goods_list:
@@ -1946,12 +1933,21 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             total = computed + operate_fee
         if total > 0 and goods_fee > 0 and goods_fee + operate_fee != total:
             operate_fee = total - goods_fee
+        if computed > 0 and goods_fee > 0 and computed != goods_fee:
+            self.logger.warning(
+                "乐天市场：GoodsList 行合计=%s 与页面 GoodsFee=%s 不一致（仍以页面金额提交）",
+                computed,
+                goods_fee,
+            )
         self.logger.info(
-            "乐天市场：购物车组装 checkCart goods=%s GoodsFee=%s OperateFee=%s Total=%s",
+            "乐天市场：购物车组装 checkCart goods=%s GoodsFee=%s OperateFee=%s Total=%s "
+            "lineSum=%s GoodsList=%s",
             len(goods_list),
             goods_fee,
             operate_fee,
             total,
+            computed,
+            goods_list,
         )
         return goods_list, total, goods_fee, operate_fee
 
