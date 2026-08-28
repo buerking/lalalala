@@ -1088,6 +1088,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         self._ensure_callback_pc_mark(order)
         if self._is_ichiba_handoff():
             self._log_callback_identity("开单", order)
+        # 拉单 Mark 可能过期/跨单复用；加购回调前先刷，避免 Success=false 空 Message
+        self._refresh_order_mark(order, reason="开单加购前")
+        self._log_callback_identity("加购前回调身份", order)
 
         driver = self.browser_manager.get_driver()
         use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
@@ -1198,14 +1201,15 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     "url": line_url,
                 }
                 self.logger.info(
-                    "乐天书店：加购回调 GoodsId=%s GoodsNo=%s qty=%s book_id=%s",
+                    "乐天书店：加购回调 GoodsId=%s GoodsNo=%s qty=%s book_id=%s Mark=%s",
                     gid,
                     gno,
                     line_qty,
                     line_bid or "",
+                    str(order.get("mark") or "")[:24],
                 )
                 try:
-                    ok_cb = send_added_cart_callback(
+                    ok_cb, cb_msg = send_added_cart_callback(
                         order,
                         callback_product,
                         config=self.config,
@@ -1218,11 +1222,38 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         order, failure_reason="加购回调异常: %s" % e
                     )
                 if not ok_cb:
+                    # Mark/验签类或空 Message：刷一次再试；「只支持加入一次」不再空耗
+                    tip = str(cb_msg or "")
+                    retry_mark = ("只支持加入" not in tip) and (
+                        (not tip.strip())
+                        or tip.strip() == "Success=false"
+                        or any(k in tip for k in ("验签", "签名", "Sign", "Mark"))
+                    )
+                    if retry_mark and self._refresh_order_mark(
+                        order, reason="加购回调失败重试"
+                    ):
+                        try:
+                            ok_cb, cb_msg = send_added_cart_callback(
+                                order,
+                                callback_product,
+                                config=self.config,
+                                is_lack=0,
+                                is_limit=0,
+                                use_curl=use_curl,
+                            )
+                        except Exception as e:
+                            return False, self._make_summary(
+                                order, failure_reason="加购回调异常: %s" % e
+                            )
+                        tip = str(cb_msg or "")
+                if not ok_cb:
+                    tip = str(cb_msg or "")
                     msgs = [
                         "乐天书店：addedCartCallbackSimple 未成功"
-                        "（GoodsId=%s GoodsNo=%s book=%s）"
-                        % (gid, gno, line_bid or line_url)
+                        "（GoodsId=%s GoodsNo=%s book=%s Message=%s）"
+                        % (gid, gno, line_bid or line_url, tip or "-")
                     ]
+                    self.logger.error("%s order=%s", msgs[0], order_id)
                     try:
                         self.ticket_creator.create_ticket(
                             str(order_id), msgs, user_id=order.get("user_id")
@@ -1239,7 +1270,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     except Exception:
                         pass
                     return False, self._make_summary(
-                        order, failure_reason="addedCartCallbackSimple 未成功"
+                        order,
+                        failure_reason="addedCartCallbackSimple 未成功: %s"
+                        % (tip or "-"),
                     )
 
         cart_url = (self.rb_cfg.get("cart_url") or "").strip() or (

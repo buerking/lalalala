@@ -6,7 +6,7 @@
 import json
 import logging
 import subprocess
-from typing import Dict, Any, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from src.utils.sign_generator import SignGenerator
@@ -14,21 +14,38 @@ from src.utils.retry import call_api_with_retries, is_transient_http_error
 
 # 加购回调：网络失败用长间隔；业务 Success=false 用短间隔再试几次（后端偶发）
 ADDED_CART_BUSINESS_RETRY_WAITS = (0.0, 2.0, 5.0, 10.0)
-_log = logging.getLogger("site.added_cart")
 
 
-def _cb_log(msg: str, *args) -> None:
-    try:
-        _log.info(msg, *args)
-    except Exception:
-        pass
-    try:
-        if args:
-            print("[加购回调]", msg % args)
-        else:
+def _make_cb_log(config: Optional[Dict[str, Any]] = None) -> Callable[..., None]:
+    """写入当前站点日志文件（与 site.rakuten_books 等同文件）+ 控制台。"""
+    ns = ""
+    if isinstance(config, dict):
+        ns = str(config.get("_log_namespace") or "").strip()
+    lg = logging.getLogger(f"site.{ns}" if ns else "site.added_cart")
+
+    def _log(msg: str, *args) -> None:
+        try:
+            lg.info("[加购回调] " + msg, *args)
+        except Exception:
+            pass
+        try:
+            if args:
+                print("[加购回调]", msg % args)
+            else:
+                print("[加购回调]", msg)
+        except Exception:
             print("[加购回调]", msg)
-    except Exception:
-        print("[加购回调]", msg)
+
+    return _log
+
+
+def _is_api_success(value: Any) -> bool:
+    """后端偶发返回字符串 true/1，不能只用 `is True`。"""
+    if value is True:
+        return True
+    if value in (1, "1", "true", "True", "TRUE"):
+        return True
+    return False
 
 
 def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30):
@@ -66,13 +83,23 @@ def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30):
         raise RuntimeError("curl 请求超时")
 
 
-def _parse_added_cart_response(status_code: int, response_text: str) -> Tuple[bool, bool, str]:
+def _params_for_sign(params: Dict[str, str], *, omit_empty: bool) -> Dict[str, str]:
+    if not omit_empty:
+        return dict(params)
+    return {k: v for k, v in params.items() if v is not None and str(v) != ""}
+
+
+def _parse_added_cart_response(
+    status_code: int,
+    response_text: str,
+    log: Callable[..., None],
+) -> Tuple[bool, bool, str]:
     """
     Returns:
         (ok, retryable, message)
     """
     if status_code != 200:
-        _cb_log("非 200，视为失败")
+        log("非 200，视为失败")
         return (
             False,
             is_transient_http_error(status_code, "HTTP %s" % status_code),
@@ -82,19 +109,19 @@ def _parse_added_cart_response(status_code: int, response_text: str) -> Tuple[bo
     try:
         data = json.loads(response_text) if (response_text or "").strip() else {}
     except Exception:
-        _cb_log("响应非 JSON，视为失败")
+        log("响应非 JSON，视为失败")
         return False, True, "响应非 JSON"
 
-    success = data.get("Success") is True
+    success = _is_api_success(data.get("Success"))
     msg = str(data.get("Message") or "")
-    _cb_log(
-        "Success=%s Data=%s Message=%s",
+    log(
+        "Success=%s Data=%s Message=%s ErrorCode=%s",
         data.get("Success"),
         data.get("Data"),
         data.get("Message"),
+        data.get("ErrorCode"),
     )
-    # Success=false：短间隔可重试（签名/瞬时业务）；最终仍失败再报工单
-    return success, (not success), msg
+    return success, (not success), msg or ("Success=false" if not success else "")
 
 
 def send_added_cart_callback(
@@ -105,15 +132,16 @@ def send_added_cart_callback(
     is_limit: int = 0,
     use_curl: bool = True,
     timeout: int = 30,
-) -> bool:
+) -> Tuple[bool, str]:
     """
     加购成功后向后台发送 POST addedCartCallbackSimple。
 
     Returns:
-        True 表示接口返回 200 且 Success 为 true；否则 False。
-        - 网络类失败：立即 / 1 分钟 / 5 分钟（call_api_with_retries 默认）
-        - Success=false：短间隔再试若干次（见 ADDED_CART_BUSINESS_RETRY_WAITS）
+        (ok, message)：ok 表示 200 且 Success 为真；message 为接口 Message 或失败原因。
+        签名先 full，失败后再试 omit_empty（空字段不参与验签，与 getOrderSimple 一致）。
     """
+    _ = use_curl
+    log = _make_cb_log(config)
     api_config = config.get("order_api") or {}
     url = (api_config.get("added_cart_callback_url") or "").strip()
     secret = str(order.get("secret") or api_config.get("secret") or "").strip()
@@ -124,21 +152,23 @@ def send_added_cart_callback(
     )
 
     if not url:
-        _cb_log("未配置 order_api.added_cart_callback_url，跳过回调")
-        return False
+        msg = "未配置 order_api.added_cart_callback_url"
+        log("%s，跳过回调", msg)
+        return False, msg
     if not secret or not pc_mark:
-        _cb_log("未配置 order_api.secret 或 pc_mark，跳过回调")
-        return False
+        msg = "未配置 order_api.secret 或 pc_mark"
+        log("%s，跳过回调", msg)
+        return False, msg
 
     order_id = str(order.get("order_id") or "").strip()
     mark_raw = order.get("mark")
-    mark_str = "" if mark_raw is None else str(mark_raw)
+    mark_str = "" if mark_raw is None else str(mark_raw).strip()
     goods_id = str(product.get("goods_id") or "").strip()
     goods_no = str(product.get("goods_no") or "").strip()
     goods_number = int(product.get("quantity") or 0)
     store_name = str(product.get("shop_id") or "").strip() or "骏河屋"
 
-    params = {
+    base = {
         "OrderId": order_id,
         "GoodsId": goods_id,
         "GoodsNo": goods_no,
@@ -150,43 +180,61 @@ def send_added_cart_callback(
         "StoreName": store_name,
         "PcMark": pc_mark,
     }
-    sign_gen = SignGenerator(secret)
-    sign = sign_gen.generate_sign(params)
-    params["Sign"] = sign
-
-    _cb_log("请求 URL: %s", url)
-    _cb_log(
-        "请求参数(form-data): %s",
-        " ".join("%s=%s" % (k, v) for k, v in params.items()),
-    )
-    _cb_log("Sign: %s", sign)
 
     last_msg: Optional[str] = None
-
-    def _once(attempt_no: int):
-        nonlocal last_msg
-        _ = attempt_no
-        try:
-            status_code, response_text = _post_with_curl(url, params, timeout)
-            _cb_log("响应状态码: %s", status_code)
-            _cb_log("响应 body: %s", (response_text or "")[:500])
-        except Exception as e:
-            _cb_log("请求异常: %s %s", type(e).__name__, str(e))
-            last_msg = str(e)
-            return False, is_transient_http_error(0, str(e)), False
-
-        ok, retryable, msg = _parse_added_cart_response(status_code, response_text)
-        last_msg = msg
-        return ok, retryable, ok
-
-    # 先按业务短重试；若仍失败且像网络问题，外层再走长间隔（此处合并为短重试优先）
-    ok = bool(
-        call_api_with_retries(
-            "加购回调",
-            _once,
-            waits=ADDED_CART_BUSINESS_RETRY_WAITS,
-        )
+    log(
+        "OrderId=%s GoodsId=%s GoodsNo=%s StoreName=%s PcMark=%s Mark=%s qty=%s",
+        order_id,
+        goods_id,
+        goods_no,
+        store_name,
+        pc_mark,
+        mark_str,
+        goods_number,
     )
-    if not ok and last_msg:
-        _cb_log("最终失败 Message: %s", last_msg)
-    return ok
+
+    for omit_empty in (False, True):
+        sign_params = _params_for_sign(base, omit_empty=omit_empty)
+        sign = SignGenerator(secret).generate_sign(sign_params)
+        params = dict(base)
+        params["Sign"] = sign
+        mode_name = "omit_empty" if omit_empty else "full"
+        log("签名模式=%s Sign=%s", mode_name, sign)
+        log("请求 URL: %s", url)
+        log(
+            "请求参数(form-data): %s",
+            " ".join("%s=%s" % (k, v) for k, v in params.items()),
+        )
+
+        def _once(attempt_no: int, _params=params):
+            nonlocal last_msg
+            _ = attempt_no
+            try:
+                status_code, response_text = _post_with_curl(url, _params, timeout)
+                log("响应状态码: %s", status_code)
+                log("响应 body: %s", (response_text or "")[:500])
+            except Exception as e:
+                log("请求异常: %s %s", type(e).__name__, str(e))
+                last_msg = str(e)
+                return False, is_transient_http_error(0, str(e)), False
+
+            ok, retryable, msg = _parse_added_cart_response(
+                status_code, response_text, log
+            )
+            last_msg = msg
+            return ok, retryable, ok
+
+        # full 多试几次；omit_empty 仅短试（避免双模式叠满约 34s）
+        waits = ADDED_CART_BUSINESS_RETRY_WAITS if not omit_empty else (0.0, 2.0)
+        ok = bool(call_api_with_retries("加购回调", _once, waits=waits))
+        if ok:
+            return True, last_msg or ""
+
+        tip = str(last_msg or "")
+        # 明确业务拒绝不必换签名模式空耗
+        if any(k in tip for k in ("只支持加入", "不符合自动下单", "已加入", "重复")):
+            break
+
+    if last_msg:
+        log("最终失败 Message: %s", last_msg)
+    return False, last_msg or "addedCartCallbackSimple 失败"

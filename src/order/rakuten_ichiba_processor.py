@@ -3608,7 +3608,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     "quantity": line_qty,
                 }
                 try:
-                    ok_cb = send_added_cart_callback(
+                    ok_cb, cb_msg = send_added_cart_callback(
                         order,
                         callback_product,
                         config=self.config,
@@ -3622,7 +3622,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     )
                 if not ok_cb:
                     msgs = [
-                        "乐天市场：addedCartCallbackSimple 未成功（GoodsNo=%s）" % gno
+                        "乐天市场：addedCartCallbackSimple 未成功（GoodsNo=%s Message=%s）"
+                        % (gno, cb_msg or "-")
                     ]
                     self.logger.error("%s order=%s", msgs[0], order_id)
                     try:

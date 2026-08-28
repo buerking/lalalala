@@ -674,7 +674,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
         # addedCartCallbackSimple：与骏河屋一致（单商品）
         try:
-            ok_cb = send_added_cart_callback(
+            ok_cb, cb_msg = send_added_cart_callback(
                 order,
                 callback_product,
                 config=self.config,
@@ -685,9 +685,14 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception as e:
             return False, self._make_summary(order, failure_reason="加购回调异常: %s" % e)
         if not ok_cb:
-            msgs = ["雅虎闲置：addedCartCallbackSimple 未成功"]
+            msgs = [
+                "雅虎闲置：addedCartCallbackSimple 未成功（Message=%s）" % (cb_msg or "-")
+            ]
             self._handle_order_issue(order, msgs, reason="加购回调失败")
-            return False, self._make_summary(order, failure_reason="addedCartCallbackSimple 未成功")
+            return False, self._make_summary(
+                order,
+                failure_reason="addedCartCallbackSimple 未成功: %s" % (cb_msg or "-"),
+            )
 
         # 确认页：再次取当前页真实价 → 截图 + checkCartGoodsSimple
         price_int, price_err = self._require_page_price(driver, "下单确认页-checkCart前")

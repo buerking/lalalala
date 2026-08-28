@@ -280,7 +280,7 @@ class OrderProcessor(LoggerMixin):
                     # 加购成功后必须成功回调 addedCartCallbackSimple，否则停止后续、跳过本单并飞书
                     use_curl = (self.config.get('order_api') or {}).get('use_curl_for_order_api', True)
                     try:
-                        callback_ok = send_added_cart_callback(
+                        callback_ok, cb_msg = send_added_cart_callback(
                             order, product,
                             config=self.config,
                             is_lack=0,
@@ -294,15 +294,18 @@ class OrderProcessor(LoggerMixin):
                         return False, self._make_order_summary(order, failure_reason="加购回调请求异常: %s" % cb_err)
                     if not callback_ok:
                         self.logger.error(
-                            "加购回调 addedCartCallbackSimple 未成功（已短间隔重试仍失败）"
+                            "加购回调 addedCartCallbackSimple 未成功 Message=%s",
+                            cb_msg or "-",
                         )
                         messages.append(
-                            "加购回调 addedCartCallbackSimple 未成功或未调用（未配置/接口返回失败，已重试）"
+                            "加购回调 addedCartCallbackSimple 未成功（Message=%s）"
+                            % (cb_msg or "-")
                         )
                         self._handle_order_issue(order, messages, reason="加购回调失败")
                         return False, self._make_order_summary(
                             order,
-                            failure_reason="加购回调 addedCartCallbackSimple 未成功或未调用",
+                            failure_reason="加购回调 addedCartCallbackSimple 未成功: %s"
+                            % (cb_msg or "-"),
                         )
                     callback_done_keys.add(product_key)
                 except SurugayaLoginError as e:
