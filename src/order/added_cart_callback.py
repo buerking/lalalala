@@ -103,7 +103,11 @@ def send_added_cart_callback(
     api_config = config.get("order_api") or {}
     url = (api_config.get("added_cart_callback_url") or "").strip()
     secret = str(order.get("secret") or api_config.get("secret") or "").strip()
-    pc_mark = (api_config.get("pc_mark") or "").strip()
+    pull = order.get("_pull_site") if isinstance(order.get("_pull_site"), dict) else {}
+    pc_mark = (
+        str(pull.get("pc_mark") or "").strip()
+        or (api_config.get("pc_mark") or "").strip()
+    )
 
     if not url:
         print("[加购回调] 未配置 order_api.added_cart_callback_url，跳过回调")

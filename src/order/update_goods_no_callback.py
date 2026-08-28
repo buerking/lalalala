@@ -76,13 +76,23 @@ def send_update_goods_no_callback(
     url = (api_config.get("update_goods_no_callback_url") or "").strip()
     # 订单专属签名：优先使用 getOrderListSimple 返回的 order.secret
     secret = str(order.get("secret") or api_config.get("secret") or "").strip()
-    pc_mark = (api_config.get("pc_mark") or "").strip()
+    # 市场→书店转交：优先订单上锁定的拉单站 PcMark
+    pull = order.get("_pull_site") if isinstance(order.get("_pull_site"), dict) else {}
+    pc_mark = (
+        str(pull.get("pc_mark") or "").strip()
+        or (api_config.get("pc_mark") or "").strip()
+    )
     if not url or not secret or not pc_mark:
         return False, "未配置 update_goods_no_callback_url / secret / pc_mark"
 
     order_id = str(order.get("order_id") or "").strip()
     mark_raw = order.get("mark")
     mark_str = "" if mark_raw is None else str(mark_raw)
+
+    # 转交锁定的 StoreName 优先（拉单站：乐天市场）
+    store_locked = str(pull.get("store_name") or "").strip()
+    if store_locked:
+        store_name = store_locked
 
     goods_no_json = json.dumps(goods_no_list, separators=(",", ":"), ensure_ascii=False)
     screen_shot_urls_json = json.dumps([screenshot_url] if screenshot_url else [], ensure_ascii=False)

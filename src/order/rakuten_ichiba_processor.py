@@ -454,6 +454,118 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 break
             time.sleep(0.25)
 
+    def _is_medicine_confirmation_page(self, driver) -> bool:
+        """乐天市场：药品/特殊品类购买前确认页（【楽天市場】注意 / 医薬品をご購入の方へ）。"""
+        try:
+            title = (driver.title or "").strip()
+            if "注意" in title and "楽天" in title:
+                # 需再确认有同意按钮或药品文案，避免误伤其它「注意」页
+                pass
+            else:
+                # 无标题特征时仍可用正文/按钮识别
+                pass
+        except Exception:
+            title = ""
+        try:
+            for el in self._find_elements_now(
+                driver,
+                By.CSS_SELECTOR,
+                'button[aria-label="内容に同意して購入手続きへ"]',
+            ):
+                if el.is_displayed():
+                    return True
+        except Exception:
+            pass
+        try:
+            body = (driver.find_element(By.TAG_NAME, "body").text or "")[:4000]
+        except Exception:
+            body = ""
+        markers = (
+            "医薬品をご購入の方へ",
+            "内容に同意して購入手続きへ",
+            "医薬品を購入にあたっての確認事項",
+            "special-genre-confirm-message",
+        )
+        if any(m in body for m in markers):
+            return True
+        try:
+            html = (driver.page_source or "")[:12000]
+            if "specialGenreInfo" in html or "special-genre-confirm-message" in html:
+                if "内容に同意して購入手続きへ" in html or "医薬品" in html:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _handle_medicine_confirmation_page(
+        self, driver, timeout: float = 8.0
+    ) -> bool:
+        """
+        加购/进入購入手続き后可能跳转药品确认页；点「内容に同意して購入手続きへ」继续。
+        不点「商品ページに戻る」。
+        """
+        deadline = time.time() + max(1.0, float(timeout))
+        handled = False
+        while time.time() < deadline:
+            if not self._is_medicine_confirmation_page(driver):
+                if handled:
+                    return True
+                # 页面可能仍在加载，短暂再等
+                time.sleep(0.35)
+                if not self._is_medicine_confirmation_page(driver):
+                    return handled
+            btn = None
+            for css in (
+                'button[aria-label="内容に同意して購入手続きへ"]',
+                'button.type-primary--3XUZe',
+            ):
+                for el in self._find_elements_now(driver, By.CSS_SELECTOR, css):
+                    try:
+                        aria = (el.get_attribute("aria-label") or "").strip()
+                        text = (el.text or "").strip()
+                        blob = "%s %s" % (aria, text)
+                        if "商品ページに戻る" in blob or "戻る" == text:
+                            continue
+                        if "内容に同意" in blob or "購入手続きへ" in aria:
+                            if el.is_displayed() and el.is_enabled():
+                                btn = el
+                                break
+                    except Exception:
+                        continue
+                if btn is not None:
+                    break
+            if btn is None:
+                # XPath 兜底
+                try:
+                    for el in driver.find_elements(
+                        By.XPATH,
+                        "//button[contains(@aria-label,'内容に同意して購入手続きへ') "
+                        "or contains(normalize-space(.), '内容に同意して購入手続きへ')]",
+                    ):
+                        if el.is_displayed() and el.is_enabled():
+                            btn = el
+                            break
+                except Exception:
+                    pass
+            if btn is None:
+                time.sleep(0.4)
+                continue
+            try:
+                self._random_pre_click_wait("药品确认同意")
+                driver.execute_script("arguments[0].click();", btn)
+                handled = True
+                self.logger.info("乐天市场：已点击药品确认页「内容に同意して購入手続きへ」")
+                time.sleep(1.2)
+                self._ensure_session_after_action(wait_seconds=1.0)
+                # 偶发连续两页确认，再扫一次
+                if self._is_medicine_confirmation_page(driver):
+                    continue
+                return True
+            except Exception as e:
+                self.logger.warning("乐天市场：药品确认页点击失败: %s", e)
+                time.sleep(0.5)
+        return handled
+
     def _iter_visible_modals(self, driver) -> List[Any]:
         """返回当前可见的确认页/通用 modal 根节点。"""
         roots: List[Any] = []
@@ -2014,6 +2126,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             self.logger.debug("乐天市场：加购前勾选确认项异常（忽略）: %s", e)
         self._click_add_to_cart_once(driver, prefer_fixed=prefer_fixed)
         time.sleep(float(self.ri_cfg.get("wait_after_add_click_seconds", 1.2)))
+        # 药品等特殊品类：加购后可能整页跳到「医薬品をご購入の方へ」
+        try:
+            self._handle_medicine_confirmation_page(driver, timeout=6.0)
+        except Exception as e:
+            self.logger.debug("乐天市场：药品确认页处理异常（忽略）: %s", e)
         self._try_set_quantity_in_dialog(driver, target_qty)
         self._confirm_sku_modal_if_needed(driver)
 
@@ -2999,6 +3116,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         time.sleep(float(self.ri_cfg.get("wait_after_shop_checkout_seconds", 4)))
         # 购物车结算常触发 session/upgrade（client=shopcart）
         self._ensure_session_after_action(wait_seconds=1.0)
+        # 药品确认页也可能出现在「購入手続き」之后
+        try:
+            self._handle_medicine_confirmation_page(driver, timeout=8.0)
+        except Exception as e:
+            self.logger.debug("乐天市场：结算后药品确认页异常（忽略）: %s", e)
         # 偶发中间页：お届け先 → 点「次へ」进入注文確認
         self._pass_delivery_address_step_if_present(driver)
 
@@ -3194,29 +3316,53 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
 
     def _build_books_handoff_config(self) -> Dict[str, Any]:
         """
-        市场站点转交书店流程时的配置：
-        复用同一浏览器会话；回传信用卡标识 / StoreName 沿用市场单（GroupId 246）。
+        市场→书店：只切换浏览器下单流程。
+        后台回调身份必须仍用拉单站（PcMark/StoreName/CreditCard/截图目录），
+        绝不可改成独立书店站 rakuten_books / 乐天书店。
         """
         cfg = dict(self.config)
         rb = dict(cfg.get("rakuten_books") or {})
-        # 市场订单 checkCart / 回调应对齐「乐天市场」，不要用独立书店站名
+        api = dict(cfg.get("order_api") or {})
         ichiba_store = (self.ri_cfg.get("store_name") or "乐天市场").strip()
-        rb["store_name"] = ichiba_store
-        rb["handoff_from_ichiba"] = True
-        # 市场转书店偶发 GoodsNo 形态不一致：校验失败仍尽量点确定，避免卡死确认页
-        rb.setdefault("commit_even_if_check_cart_fails", True)
-        rb.setdefault(
-            "purchase_url_template",
-            "https://books.rakuten.co.jp/mypage/delivery/status?order_number={purchase_no}",
+        ichiba_pc_mark = (
+            (api.get("pc_mark") or "").strip()
+            or "rakuten"
         )
         ichiba_card = (
             (self.ri_cfg.get("add_no_credit_card") or "").strip()
             or ((cfg.get("payment") or {}).get("add_no_credit_card") or "").strip()
             or "8828"
         )
-        # 市场拉单转交时强制用市场回传卡名，避免误用独立书店站的 rakuten_books 标识
+        # 锁定拉单站身份（转书店仅换流程，不换站点回调身份）
+        api["pc_mark"] = ichiba_pc_mark
+        if not (api.get("upload_folder") or "").strip():
+            api["upload_folder"] = "/rakutenscreen"
+        rb["store_name"] = ichiba_store
         rb["add_no_credit_card"] = ichiba_card
+        rb["handoff_from_ichiba"] = True
+        rb["pull_pc_mark"] = ichiba_pc_mark
+        rb["pull_store_name"] = ichiba_store
+        rb["pull_credit_card"] = ichiba_card
+        # 市场转书店偶发 GoodsNo 形态不一致：校验失败仍尽量点确定，避免卡死确认页
+        rb.setdefault("commit_even_if_check_cart_fails", True)
+        rb.setdefault(
+            "purchase_url_template",
+            "https://books.rakuten.co.jp/mypage/delivery/status?order_number={purchase_no}",
+        )
+        pay = dict(cfg.get("payment") or {})
+        pay["add_no_credit_card"] = ichiba_card
+        cfg["payment"] = pay
+        cfg["order_api"] = api
         cfg["rakuten_books"] = rb
+        self.logger.info(
+            "乐天市场→书店转交（仅流程）：PcMark=%s StoreName=%s CreditCard=%s "
+            "upload_folder=%s commit_even_if_check_cart_fails=%s",
+            ichiba_pc_mark,
+            ichiba_store,
+            ichiba_card,
+            api.get("upload_folder") or "",
+            rb.get("commit_even_if_check_cart_fails"),
+        )
         return cfg
 
     def _handoff_to_books_processor(
@@ -3240,11 +3386,17 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             order_id,
             len(merged),
         )
+        handoff_cfg = self._build_books_handoff_config()
+        rb = handoff_cfg.get("rakuten_books") or {}
         order2 = dict(order)
         order2["products"] = merged
-        books = RakutenBooksOrderProcessor(
-            self._build_books_handoff_config(), self.browser_manager
-        )
+        # 订单级锁定：后续 addNo / updateGoodsNo 优先读此快照，避免误用书店站默认
+        order2["_pull_site"] = {
+            "pc_mark": (rb.get("pull_pc_mark") or "rakuten").strip(),
+            "store_name": (rb.get("pull_store_name") or "乐天市场").strip(),
+            "credit_card": (rb.get("pull_credit_card") or "8828").strip(),
+        }
+        books = RakutenBooksOrderProcessor(handoff_cfg, self.browser_manager)
         return books.process_order(order2)
 
     def process_order(self, order: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:

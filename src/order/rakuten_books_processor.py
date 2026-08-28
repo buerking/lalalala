@@ -188,11 +188,95 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         self.logger.info("乐天书店：关键点击前随机等待 %.2f 秒（%s）", sec, action)
         time.sleep(sec)
 
-    def _store_name(self) -> str:
+    def _is_ichiba_handoff(self) -> bool:
+        return bool(self.rb_cfg.get("handoff_from_ichiba"))
+
+    def _pull_site_from_order(self, order: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        """拉单站身份快照（市场→书店转交流程时写入 order._pull_site）。"""
+        snap = {}
+        if isinstance(order, dict):
+            raw = order.get("_pull_site")
+            if isinstance(raw, dict):
+                snap = raw
+        return {
+            "pc_mark": str(snap.get("pc_mark") or "").strip(),
+            "store_name": str(snap.get("store_name") or "").strip(),
+            "credit_card": str(snap.get("credit_card") or "").strip(),
+        }
+
+    def _store_name(self, order: Optional[Dict[str, Any]] = None) -> str:
+        snap = self._pull_site_from_order(order)
+        if snap.get("store_name"):
+            return snap["store_name"]
+        if self._is_ichiba_handoff():
+            return (
+                self.rb_cfg.get("pull_store_name")
+                or self.rb_cfg.get("store_name")
+                or "乐天市场"
+            ).strip()
         return (self.rb_cfg.get("store_name") or "乐天书店").strip()
 
-    def _credit_card_label(self) -> str:
+    def _credit_card_label(self, order: Optional[Dict[str, Any]] = None) -> str:
+        snap = self._pull_site_from_order(order)
+        if snap.get("credit_card"):
+            return snap["credit_card"]
+        if self._is_ichiba_handoff():
+            # 转交时绝不能落到独立书店默认 rakuten_books
+            return (
+                self.rb_cfg.get("pull_credit_card")
+                or self.rb_cfg.get("add_no_credit_card")
+                or ((self.config.get("payment") or {}).get("add_no_credit_card") or "")
+                or "8828"
+            ).strip()
         return (self.rb_cfg.get("add_no_credit_card") or "rakuten_books").strip()
+
+    def _ensure_callback_pc_mark(self, order: Optional[Dict[str, Any]] = None) -> str:
+        """保证 config.order_api.pc_mark 为拉单站；转交时强制 rakuten。"""
+        api = dict(self.config.get("order_api") or {})
+        snap = self._pull_site_from_order(order)
+        want = (
+            snap.get("pc_mark")
+            or (self.rb_cfg.get("pull_pc_mark") if self._is_ichiba_handoff() else "")
+            or (api.get("pc_mark") or "")
+        ).strip()
+        if self._is_ichiba_handoff() and not want:
+            want = "rakuten"
+        if want and api.get("pc_mark") != want:
+            api["pc_mark"] = want
+            self.config["order_api"] = api
+            self.logger.info("乐天书店：回调 PcMark 锁定为拉单站 %s", want)
+        return (api.get("pc_mark") or want or "").strip()
+
+    def _log_callback_identity(self, phase: str, order: Dict[str, Any]) -> None:
+        api = self.config.get("order_api") or {}
+        self.logger.info(
+            "乐天书店：%s 回调身份 PcMark=%s StoreName=%s CreditCard=%s handoff=%s",
+            phase,
+            api.get("pc_mark") or "",
+            self._store_name(order),
+            self._credit_card_label(order),
+            self._is_ichiba_handoff(),
+        )
+
+    def _refresh_order_mark(self, order: Dict[str, Any], *, reason: str = "") -> bool:
+        """刷新 Mark/Secret（用当前拉单站 PcMark）。失败只记日志。"""
+        try:
+            self._ensure_callback_pc_mark(order)
+            from src.order.order_credentials import refresh_order_mark
+
+            refresh_order_mark(order, self.config)
+            self.logger.info(
+                "乐天书店：已刷新 Mark reason=%s Mark=%s secret_len=%s",
+                reason or "-",
+                order.get("mark"),
+                len(str(order.get("secret") or "")),
+            )
+            return True
+        except Exception as e:
+            self.logger.warning(
+                "乐天书店：刷新 Mark 失败 reason=%s: %s", reason or "-", e
+            )
+            return False
 
     def _make_summary(
         self,
@@ -824,13 +908,15 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         return goods_fee, operate_fee, total
 
     def _goods_list_from_order_products(
-        self, products: List[Dict[str, Any]]
+        self,
+        products: List[Dict[str, Any]],
+        order: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         用订单接口行的 GoodsNo（后端对账键）组装 GoodsList。
         市场→书店转交时尤其重要：确认页 DOM 常只有书目 ID/无链接，对不上接口 GoodsNo。
         """
-        store = self._store_name()
+        store = self._store_name(order)
         out: List[Dict[str, Any]] = []
         for p in products or []:
             lines = list(p.get("_source_lines") or [p])
@@ -991,6 +1077,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if not products:
             return False, self._make_summary(order, failure_reason="订单无商品")
 
+        # 市场转交：一开始就锁死拉单站 PcMark，避免后续回调落到 rakuten_books
+        self._ensure_callback_pc_mark(order)
+        if self._is_ichiba_handoff():
+            self._log_callback_identity("开单", order)
+
         driver = self.browser_manager.get_driver()
         use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
 
@@ -1084,7 +1175,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     ).strip()
                     or line_bid
                 )
-                callback_product["shop_id"] = self._store_name()
+                callback_product["shop_id"] = self._store_name(order)
                 callback_product["quantity"] = line_qty
                 try:
                     ok_cb = send_added_cart_callback(
@@ -1180,7 +1271,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     {
                         "No": bid,
                         "Num": max(1, q),
-                        "StoreName": self._store_name(),
+                        "StoreName": self._store_name(order),
                         "Price": price_int,
                     }
                 )
@@ -1199,7 +1290,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 operate_fee = total - goods_fee
 
         # checkCart 优先用接口 GoodsNo（市场转书店时确认页 DOM 常对不上）
-        order_goods = self._goods_list_from_order_products(products)
+        order_goods = self._goods_list_from_order_products(products, order)
         if order_goods:
             # 页面有单价时覆写价格，数量以订单为准（合并后更稳）
             if goods_list:
@@ -1221,7 +1312,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             goods_list = order_goods
             self.logger.info(
                 "乐天书店：checkCart GoodsList 改用订单 GoodsNo store=%s n=%s sample=%s",
-                self._store_name(),
+                self._store_name(order),
                 len(goods_list),
                 (goods_list[0].get("No") if goods_list else ""),
             )
@@ -1245,6 +1336,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     "乐天书店：无 ScreenShotUrl，仍继续 checkCart / 点击确定"
                 )
 
+            self._ensure_callback_pc_mark(order)
+            self._log_callback_identity("checkCart", order)
+            # 转交/长流程后 Mark 可能过期：先刷再校验
+            if self._is_ichiba_handoff():
+                self._refresh_order_mark(order, reason="checkCart前")
             self.logger.info(
                 "乐天书店：调用 checkCartGoodsSimple Total=%s GoodsFee=%s OperateFee=%s goods=%s",
                 total,
@@ -1262,6 +1358,26 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 goods_list_override=goods_list,
                 use_curl=use_curl,
             )
+            # 获取订单信息失败等：刷新 Mark 后再试一次
+            if (
+                not ok_chk
+                and self._is_ichiba_handoff()
+                and self._refresh_order_mark(order, reason="checkCart失败重试")
+            ):
+                self.logger.warning(
+                    "乐天书店：checkCart 失败，刷新 Mark 后重试 err=%s",
+                    chk_err,
+                )
+                ok_chk, chk_err, chk_raw = check_cart_goods_simple(
+                    order,
+                    total=total,
+                    goods_fee=goods_fee,
+                    operate_fee=operate_fee,
+                    screenshot_url=screen_url,
+                    config=self.config,
+                    goods_list_override=goods_list,
+                    use_curl=use_curl,
+                )
         finally:
             if shot_path:
                 try:
@@ -1272,29 +1388,31 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     pass
 
         if not ok_chk:
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [chk_err or "checkCartGoodsSimple 失败"],
-                    user_id=order.get("user_id"),
-                    extra="乐天书店结算校验失败",
-                )
-            except Exception:
-                pass
             allow_continue = bool(
                 self.rb_cfg.get("commit_even_if_check_cart_fails", False)
             )
-            if not allow_continue:
+            if allow_continue:
+                # 市场→书店转交常见 Mark/状态不一致；继续下单，勿发「需人工」以免误判整单失败
+                self.logger.warning(
+                    "乐天书店：checkCart 失败仍继续点「注文を確定する」 err=%s",
+                    chk_err,
+                )
+            else:
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [chk_err or "checkCartGoodsSimple 失败"],
+                        user_id=order.get("user_id"),
+                        extra="乐天书店结算校验失败",
+                    )
+                except Exception:
+                    pass
                 return False, self._make_summary(
                     order,
                     failure_reason=chk_err or "checkCartGoodsSimple 失败",
                     check_cart_requested=True,
                     check_cart_response=(chk_raw or "")[:500],
                 )
-            self.logger.warning(
-                "乐天书店：checkCart 失败仍继续点「注文を確定する」 err=%s",
-                chk_err,
-            )
 
         commit_sel = (
             self.rb_cfg.get("commit_order_button_css")
@@ -1383,15 +1501,18 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
         purchase_nobs = [{"no": purchase_no, "url": detail_url}]
 
+        self._ensure_callback_pc_mark(order)
+        self._refresh_order_mark(order, reason="addNo前")
+        self._log_callback_identity("addNo", order)
         self.logger.info(
             "乐天书店：调用 addNoCallbackSimple CreditCard=%s PurchaseNo=%s",
-            self._credit_card_label(),
+            self._credit_card_label(order),
             purchase_no,
         )
         ok_add, add_err, add_raw = send_add_no_callback(
             order,
             purchase_nobs,
-            credit_card=self._credit_card_label(),
+            credit_card=self._credit_card_label(order),
             config=self.config,
             use_curl=use_curl,
         )
@@ -1486,18 +1607,22 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 update_errors.append(msg)
                 self.logger.error("乐天书店：%s", msg)
 
+            self._ensure_callback_pc_mark(order)
+            self._refresh_order_mark(order, reason="updateGoodsNo前")
+            self._log_callback_identity("updateGoodsNo", order)
             self.logger.info(
-                "乐天书店：调用 updateGoodsNoCallback PurchaseNo=%s shot=%s goods=%s",
+                "乐天书店：调用 updateGoodsNoCallback PurchaseNo=%s shot=%s goods=%s StoreName=%s",
                 purchase_no,
                 "yes" if detail_shot_url else "no",
                 len(goods_no_list),
+                self._store_name(order),
             )
             ok_u, uerr = send_update_goods_no_callback(
                 order,
                 purchase_no,
                 goods_no_list,
                 detail_shot_url or "",
-                self._store_name(),
+                self._store_name(order),
                 self.config,
                 use_curl=use_curl,
             )

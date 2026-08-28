@@ -444,7 +444,12 @@ def check_cart_goods_simple(
     url = (api_config.get("check_cart_goods_url") or "").strip()
     # 订单专属签名：优先使用 getOrderListSimple 返回的 order.secret
     secret = str(order.get("secret") or api_config.get("secret") or "").strip()
-    pc_mark = (api_config.get("pc_mark") or "").strip()
+    # 市场→书店转交：优先订单上锁定的拉单站 PcMark
+    pull = order.get("_pull_site") if isinstance(order.get("_pull_site"), dict) else {}
+    pc_mark = (
+        str(pull.get("pc_mark") or "").strip()
+        or (api_config.get("pc_mark") or "").strip()
+    )
     if not url or not secret or not pc_mark:
         return False, "未配置 check_cart_goods_url / secret / pc_mark", ""
 
