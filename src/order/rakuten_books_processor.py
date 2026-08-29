@@ -263,8 +263,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         刷新 Mark/Secret。
         返回：
           "" — 成功
-          含「只支持加入」等 — 业务锁定文案（调用方应中止）
-          其它非空 — 软失败文案（可继续用拉单 Mark）
+          非空 — 失败文案（含「只支持加入」）；调用方应继续用拉单 Mark，勿整单中止
         """
         try:
             self._ensure_callback_pc_mark(order)
@@ -1126,22 +1125,14 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             self._log_callback_identity("开单", order)
         refresh_err = self._refresh_order_mark(order, reason="开单加购前")
         if refresh_err and self._is_auto_order_locked(refresh_err):
-            msg = (
-                "后台已锁定本单：%s（需人工在后台放单/重置后再自动下单；"
-                "继续加购只会误报验签失败）" % refresh_err
+            # 对齐雅虎闲置 / 乐天市场：不调用 getOrderSimple 换 Mark，直接用拉单 Mark。
+            # 「只支持加入一次」= 后台拒绝再发新 Mark，不代表本单不能做。
+            self.logger.info(
+                "乐天书店：开单 Mark 刷新被拒（%s），继续用拉单 Mark=%s",
+                refresh_err[:80],
+                str(order.get("mark") or "")[:24],
             )
-            self.logger.error("乐天书店：%s order=%s", msg, order_id)
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [msg],
-                    user_id=order.get("user_id"),
-                    extra="乐天书店：订单自动下单状态锁定，非页面问题。",
-                )
-            except Exception:
-                pass
-            return False, self._make_summary(order, failure_reason=msg)
-        if refresh_err:
+        elif refresh_err:
             self.logger.info(
                 "乐天书店：开单 Mark 刷新失败，继续用拉单 Mark（%s）",
                 str(order.get("mark") or "")[:24],
