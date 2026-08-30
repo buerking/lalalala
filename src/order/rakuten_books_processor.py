@@ -1,6 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 乐天书店（books.rakuten.co.jp）：多商品 → 购物车 → 结算确认 → 一键注文確定 → 注文完了。
+
+后端回调与乐天市场对齐（同一套接口，仅用拉单凭证）：
+  getOrderListSimple 拉单 Mark/Secret
+  → 按 List 行加购 → 每行 addedCartCallbackSimple
+  → 确认页金额 + checkCartGoodsSimple
+  → 注文確定 → addNoCallbackSimple → updateGoodsNoCallback
+
+不再调用已禁用的 getOrderSimple 刷新 Mark。
 """
 
 from __future__ import annotations
@@ -259,37 +267,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
 
     def _refresh_order_mark(self, order: Dict[str, Any], *, reason: str = "") -> str:
-        """
-        刷新 Mark/Secret。
-        返回：
-          "" — 成功
-          非空 — 失败文案（含「只支持加入」）；调用方应继续用拉单 Mark，勿整单中止
-        """
-        try:
-            self._ensure_callback_pc_mark(order)
-            from src.order.order_credentials import refresh_order_mark
-
-            refresh_order_mark(order, self.config)
-            self.logger.info(
-                "乐天书店：已刷新 Mark reason=%s Mark=%s secret_len=%s",
-                reason or "-",
-                order.get("mark"),
-                len(str(order.get("secret") or "")),
-            )
-            return ""
-        except Exception as e:
-            msg = str(e or "").strip()
-            self.logger.warning(
-                "乐天书店：刷新 Mark 失败 reason=%s: %s", reason or "-", msg
-            )
-            return msg or "刷新 Mark 失败"
-
-    def _is_auto_order_locked(self, message: str) -> bool:
-        msg = str(message or "")
-        return any(
-            k in msg
-            for k in ("只支持加入一次", "只支持加入一单", "不符合自动下单")
-        )
+        """已废弃：getOrderSimple 已禁用。保留空实现以免旧调用报错。"""
+        _ = (order, reason)
+        return ""
 
     def _make_summary(
         self,
@@ -1119,24 +1099,16 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if not products:
             return False, self._make_summary(order, failure_reason="订单无商品")
 
-        # 市场转交：一开始就锁死拉单站 PcMark，避免后续回调落到 rakuten_books
+        # 市场转交：一开始就锁死拉单站 PcMark，避免后续回调落到独立书店默认
         self._ensure_callback_pc_mark(order)
         if self._is_ichiba_handoff():
             self._log_callback_identity("开单", order)
-        refresh_err = self._refresh_order_mark(order, reason="开单加购前")
-        if refresh_err and self._is_auto_order_locked(refresh_err):
-            # 对齐雅虎闲置 / 乐天市场：不调用 getOrderSimple 换 Mark，直接用拉单 Mark。
-            # 「只支持加入一次」= 后台拒绝再发新 Mark，不代表本单不能做。
-            self.logger.info(
-                "乐天书店：开单 Mark 刷新被拒（%s），继续用拉单 Mark=%s",
-                refresh_err[:80],
-                str(order.get("mark") or "")[:24],
-            )
-        elif refresh_err:
-            self.logger.info(
-                "乐天书店：开单 Mark 刷新失败，继续用拉单 Mark（%s）",
-                str(order.get("mark") or "")[:24],
-            )
+        # 与乐天市场一致：只用 getOrderListSimple 的 Mark/Secret，不调 getOrderSimple
+        self.logger.info(
+            "乐天书店：使用拉单 Mark=%s secret_len=%s（不刷新 getOrderSimple）",
+            str(order.get("mark") or "")[:24],
+            len(str(order.get("secret") or "")),
+        )
         self._log_callback_identity("加购前回调身份", order)
 
         driver = self.browser_manager.get_driver()
@@ -1187,45 +1159,17 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             )
             if not purl:
                 continue
-            qty = int(product.get("quantity") or 1)
-            bid = extract_rakuten_book_id(purl) or ""
             source_lines: List[Dict[str, Any]] = list(
                 product.get("_source_lines") or [product]
             )
-            try:
-                self.logger.info(
-                    "乐天书店：加购 %s/%s（合并数量=%s，接口行=%s） %s",
-                    idx,
-                    len(products),
-                    qty,
-                    len(source_lines),
-                    purl,
-                )
-                self._add_product_to_cart(driver, purl, qty)
-            except Exception as e:
-                msg = "加购失败: %s url=%s" % (e, purl)
-                self.logger.error(msg)
-                try:
-                    self.feishu_notifier.notify_order_issue(
-                        str(order_id), [msg], user_id=order.get("user_id"), extra="乐天书店"
-                    )
-                except Exception:
-                    pass
-                return False, self._make_summary(order, failure_reason=msg)
-
+            # 与乐天市场一致：先校验 List 行齐全，再浏览器加购，再按行逐条 addedCart
             for line in source_lines:
-                line_qty = max(1, int(line.get("quantity") or 1))
-                line_url = normalize_rakuten_books_product_url(
-                    str(line.get("url") or purl)
-                )
-                line_bid = extract_rakuten_book_id(line_url) or bid
                 gid, gno = self._api_goods_id_and_no(line)
-                # GoodsId 必须用接口行；URL 书号仅作 GoodsNo 兜底，不可覆盖 GoodsId
                 if not gid:
                     msg = (
                         "订单商品缺少 GoodsId（getOrderListSimple List） "
                         "goods_id=%r goods_no=%r url=%s"
-                        % (gid, gno, line_url or purl)
+                        % (gid, gno, str(line.get("url") or purl))
                     )
                     self.logger.error("乐天书店：%s order=%s", msg, order_id)
                     try:
@@ -1239,7 +1183,55 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         pass
                     return False, self._make_summary(order, failure_reason=msg)
                 if not gno:
+                    line_bid = extract_rakuten_book_id(
+                        normalize_rakuten_books_product_url(
+                            str(line.get("url") or purl)
+                        )
+                    )
+                    if not line_bid:
+                        msg = (
+                            "订单商品缺少 GoodsNo（getOrderListSimple List） "
+                            "goods_id=%r url=%s" % (gid, purl)
+                        )
+                        self.logger.error("乐天书店：%s order=%s", msg, order_id)
+                        return False, self._make_summary(order, failure_reason=msg)
+
+            # 浏览器：按接口行加购（每行用该行数量；不跨行合并）
+            try:
+                self.logger.info(
+                    "乐天书店：加购组 %s/%s 接口行=%s %s",
+                    idx,
+                    len(products),
+                    len(source_lines),
+                    purl,
+                )
+                for line in source_lines:
+                    line_qty = max(1, int(line.get("quantity") or 1))
+                    line_url = normalize_rakuten_books_product_url(
+                        str(line.get("url") or purl)
+                    )
+                    self._add_product_to_cart(driver, line_url or purl, line_qty)
+            except Exception as e:
+                msg = "加购失败: %s url=%s" % (e, purl)
+                self.logger.error(msg)
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id), [msg], user_id=order.get("user_id"), extra="乐天书店"
+                    )
+                except Exception:
+                    pass
+                return False, self._make_summary(order, failure_reason=msg)
+
+            # 后端：List 每一行单独 addedCartCallbackSimple（与乐天市场相同）
+            for line in source_lines:
+                line_url = normalize_rakuten_books_product_url(
+                    str(line.get("url") or purl)
+                )
+                line_bid = extract_rakuten_book_id(line_url) or ""
+                gid, gno = self._api_goods_id_and_no(line)
+                if not gno:
                     gno = line_bid or gid
+                line_qty = max(1, int(line.get("quantity") or 1))
                 callback_product: Dict[str, Any] = {
                     "goods_id": gid,
                     "goods_no": gno,
@@ -1270,36 +1262,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     )
                 if not ok_cb:
                     tip = str(cb_msg or "")
-                    # 「只支持加入一次」不再刷 Mark；验签类可刷一次再试
-                    if self._is_auto_order_locked(tip):
-                        pass
-                    else:
-                        retry_mark = (not tip.strip()) or tip.strip() == "Success=false" or any(
-                            k in tip for k in ("验签", "签名", "Sign", "Mark")
-                        )
-                        if retry_mark:
-                            refresh_err2 = self._refresh_order_mark(
-                                order, reason="加购回调失败重试"
-                            )
-                            if refresh_err2 and self._is_auto_order_locked(refresh_err2):
-                                tip = refresh_err2
-                            elif not refresh_err2:
-                                try:
-                                    ok_cb, cb_msg = send_added_cart_callback(
-                                        order,
-                                        callback_product,
-                                        config=self.config,
-                                        is_lack=0,
-                                        is_limit=0,
-                                        use_curl=use_curl,
-                                    )
-                                except Exception as e:
-                                    return False, self._make_summary(
-                                        order, failure_reason="加购回调异常: %s" % e
-                                    )
-                                tip = str(cb_msg or "")
-                if not ok_cb:
-                    tip = str(cb_msg or tip or "")
                     msgs = [
                         "乐天书店：addedCartCallbackSimple 未成功"
                         "（GoodsId=%s GoodsNo=%s book=%s Message=%s）"
@@ -1451,9 +1413,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
             self._ensure_callback_pc_mark(order)
             self._log_callback_identity("checkCart", order)
-            # 转交/长流程后 Mark 可能过期：先刷再校验
-            if self._is_ichiba_handoff():
-                self._refresh_order_mark(order, reason="checkCart前")
             self.logger.info(
                 "乐天书店：调用 checkCartGoodsSimple Total=%s GoodsFee=%s OperateFee=%s goods=%s",
                 total,
@@ -1471,26 +1430,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 goods_list_override=goods_list,
                 use_curl=use_curl,
             )
-            # 获取订单信息失败等：刷新 Mark 后再试一次
-            if (
-                not ok_chk
-                and self._is_ichiba_handoff()
-                and not self._refresh_order_mark(order, reason="checkCart失败重试")
-            ):
-                self.logger.warning(
-                    "乐天书店：checkCart 失败，刷新 Mark 后重试 err=%s",
-                    chk_err,
-                )
-                ok_chk, chk_err, chk_raw = check_cart_goods_simple(
-                    order,
-                    total=total,
-                    goods_fee=goods_fee,
-                    operate_fee=operate_fee,
-                    screenshot_url=screen_url,
-                    config=self.config,
-                    goods_list_override=goods_list,
-                    use_curl=use_curl,
-                )
+            # 与乐天市场一致：不调 getOrderSimple 刷 Mark 重试
         finally:
             if shot_path:
                 try:
@@ -1615,7 +1555,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         purchase_nobs = [{"no": purchase_no, "url": detail_url}]
 
         self._ensure_callback_pc_mark(order)
-        self._refresh_order_mark(order, reason="addNo前")
         self._log_callback_identity("addNo", order)
         self.logger.info(
             "乐天书店：调用 addNoCallbackSimple CreditCard=%s PurchaseNo=%s",
@@ -1721,7 +1660,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 self.logger.error("乐天书店：%s", msg)
 
             self._ensure_callback_pc_mark(order)
-            self._refresh_order_mark(order, reason="updateGoodsNo前")
             self._log_callback_identity("updateGoodsNo", order)
             self.logger.info(
                 "乐天书店：调用 updateGoodsNoCallback PurchaseNo=%s shot=%s goods=%s StoreName=%s",
