@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """EDI 回调验签：密钥选择与失败判定（加购 / Mark 刷新等共用）。
 
-单订单回调优先使用 getOrderListSimple 返回的 order.secret（见 docs/run_flow_detailed.md）；
-仅当订单未带 Secret 时回退 order_api.secret。
+拉单返回的 order.secret 常不可用；列表接口用的全局 secret 更稳。
+与骏河屋约定一致：默认优先 global_secret。
 """
 
 from __future__ import annotations
@@ -61,11 +61,8 @@ def iter_sign_secrets(
     order: Dict[str, Any], api_config: Dict[str, Any]
 ) -> List[Tuple[str, str]]:
     """
-    返回 (label, secret)。
-
-    与 run_flow_detailed 约定一致：单订单回调优先 order.secret，
-    仅当订单未带 Secret 时才用配置 order_api.secret。
-    可用 order_api.sign_secret_prefer=global 覆盖（少数站点）。
+    返回 (label, secret)，优先最可能成功：
+    verified → last_good → global（默认）→ order
     """
     global _LAST_GOOD_SECRET
     order = order or {}
@@ -75,8 +72,7 @@ def iter_sign_secrets(
     if verified:
         return [("verified_secret", verified)]
 
-    # 文档约定默认 order；旧逻辑误改为 global 会导致与拉单 Secret 不一致
-    prefer = str(api_config.get("sign_secret_prefer") or "order").strip().lower()
+    prefer = str(api_config.get("sign_secret_prefer") or "global").strip().lower()
     order_sec = str(order.get("secret") or "").strip()
     global_sec = str(api_config.get("secret") or "").strip()
     last_sec = str(_LAST_GOOD_SECRET or "").strip()
@@ -90,12 +86,13 @@ def iter_sign_secrets(
         seen.add(sec)
         out.append((label, sec))
 
-    # last_good 仅在与 prefer 同侧时提前，避免跨单/跨站把错误密钥顶到最前
     if last_sec:
-        if prefer in ("global", "config", "api") and last_sec == global_sec:
+        if last_sec == global_sec:
             _add("global_secret", last_sec)
-        elif prefer not in ("global", "config", "api") and last_sec == order_sec:
+        elif last_sec == order_sec:
             _add("order_secret", last_sec)
+        else:
+            _add("last_good_secret", last_sec)
 
     if prefer in ("global", "config", "api"):
         _add("global_secret", global_sec)

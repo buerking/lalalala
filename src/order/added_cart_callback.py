@@ -129,7 +129,7 @@ def send_added_cart_callback(
     """
     Returns:
         (ok, message)
-    密钥：优先订单 Secret（getOrderListSimple），与文档约定一致；可回退全局 secret。
+    密钥：默认优先 order_api.secret（global），可回退订单 Secret；见 api_sign.iter_sign_secrets。
     """
     _ = use_curl
     log = _make_cb_log(config)
@@ -217,7 +217,7 @@ def send_added_cart_callback(
         "密钥优先序=%s 签名模式=%s sign_secret_prefer=%s",
         [x[0] for x in secrets],
         modes,
-        str(api_config.get("sign_secret_prefer") or "order"),
+        str(api_config.get("sign_secret_prefer") or "global"),
     )
     log(
         "待签 base(JSON)=%s",

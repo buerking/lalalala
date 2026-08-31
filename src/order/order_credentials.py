@@ -4,7 +4,7 @@
 错/过期 Mark 时：回调可能 Success=true，但后台订单状态不完结。
 市场→书店转交后仍用拉单站 PcMark 刷新本单凭证。
 
-验签：单订单回调优先 order.secret（拉单）；可用 sign_secret_prefer=global 覆盖。
+验签：默认优先 order_api.secret（global）；可用 sign_secret_prefer=order 覆盖。
 """
 
 from __future__ import annotations
