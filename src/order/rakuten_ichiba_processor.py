@@ -429,14 +429,30 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             except Exception:
                 pass
             try:
+                # 有选项+「変更する」的弹窗必须走选项处理，不能直接点 X 关掉
+                blocking = {
+                    id(m)
+                    for m in self._iter_visible_modals(driver)
+                    if self._modal_looks_option_required(driver, m)
+                }
                 for el in self._find_elements_now(
                     driver,
                     By.CSS_SELECTOR, 'button[aria-label="モーダルを閉じる"]'
                 ):
-                    if el.is_displayed():
-                        driver.execute_script("arguments[0].click();", el)
-                        dismissed = True
-                        time.sleep(0.3)
+                    if not el.is_displayed():
+                        continue
+                    try:
+                        root = el.find_element(
+                            By.XPATH,
+                            './ancestor::*[@aria-modal="true" or @role="dialog"][1]',
+                        )
+                        if id(root) in blocking:
+                            continue
+                    except Exception:
+                        pass
+                    driver.execute_script("arguments[0].click();", el)
+                    dismissed = True
+                    time.sleep(0.3)
             except Exception:
                 pass
             try:
@@ -586,9 +602,105 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     continue
         return roots
 
+    def _modal_looks_option_required(self, driver, modal) -> bool:
+        """有可选项 + 应用按钮的弹窗（お届け日時 / 配送方法等），不可直接点 X 关掉。"""
+        try:
+            has_choice = bool(
+                self._find_elements_in(
+                    driver, modal, By.CSS_SELECTOR, 'input[type="radio"], select'
+                )
+            )
+        except Exception:
+            has_choice = False
+        if not has_choice:
+            # 文案型选项（最短お届け日）也可能没有原生 radio
+            blob = self._modal_text_blob(modal)
+            has_choice = "最短お届け日" in blob or "日付指定" in blob
+        if not has_choice:
+            return False
+        return self._find_modal_confirm_button(driver, modal) is not None
+
+    def _has_blocking_confirm_modal(self, driver) -> bool:
+        for modal in self._iter_visible_modals(driver):
+            if self._modal_looks_option_required(driver, modal):
+                return True
+            if self._find_modal_confirm_button(driver, modal) is not None:
+                return True
+        return False
+
+    def _modal_text_blob(self, modal) -> str:
+        try:
+            return (modal.text or "").strip()
+        except Exception:
+            return ""
+
+    def _is_delivery_datetime_force_modal(self, modal) -> bool:
+        """强制指定お届け日時的弹窗（标题含「を指定してください」）。"""
+        blob = self._modal_text_blob(modal)
+        return "お届け日時" in blob and (
+            "を指定してください" in blob or "1回の配達" in blob
+        )
+
+    def _click_radio_by_label_texts(self, driver, modal, labels: tuple) -> bool:
+        """按可见文案点选 radio / 可点击行（兼容自定义控件）。"""
+        for label in labels:
+            if not label:
+                continue
+            # 优先：带该文案的 label 包住的 radio
+            try:
+                for lab in self._find_elements_in(
+                    driver, modal, By.XPATH, ".//label[contains(., '%s')]" % label
+                ):
+                    try:
+                        if not lab.is_displayed():
+                            continue
+                        radios = lab.find_elements(By.CSS_SELECTOR, 'input[type="radio"]')
+                        if radios:
+                            driver.execute_script("arguments[0].click();", radios[0])
+                        else:
+                            driver.execute_script("arguments[0].click();", lab)
+                        time.sleep(0.3)
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # 其次：role=radio 或含文案的可点击块
+            try:
+                for el in self._find_elements_in(
+                    driver,
+                    modal,
+                    By.XPATH,
+                    ".//*[@role='radio' and contains(., '%s')]" % label,
+                ):
+                    try:
+                        if el.is_displayed():
+                            driver.execute_script("arguments[0].click();", el)
+                            time.sleep(0.3)
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        return False
+
     def _click_first_option_in_modal(self, driver, modal) -> bool:
-        """在弹窗内选择第一个 radio / 有效 select 选项。"""
+        """
+        在弹窗内选择选项。
+        - 「お届け日時を指定してください」：固定点第一项「最短お届け日」（业务约定）
+        - 其它弹窗：已有选中则保留；否则第一项可见 radio
+        - select：占位未选时优先「指定なし」，否则第一项有效值
+        """
         chose = False
+        force_delivery = self._is_delivery_datetime_force_modal(modal)
+        if force_delivery:
+            if self._click_radio_by_label_texts(
+                driver,
+                modal,
+                ("最短お届け日", "最短"),
+            ):
+                return True
+
         radios = self._find_elements_in(
             driver, modal, By.CSS_SELECTOR, 'input[type="radio"]'
         )
@@ -600,20 +712,51 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             except Exception:
                 continue
         if visible_radios:
-            first = visible_radios[0]
+            selected = None
+            for radio in visible_radios:
+                try:
+                    if radio.is_selected():
+                        selected = radio
+                        break
+                except Exception:
+                    continue
+            # 强制お届け日時弹窗：即使已选「指定なし」也改点第一项
+            if force_delivery:
+                target = visible_radios[0]
+            elif selected is not None:
+                target = selected
+            else:
+                target = visible_radios[0]
             try:
-                if not first.is_selected():
-                    driver.execute_script("arguments[0].click();", first)
-                    time.sleep(0.25)
+                if selected is None or target is not selected or force_delivery:
+                    if force_delivery or not target.is_selected():
+                        driver.execute_script("arguments[0].click();", target)
+                        time.sleep(0.25)
                 chose = True
             except Exception:
                 try:
-                    label = first.find_element(By.XPATH, "./ancestor::label[1]")
+                    label = target.find_element(By.XPATH, "./ancestor::label[1]")
                     driver.execute_script("arguments[0].click();", label)
                     time.sleep(0.25)
                     chose = True
                 except Exception:
                     pass
+
+        if not chose and not force_delivery:
+            # 无原生 radio 时，尝试点第一段可选文案
+            if self._click_radio_by_label_texts(
+                driver, modal, ("最短お届け日",)
+            ):
+                chose = True
+
+        placeholder_texts = (
+            "選択してください",
+            "選択",
+            "時間を選択",
+            "日付を選択",
+            "",
+        )
+        prefer_texts = ("指定なし", "日付指定なし", "指定無し")
 
         for select_el in self._find_elements_in(driver, modal, By.CSS_SELECTOR, "select"):
             try:
@@ -624,36 +767,57 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 for option in select.options:
                     text = (option.text or "").strip()
                     value = (option.get_attribute("value") or "").strip()
-                    if not text or text in ("選択してください", "選択"):
+                    if text in placeholder_texts and not value:
                         continue
-                    if value == "" and text in ("選択してください", "選択"):
+                    if text in ("選択してください", "選択", "時間を選択", "日付を選択"):
                         continue
                     valid.append((value, text))
                 if not valid:
                     continue
-                current = (select.first_selected_option.text or "").strip()
-                if current in ("選択してください", "選択", ""):
-                    value, text = valid[0]
-                    if value:
-                        select.select_by_value(value)
-                    else:
-                        select.select_by_visible_text(text)
-                    time.sleep(0.25)
-                    chose = True
+                current = ""
+                try:
+                    current = (select.first_selected_option.text or "").strip()
+                except Exception:
+                    current = ""
+                if current and current not in placeholder_texts:
+                    continue
+                pick = None
+                for value, text in valid:
+                    if value == "unspecifiedDate" or any(
+                        p in text for p in prefer_texts
+                    ):
+                        pick = (value, text)
+                        break
+                if pick is None:
+                    pick = valid[0]
+                value, text = pick
+                if value:
+                    select.select_by_value(value)
+                else:
+                    select.select_by_visible_text(text)
+                time.sleep(0.25)
+                chose = True
             except Exception:
                 continue
         return chose
 
     def _find_modal_confirm_button(self, driver, modal):
-        """查找弹窗内「确认」类按钮（不含取消/关闭/变更）。"""
+        """
+        查找弹窗内「确认/应用」类按钮。
+        お届け日時强制弹窗主按钮是「決定する」；部分设置弹窗是「変更する」。
+        """
         exact_labels = (
-            "確認する",
-            "確認",
             "決定する",
             "決定",
+            "確認する",
+            "確認",
             "同意する",
             "了承しました",
             "OK",
+            "変更する",
+            "追加する",
+            "この内容で変更する",
+            "この内容で確定する",
         )
         for label in exact_labels:
             for el in self._find_elements_in(
@@ -664,43 +828,49 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         return el
                 except Exception:
                     continue
+        skip_tokens = (
+            "キャンセル",
+            "閉じる",
+            "戻る",
+            "解除",
+            "さらに表示",
+            "編集",
+            "詳細",
+            "更新",
+        )
+        primary_fallback = None
         for el in self._find_elements_in(driver, modal, By.CSS_SELECTOR, "button"):
             try:
                 if not el.is_displayed() or not el.is_enabled():
                     continue
                 aria = (el.get_attribute("aria-label") or "").strip()
                 text = (el.text or "").strip()
-                # 排除取消/关闭/变更等
-                skip_tokens = (
-                    "キャンセル",
-                    "閉じる",
-                    "変更",
-                    "戻る",
-                    "解除",
-                    "さらに表示",
-                )
                 blob = "%s %s" % (aria, text)
                 if any(tok in blob for tok in skip_tokens):
                     continue
+                if "変更" in blob and aria not in exact_labels and text not in exact_labels:
+                    if aria != "変更する" and text != "変更する":
+                        continue
                 if aria in exact_labels or text in exact_labels:
                     return el
-                # 文案恰好为「確認」或以其开头的短按钮
-                if text in exact_labels or aria.split()[:1] == ["確認"]:
-                    return el
+                cls = (el.get_attribute("class") or "")
+                if "type-primary" in cls and primary_fallback is None:
+                    primary_fallback = el
             except Exception:
                 continue
-        return None
+        return primary_fallback
 
     def _handle_confirm_page_option_modal(
         self, driver, timeout: float = 6.0
     ) -> bool:
         """
-        确认订单页弹窗：选择第一个选项后点确认。
-        典型出现在点击「注文を確定する」前后（店铺注意事项 / 配送选项等）。
+        确认订单页弹窗：选好选项后点「決定する/変更する/確認」。
+        常见：点击「注文を確定する」之后才弹出「お届け日時を指定してください」。
         """
         deadline = time.time() + max(0.5, float(timeout))
         handled_any = False
         idle_rounds = 0
+        warned_no_btn = False
         while time.time() < deadline:
             modals = self._iter_visible_modals(driver)
             if not modals:
@@ -716,21 +886,103 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             for modal in modals:
                 confirm_btn = self._find_modal_confirm_button(driver, modal)
                 if confirm_btn is None:
+                    if not warned_no_btn:
+                        snippet = self._modal_text_blob(modal).replace("\n", " ")[:120]
+                        self.logger.warning(
+                            "乐天市场：确认页可见弹窗但未找到決定する/変更する按钮 text=%s",
+                            snippet,
+                        )
+                        warned_no_btn = True
                     continue
-                # 有确认按钮时：先选第一项（若有），再点确认
                 self._click_first_option_in_modal(driver, modal)
+                confirm_btn = self._find_modal_confirm_button(driver, modal)
+                if confirm_btn is None:
+                    continue
                 try:
+                    label = (
+                        (confirm_btn.get_attribute("aria-label") or "")
+                        or (confirm_btn.text or "")
+                    ).strip()
                     driver.execute_script("arguments[0].click();", confirm_btn)
                     handled_any = True
                     progressed = True
-                    self.logger.info("乐天市场：已处理确认页弹窗（选第一项并确认）")
-                    time.sleep(0.6)
+                    self.logger.info(
+                        "乐天市场：已处理确认页弹窗（选项+「%s」）", label or "确认"
+                    )
+                    time.sleep(0.8)
                     break
                 except Exception as e:
                     self.logger.warning("乐天市场：确认页弹窗点击失败: %s", e)
             if not progressed:
                 time.sleep(0.25)
         return handled_any
+
+    def _click_commit_order_button(self, driver, commit_sel: str) -> None:
+        """点击确认页「注文を確定する」（调用方需先确保无阻塞弹窗）。"""
+        self._random_pre_click_wait("注文を確定する")
+        commit_btn = WebDriverWait(driver, 25).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, commit_sel))
+        )
+        driver.execute_script("arguments[0].click();", commit_btn)
+        self._ensure_session_after_action(wait_seconds=1.0)
+
+    def _commit_order_with_delivery_modal_gate(
+        self, driver, commit_sel: str
+    ) -> None:
+        """
+        点注文確定；若之后弹出「お届け日時を指定してください」，
+        选最短お届け日 → 決定する；仅在真正处理过该弹窗且仍停在确认页时再点一次確定。
+        无弹窗的正常单：最多多等约 2 秒探测，不拖慢主流程。
+        """
+        # 点之前若已有弹窗，先处理（不穿透遮罩点確定）
+        self._handle_confirm_page_option_modal(driver, timeout=4.0)
+        if self._has_blocking_confirm_modal(driver):
+            raise RuntimeError(
+                "确认页选项弹窗未关闭（お届け日時需选「最短お届け日」并点「決定する」）"
+            )
+
+        self._click_commit_order_button(driver, commit_sel)
+
+        # 短探测：点完后才弹出的お届け日時（正常无弹窗单很快进入成功/继续等待）
+        handled_delivery_modal = False
+        gate_deadline = time.time() + 2.5
+        while time.time() < gate_deadline:
+            try:
+                if self._is_order_success_page(driver):
+                    return
+            except Exception:
+                pass
+            modals = self._iter_visible_modals(driver)
+            if not modals:
+                time.sleep(0.3)
+                continue
+            self.logger.info("乐天市场：注文確定后出现弹窗，按选项处理")
+            self._handle_confirm_page_option_modal(driver, timeout=8.0)
+            handled_delivery_modal = True
+            break
+
+        if handled_delivery_modal and self._has_blocking_confirm_modal(driver):
+            raise RuntimeError(
+                "注文確定后お届け日時弹窗未能关闭（需「最短お届け日」+「決定する」）"
+            )
+
+        # 仅当我们刚关掉强制弹窗、且确认按钮仍在时，再点一次（避免正常单重复提交）
+        if not handled_delivery_modal:
+            return
+        for el in self._find_elements_now(
+            driver,
+            By.CSS_SELECTOR,
+            'button[aria-label="注文を確定する"], .commit-order-button button',
+        ):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    self.logger.info(
+                        "乐天市场：お届け日時弹窗已关，再次点击注文を確定する"
+                    )
+                    self._click_commit_order_button(driver, commit_sel)
+                    return
+            except Exception:
+                continue
 
     def _clear_cart(self, driver) -> None:
         """逐条删除；每次等待原按钮失效并刷新，禁止连续点击同一个旧按钮。"""
@@ -3277,6 +3529,13 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         确认页正文里也会出现「注文完了」（积分/延保说明），不能单独用该词判断成功。
         成功页以感谢文案或「注文番号 + 注文番号样式单号」为准，且确认按钮应已消失。
         """
+        # 选项弹窗未消时绝不能当成功（否则会误以为已点注文確定）
+        try:
+            if self._has_blocking_confirm_modal(driver):
+                return False
+        except Exception:
+            pass
+
         src = driver.page_source or ""
         success_kw = (
             self.ri_cfg.get("success_page_text") or "ご注文ありがとうございます"
@@ -3731,6 +3990,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 check_cart_response="ok",
             )
 
+        # 先处理需选选项的弹窗，再关信息类弹窗（避免 X 掉お届け日時）
+        try:
+            self._handle_confirm_page_option_modal(driver, timeout=5.0)
+        except Exception as e:
+            self.logger.warning("乐天市场：确认页预处理选项弹窗异常: %s", e)
         self._dismiss_interruptions(driver, timeout=3.0)
         try:
             self._pass_delivery_address_step_if_present(driver)
@@ -3742,14 +4006,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             or '.commit-order-button button[aria-label="注文を確定する"]'
         ).strip()
         try:
-            # 部分店铺在点確定前就会弹出需选第一项并确认的 modal
-            self._handle_confirm_page_option_modal(driver, timeout=3.0)
-            self._random_pre_click_wait("注文を確定する")
-            commit_btn = WebDriverWait(driver, 25).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, commit_sel))
-            )
-            driver.execute_script("arguments[0].click();", commit_btn)
-            self._ensure_session_after_action(wait_seconds=1.0)
+            # 点注文確定；若之后才弹出お届け日時，选最短お届け日→決定する，必要时再点一次確定
+            self._commit_order_with_delivery_modal_gate(driver, commit_sel)
         except Exception as e:
             msg = "点击注文確定失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
@@ -3758,7 +4016,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     str(order_id),
                     [msg],
                     user_id=order.get("user_id"),
-                    extra="乐天市场：确认页无法点击注文を確定する。",
+                    extra="乐天市场：确认页无法完成注文確定（含お届け日時弹窗）。",
                 )
             except Exception:
                 pass
@@ -3772,12 +4030,14 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         sec = int(self.ri_cfg.get("success_page_wait_seconds", 120))
         deadline = time.time() + max(10, sec)
         ok_page = False
+        modal_still_open = False
         while time.time() < deadline:
             try:
-                # 点確定后常见：店铺注意事项 / 选项弹窗 → 选第一项并确认
+                # 仅处理弹窗，不再在等待循环里补点注文確定（避免正常单重复提交）
                 self._handle_confirm_page_option_modal(driver, timeout=2.0)
+                modal_still_open = self._has_blocking_confirm_modal(driver)
             except Exception:
-                pass
+                modal_still_open = False
             try:
                 if self._is_order_success_page(driver):
                     ok_page = True
@@ -3787,10 +4047,18 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             time.sleep(1.0)
 
         if not ok_page:
+            hint = ""
+            try:
+                if modal_still_open or self._has_blocking_confirm_modal(driver):
+                    hint = (
+                        "；仍有未关闭的お届け日時弹窗（需「最短お届け日」+「決定する」）"
+                    )
+            except Exception:
+                pass
             msg = (
                 "乐天市场：超时未检测到成功页（需「ご注文ありがとうございます」或注文番号，"
-                "且确认页「注文を確定する」已消失），可能 3DS 或页面异常。URL: %s"
-                % (driver.current_url or "")
+                "且确认页「注文を確定する」已消失），可能 3DS、选项弹窗未消或页面异常。"
+                "URL: %s%s" % ((driver.current_url or ""), hint)
             )
             self.logger.error(msg)
             try:

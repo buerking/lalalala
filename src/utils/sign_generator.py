@@ -44,6 +44,19 @@ class SignGenerator:
         parts.append(f"key={self.client_secret}")
         return "&".join(parts)
 
+    def debug_concat_string(
+        self, params: Dict[str, Any], *, redact_secret: bool = True
+    ) -> str:
+        """与 generateSign 相同的拼接串；默认脱敏 key=，便于对照 JS concatenatedString。"""
+        sorted_params = self.sort_params(params)
+        parts = [f"{k}={v}" for k, v in sorted_params.items()]
+        sec = self.client_secret or ""
+        if redact_secret:
+            parts.append("key=<redacted len=%s>" % len(sec))
+        else:
+            parts.append("key=%s" % sec)
+        return "&".join(parts)
+
     def generate_sign(self, params: Dict[str, Any]) -> str:
         """
         生成签名步骤：

@@ -924,14 +924,12 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
     @staticmethod
     def _api_goods_id_and_no(product: Dict[str, Any]) -> Tuple[str, str]:
-        """优先用 getOrderListSimple 行的 GoodsId/GoodsNo；勿用 URL 书号覆盖 GoodsId。"""
-        gid = str(product.get("goods_id") or product.get("GoodsId") or "").strip()
-        gno = str(
-            product.get("goods_no")
-            or product.get("no")
-            or product.get("GoodsNo")
-            or ""
-        ).strip()
+        """
+        与乐天市场一致：只用 getOrderListSimple List 落库后的 goods_id / goods_no。
+        禁止用 URL 书号、product.no 等字段顶替（否则 Sign 参与字段与后端库内行不一致 → 验签失败）。
+        """
+        gid = str(product.get("goods_id") or "").strip()
+        gno = str(product.get("goods_no") or "").strip()
         return gid, gno
 
     def _goods_list_from_order_products(
@@ -949,11 +947,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             lines = list(p.get("_source_lines") or [p])
             for line in lines:
                 _gid, no = self._api_goods_id_and_no(line)
-                if not no:
-                    no = (
-                        extract_rakuten_book_id(str(line.get("url") or ""))
-                        or str(line.get("goods_id") or "").strip()
-                    )
                 if not no:
                     continue
                 try:
@@ -1183,18 +1176,13 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         pass
                     return False, self._make_summary(order, failure_reason=msg)
                 if not gno:
-                    line_bid = extract_rakuten_book_id(
-                        normalize_rakuten_books_product_url(
-                            str(line.get("url") or purl)
-                        )
+                    msg = (
+                        "订单商品缺少 GoodsNo（getOrderListSimple List），"
+                        "不可用 URL 书号顶替。goods_id=%r url=%s"
+                        % (gid, str(line.get("url") or purl))
                     )
-                    if not line_bid:
-                        msg = (
-                            "订单商品缺少 GoodsNo（getOrderListSimple List） "
-                            "goods_id=%r url=%s" % (gid, purl)
-                        )
-                        self.logger.error("乐天书店：%s order=%s", msg, order_id)
-                        return False, self._make_summary(order, failure_reason=msg)
+                    self.logger.error("乐天书店：%s order=%s", msg, order_id)
+                    return False, self._make_summary(order, failure_reason=msg)
 
             # 浏览器：按接口行加购（每行用该行数量；不跨行合并）
             try:
@@ -1222,30 +1210,43 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     pass
                 return False, self._make_summary(order, failure_reason=msg)
 
-            # 后端：List 每一行单独 addedCartCallbackSimple（与乐天市场相同）
+            # 后端：List 每一行单独 addedCartCallbackSimple（与乐天市场相同字段，不用 URL 书号顶替 GoodsNo）
             for line in source_lines:
                 line_url = normalize_rakuten_books_product_url(
                     str(line.get("url") or purl)
                 )
-                line_bid = extract_rakuten_book_id(line_url) or ""
                 gid, gno = self._api_goods_id_and_no(line)
-                if not gno:
-                    gno = line_bid or gid
+                if not gid or not gno:
+                    msg = (
+                        "订单商品缺少 GoodsId/GoodsNo（getOrderListSimple List），"
+                        "拒绝用 URL 书号顶替。goods_id=%r goods_no=%r url=%s"
+                        % (gid, gno, line_url or purl)
+                    )
+                    self.logger.error("乐天书店：%s order=%s", msg, order_id)
+                    return False, self._make_summary(order, failure_reason=msg)
                 line_qty = max(1, int(line.get("quantity") or 1))
+                store = self._store_name(order)
                 callback_product: Dict[str, Any] = {
                     "goods_id": gid,
                     "goods_no": gno,
-                    "shop_id": self._store_name(order),
+                    "shop_id": store,
                     "quantity": line_qty,
-                    "url": line_url,
                 }
                 self.logger.info(
-                    "乐天书店：加购回调 GoodsId=%s GoodsNo=%s qty=%s book_id=%s Mark=%s",
+                    "乐天书店：addedCart 准备提交 "
+                    "OrderId=%s GoodsId=%s GoodsNo=%s(来自List) qty=%s "
+                    "StoreName=%s Mark=%s secret_len=%s url=%s "
+                    "line.raw goods_id=%r goods_no=%r",
+                    order_id,
                     gid,
                     gno,
                     line_qty,
-                    line_bid or "",
-                    str(order.get("mark") or "")[:24],
+                    store,
+                    str(order.get("mark") or ""),
+                    len(str(order.get("secret") or "")),
+                    line_url or purl,
+                    line.get("goods_id"),
+                    line.get("goods_no"),
                 )
                 try:
                     ok_cb, cb_msg = send_added_cart_callback(
@@ -1264,8 +1265,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     tip = str(cb_msg or "")
                     msgs = [
                         "乐天书店：addedCartCallbackSimple 未成功"
-                        "（GoodsId=%s GoodsNo=%s book=%s Message=%s）"
-                        % (gid, gno, line_bid or line_url, tip or "-")
+                        "（GoodsId=%s GoodsNo=%s Message=%s）"
+                        % (gid, gno, tip or "-")
                     ]
                     self.logger.error("%s order=%s", msgs[0], order_id)
                     try:
@@ -1332,24 +1333,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             self.logger.warning("乐天书店：解析结算页商品列表失败: %s", e)
 
         if not goods_list:
-            for p in products:
-                purl = (p.get("url") or "").strip()
-                bid = extract_rakuten_book_id(purl)
-                if not bid:
-                    continue
-                try:
-                    price_int = int(round(float(p.get("price") or 0)))
-                except Exception:
-                    price_int = 0
-                q = int(p.get("quantity") or 1)
-                goods_list.append(
-                    {
-                        "No": bid,
-                        "Num": max(1, q),
-                        "StoreName": self._store_name(order),
-                        "Price": price_int,
-                    }
-                )
+            # 确认页解析失败时仍用 List.GoodsNo，不用 /rb/{id} 书号顶替
+            goods_list = list(self._goods_list_from_order_products(products, order))
             try:
                 gf, of, tot = self._parse_books_confirm_totals(driver)
                 goods_fee = gf or goods_fee

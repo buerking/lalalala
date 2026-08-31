@@ -129,7 +129,7 @@ def send_added_cart_callback(
     """
     Returns:
         (ok, message)
-    密钥默认优先全局 secret（拉单 order.secret 常导致验签失败）。
+    密钥：优先订单 Secret（getOrderListSimple），与文档约定一致；可回退全局 secret。
     """
     _ = use_curl
     log = _make_cb_log(config)
@@ -156,7 +156,15 @@ def send_added_cart_callback(
     goods_id = str(product.get("goods_id") or "").strip()
     goods_no = str(product.get("goods_no") or "").strip()
     goods_number = int(product.get("quantity") or 0)
+    # StoreName：调用方传入的 shop_id（站点固定中文名，与市场/书店配置一致）
     store_name = str(product.get("shop_id") or "").strip() or "骏河屋"
+    order_sec = str(order.get("secret") or "").strip()
+    global_sec = str(api_config.get("secret") or "").strip()
+
+    if not goods_id or not goods_no:
+        msg = "addedCart 缺少 GoodsId/GoodsNo（须来自 getOrderListSimple List）"
+        log("%s goods_id=%r goods_no=%r", msg, goods_id, goods_no)
+        return False, msg
 
     base = {
         "OrderId": order_id,
@@ -173,47 +181,81 @@ def send_added_cart_callback(
 
     modes = iter_sign_modes(order, api_config)
     last_msg: Optional[str] = None
+    log("========== addedCartCallbackSimple 开始 ==========")
+    log("URL=%s", url)
     log(
-        "OrderId=%s GoodsId=%s GoodsNo=%s StoreName=%s PcMark=%s Mark=%s qty=%s",
+        "入参快照 OrderId=%s GoodsId=%s GoodsNo=%s GoodsNumber=%s "
+        "Mark=%s StoreName=%s PcMark=%s IsLack=%s IsLimit=%s IsNewOld=0",
         order_id,
         goods_id,
         goods_no,
+        goods_number,
+        mark_str,
         store_name,
         pc_mark,
-        mark_str,
-        goods_number,
+        is_lack,
+        is_limit,
     )
     log(
-        "密钥优先序=%s 签名模式=%s",
+        "凭证 order.mark_len=%s order.secret_len=%s "
+        "config.secret_len=%s pull_pc_mark=%s config.pc_mark=%s",
+        len(mark_str),
+        len(order_sec),
+        len(global_sec),
+        str(pull.get("pc_mark") or ""),
+        str(api_config.get("pc_mark") or ""),
+    )
+    log(
+        "product 原始字段 goods_id=%r goods_no=%r shop_id=%r quantity=%r "
+        "(GoodsNo 须等于 getOrderListSimple List.GoodsNo)",
+        product.get("goods_id"),
+        product.get("goods_no"),
+        product.get("shop_id"),
+        product.get("quantity"),
+    )
+    log(
+        "密钥优先序=%s 签名模式=%s sign_secret_prefer=%s",
         [x[0] for x in secrets],
         modes,
+        str(api_config.get("sign_secret_prefer") or "order"),
+    )
+    log(
+        "待签 base(JSON)=%s",
+        json.dumps(base, ensure_ascii=False, sort_keys=True),
     )
 
     for sec_label, secret in secrets:
         for mode in modes:
             sign_src = params_for_sign(base, mode)
-            sign = SignGenerator(secret).generate_sign(sign_src)
+            omitted = sorted(set(base.keys()) - set(sign_src.keys()))
+            gen = SignGenerator(secret)
+            sign = gen.generate_sign(sign_src)
+            concat_dbg = gen.debug_concat_string(sign_src, redact_secret=True)
             params = dict(base)
             params["Sign"] = sign
+            log("---------- 尝试验签 secret=%s mode=%s ----------", sec_label, mode)
+            log("参与签名字段(sorted)=%s", sorted(sign_src.keys()))
+            if omitted:
+                log("omit_empty 已排除空字段=%s", omitted)
             log(
-                "尝试 secret=%s mode=%s sign_keys=%s Sign=%s",
-                sec_label,
-                mode,
-                sorted(sign_src.keys()),
-                sign,
+                "参与签名参数(JSON)=%s",
+                json.dumps(sign_src, ensure_ascii=False, sort_keys=True),
             )
+            log("concatenatedString(密钥已脱敏)=%s", concat_dbg)
+            log("GoodsNo(参与签名)=%r Sign=%s secret_len=%s", goods_no, sign, len(secret))
             log(
-                "请求参数(form-data): %s",
+                "请求参数(form-data 完整)=%s",
                 " ".join("%s=%s" % (k, v) for k, v in params.items()),
             )
 
             def _once(attempt_no: int, _params=params):
                 nonlocal last_msg
-                _ = attempt_no
+                log("HTTP POST 第 %s 次", attempt_no)
                 try:
                     status_code, response_text = _post_with_curl(url, _params, timeout)
                     log("响应状态码: %s", status_code)
-                    log("响应 body: %s", (response_text or "")[:500])
+                    body = response_text or ""
+                    log("响应 body 全文: %s", body if len(body) <= 2000 else body[:2000] + "...(截断)")
                 except Exception as e:
                     log("请求异常: %s %s", type(e).__name__, str(e))
                     last_msg = str(e)
@@ -223,6 +265,18 @@ def send_added_cart_callback(
                     status_code, response_text, log
                 )
                 last_msg = msg
+                if (not ok) and is_sign_failure(str(msg or "")):
+                    log(
+                        "验签失败对照: GoodsNo=%r Mark=%r PcMark=%r "
+                        "StoreName=%r secret=%s mode=%s Sign=%s",
+                        _params.get("GoodsNo"),
+                        _params.get("Mark"),
+                        _params.get("PcMark"),
+                        _params.get("StoreName"),
+                        sec_label,
+                        mode,
+                        _params.get("Sign"),
+                    )
                 return ok, retryable, ok
 
             # 验签失败很快换下一密钥；非验签才短重试
@@ -231,10 +285,12 @@ def send_added_cart_callback(
             if ok:
                 remember_sign_strategy(order, secret=secret, mode=mode)
                 log("成功 secret=%s mode=%s", sec_label, mode)
+                log("========== addedCartCallbackSimple 结束 ok ==========")
                 return True, last_msg or ""
 
             tip = str(last_msg or "")
             if is_sign_failure(tip):
+                log("本轮验签失败，换下一密钥/模式 Message=%s", tip)
                 continue
             # 非验签：同一密钥再短重试一轮（含 2s/5s）
             ok = bool(
@@ -247,6 +303,7 @@ def send_added_cart_callback(
             if ok:
                 remember_sign_strategy(order, secret=secret, mode=mode)
                 log("成功 secret=%s mode=%s", sec_label, mode)
+                log("========== addedCartCallbackSimple 结束 ok ==========")
                 return True, last_msg or ""
             tip = str(last_msg or "")
             if any(k in tip for k in ("只支持加入", "不符合自动下单", "已加入", "重复")):
@@ -254,4 +311,9 @@ def send_added_cart_callback(
 
     if last_msg:
         log("最终失败 Message: %s", last_msg)
+    log(
+        "========== addedCartCallbackSimple 结束失败 GoodsNo=%s Message=%s ==========",
+        goods_no,
+        last_msg or "",
+    )
     return False, last_msg or "addedCartCallbackSimple 失败"
