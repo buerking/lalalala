@@ -300,8 +300,13 @@ class OrderFetcher(LoggerMixin):
             data = response.json()
             self.logger.info("[响应] 响应 body 前 200 字符: %s", str(data)[:200])
 
+        # 拉单原文摘要（Secret 脱敏），便于对照 addedCart 验签
+        self._log_pull_response_summary(data)
+
         # 解析所有订单
         one = self._parse_formal_api_response(data)
+        for o in one:
+            self._log_parsed_order_summary(o)
 
         # tenpo_cd（第三方店铺）订单：写入 PayPay 队列文件并跳过本轮自动处理
         orders: List[Dict[str, Any]] = []
@@ -583,7 +588,64 @@ class OrderFetcher(LoggerMixin):
             order['products'].append(product)
         
         return order
-    
+
+    @staticmethod
+    def _redact_pull_payload(obj: Any) -> Any:
+        """递归脱敏 Secret，保留其余字段便于日志对照。"""
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if str(k).lower() == "secret":
+                    s = "" if v is None else str(v)
+                    out[k] = "<redacted len=%s>" % len(s)
+                else:
+                    out[k] = OrderFetcher._redact_pull_payload(v)
+            return out
+        if isinstance(obj, list):
+            return [OrderFetcher._redact_pull_payload(x) for x in obj]
+        return obj
+
+    def _log_pull_response_summary(self, data: Dict[str, Any]) -> None:
+        try:
+            redacted = self._redact_pull_payload(data)
+            text = json.dumps(redacted, ensure_ascii=False)
+            if len(text) > 8000:
+                text = text[:8000] + "...(截断)"
+            self.logger.info("[订单接口] 拉单响应(Secret已脱敏): %s", text)
+            _print_debug("拉单响应(Secret已脱敏):", text[:2000])
+        except Exception as e:
+            self.logger.warning("[订单接口] 拉单响应摘要日志失败: %s", e)
+
+    def _log_parsed_order_summary(self, order: Dict[str, Any]) -> None:
+        try:
+            lines = []
+            for i, p in enumerate(order.get("products") or [], 1):
+                lines.append(
+                    {
+                        "i": i,
+                        "GoodsId": p.get("goods_id"),
+                        "GoodsNo": p.get("goods_no"),
+                        "GoodsNumber": p.get("quantity"),
+                        "GoodsPrice": p.get("price"),
+                        "GoodsUrl": p.get("url"),
+                    }
+                )
+            mark = "" if order.get("mark") is None else str(order.get("mark"))
+            sec = "" if order.get("secret") is None else str(order.get("secret"))
+            self.logger.info(
+                "[订单接口] 解析订单 OrderId=%s OrderNo=%s UserId=%s Mark=%s "
+                "secret_len=%s List行数=%s List=%s",
+                order.get("order_id"),
+                order.get("order_no"),
+                order.get("user_id"),
+                mark,
+                len(sec),
+                len(lines),
+                json.dumps(lines, ensure_ascii=False),
+            )
+        except Exception as e:
+            self.logger.warning("[订单接口] 解析订单摘要日志失败: %s", e)
+
     def _parse_order(self, order_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         解析单个订单数据（兼容旧格式，新格式请用 _parse_formal_api_order）
