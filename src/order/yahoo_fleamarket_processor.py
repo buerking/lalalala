@@ -1042,6 +1042,145 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             update_errors=update_errors,
         )
 
+    def submit_price_consultation(
+        self, product_url: str, bargain_yen: int, item_id: str
+    ) -> Tuple[bool, str]:
+        """
+        打开商品页，检测 #fltdscnt 议价窗口，填入 BargainPrice 并提交。
+        跳转到 /item/{id}/negotiate 视为提交完成。
+        """
+        driver = self.browser_manager.get_driver()
+        wait_sec = int(self.y_cfg.get("bargain_widget_wait_seconds", 25))
+        nego_sec = int(self.y_cfg.get("bargain_negotiate_wait_seconds", 20))
+        yen_str = str(int(bargain_yen))
+        self.logger.info(
+            "雅虎闲置议价：打开商品页提交価格の相談 item=%s yen=%s url=%s",
+            item_id,
+            yen_str,
+            product_url,
+        )
+        try:
+            self.browser_manager.navigate(product_url)
+        except Exception as e:
+            return False, "打开商品页失败: %s" % e
+
+        widget = None
+        try:
+            widget = WebDriverWait(driver, wait_sec).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#fltdscnt"))
+            )
+        except TimeoutException:
+            try:
+                widget = driver.find_element(
+                    By.CSS_SELECTOR,
+                    'input[placeholder="購入したい金額を入力"]',
+                )
+            except Exception:
+                widget = None
+        if widget is None:
+            return False, "商品页未找到议价窗口 #fltdscnt（価格の相談）"
+
+        inp = None
+        try:
+            inp = driver.find_element(
+                By.CSS_SELECTOR, "#fltdscnt input[type='tel']"
+            )
+        except Exception:
+            try:
+                inp = driver.find_element(
+                    By.CSS_SELECTOR,
+                    'input[placeholder="購入したい金額を入力"]',
+                )
+            except Exception:
+                inp = None
+        if inp is None:
+            return False, "议价窗口内未找到金额输入框"
+
+        try:
+            driver.execute_script(
+                """
+                var el = arguments[0];
+                var val = arguments[1];
+                el.focus();
+                var proto = Object.getOwnPropertyDescriptor(
+                  window.HTMLInputElement.prototype, 'value'
+                );
+                if (proto && proto.set) { proto.set.call(el, val); }
+                else { el.value = val; }
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                """,
+                inp,
+                yen_str,
+            )
+        except Exception as e:
+            return False, "填写议价金额失败: %s" % e
+
+        time.sleep(0.4)
+        try:
+            current = driver.execute_script("return arguments[0].value || '';", inp) or ""
+        except Exception:
+            current = ""
+        if str(current).strip() != yen_str:
+            try:
+                inp.clear()
+                inp.send_keys(yen_str)
+            except Exception as e:
+                return False, "议价金额未写入输入框: %s" % e
+
+        send_btn = None
+        try:
+            send_btn = driver.find_element(
+                By.CSS_SELECTOR, "#fltdscnt button[data-cl-params*='discount']"
+            )
+        except Exception:
+            try:
+                send_btn = driver.find_element(By.CSS_SELECTOR, "#fltdscnt button")
+            except Exception:
+                send_btn = None
+        if send_btn is None:
+            return False, "议价窗口内未找到提交按钮"
+
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            try:
+                disabled = send_btn.get_attribute("disabled")
+                if disabled in (None, "false", "0", ""):
+                    break
+            except Exception:
+                break
+            time.sleep(0.2)
+        try:
+            disabled = send_btn.get_attribute("disabled")
+            if disabled not in (None, "false", "0", ""):
+                return False, "议价提交按钮仍为 disabled，金额可能未生效"
+        except Exception:
+            pass
+
+        try:
+            self._random_pre_click_wait("価格の相談提交")
+            driver.execute_script("arguments[0].click();", send_btn)
+        except Exception as e:
+            return False, "点击议价提交按钮失败: %s" % e
+
+        try:
+            WebDriverWait(driver, nego_sec).until(
+                lambda d: "/negotiate" in ((d.current_url or "").lower())
+            )
+        except TimeoutException:
+            cur = ""
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                pass
+            return False, "提交后未进入协商页 /negotiate 当前URL=%s" % cur
+
+        self.logger.info(
+            "雅虎闲置议价：已进入协商页 URL=%s",
+            driver.current_url or "",
+        )
+        return True, ""
+
     def _handle_order_issue(self, order: Dict[str, Any], messages: List[str], reason: str = "") -> None:
         order_id = order.get("order_id", "未知")
         user_id = order.get("user_id")

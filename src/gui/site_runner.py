@@ -615,6 +615,12 @@ class SiteRunner:
                 return False
 
         order_processor = self._new_order_processor()
+        bargain = self._yahoo_bargain_service(order_processor)
+        if bargain is not None:
+            try:
+                bargain.monitor_and_purchase()
+            except Exception as e:
+                self._logger().error("雅虎闲置议价盯价失败: %s", e, exc_info=True)
 
         try:
             orders = order_fetcher.fetch_orders()
@@ -622,6 +628,7 @@ class SiteRunner:
             self._logger().error("拉单失败: %s", e, exc_info=True)
             if summaries:
                 self._flush_success_log(summaries)
+            self._run_yahoo_bargain_submit(bargain)
             return False
 
         if not orders:
@@ -630,6 +637,7 @@ class SiteRunner:
                 self._logger().info("本轮仅处理 PayPay 队列")
             else:
                 self._logger().info("没有符合条件的订单")
+            self._run_yahoo_bargain_submit(bargain)
             return True
 
         self._logger().info("获取到 %s 个订单", len(orders))
@@ -660,7 +668,30 @@ class SiteRunner:
 
         self._flush_success_log(summaries)
         self._logger().info("任务完成，成功 %s/%s", success_count, len(orders))
+        self._run_yahoo_bargain_submit(bargain)
         return True
+
+    def _yahoo_bargain_service(self, order_processor: OrderProcessor):
+        if self.adapter != "yahoo_fleamarket":
+            return None
+        from src.order.yahoo_bargain_service import YahooBargainService
+        from src.order.yahoo_fleamarket_processor import YahooFleaMarketOrderProcessor
+
+        yp = YahooFleaMarketOrderProcessor(self.merged_config, self.browser_manager)
+        return YahooBargainService(
+            self.merged_config,
+            yp,
+            order_processor.process_order,
+            cooldown=self._sleep_order_cooldown_if_needed,
+        )
+
+    def _run_yahoo_bargain_submit(self, bargain) -> None:
+        if bargain is None:
+            return
+        try:
+            bargain.fetch_and_submit_new()
+        except Exception as e:
+            self._logger().error("雅虎闲置议价拉单/提交失败: %s", e, exc_info=True)
 
     def _flush_success_log(self, summaries: list) -> None:
         if not summaries:

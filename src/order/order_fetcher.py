@@ -354,6 +354,78 @@ class OrderFetcher(LoggerMixin):
         self.logger.info(f"成功从真实接口获取 {len(orders)} 个订单（已过滤 tenpo_cd）")
         return orders
 
+    def _bargain_list_url(self) -> str:
+        y_cfg = self.config.get("yahoo_fleamarket") or {}
+        url = (
+            (self.api_config.get("get_bargain_order_list_url") or "").strip()
+            or (y_cfg.get("bargain_list_url") or "").strip()
+        )
+        if url:
+            return url
+        base = (self.get_order_list_simple_url or "").strip()
+        if "getOrderListSimple" in base:
+            return base.replace("getOrderListSimple", "getBargainOrderListSimple")
+        return "https://edi.jpgoodbuy.com/service.php?func=getBargainOrderListSimple"
+
+    def fetch_bargain_orders(self) -> List[Dict[str, Any]]:
+        """
+        拉取议价订单：POST getBargainOrderListSimple。
+        不传 GroupIds；空 OrderId 默认不参与签名（与 getOrderListSimple 一致）。
+        """
+        url = self._bargain_list_url()
+        self.logger.info(
+            "[议价接口] 请求 URL: %s, PcMark: %s, verify_ssl: %s, use_tls12: %s",
+            url,
+            self.pc_mark,
+            self.verify_ssl,
+            self.use_tls12,
+        )
+        sign_generator = SignGenerator(self.secret)
+        page_size_str = str(self.get_order_list_page_size)
+        post_body: Dict[str, str] = {
+            "OrderId": "",
+            "PcMark": str(self.pc_mark),
+            "PageSize": page_size_str,
+        }
+        sign_params: Dict[str, Any] = dict(post_body)
+        if self.get_order_list_sign_omit_empty_order_id and sign_params.get("OrderId") == "":
+            sign_params.pop("OrderId", None)
+        sign = sign_generator.generate_sign(sign_params)
+        body = dict(post_body)
+        body["Sign"] = sign
+        _print_debug("议价 sign_params:", sign_params)
+        _print_debug("议价 Sign:", sign)
+
+        if self.use_curl_for_order_api:
+            status_code, response_text = self._post_with_curl(url, body, self.timeout)
+            if status_code != 200:
+                raise requests.HTTPError(
+                    "HTTP %s" % status_code,
+                    response=type("R", (), {"status_code": status_code, "text": response_text})(),
+                )
+            data = json.loads(response_text) if response_text.strip() else {}
+        else:
+            post_headers = {k: v for k, v in self.headers.items() if k.lower() != "content-type"}
+            session = requests.Session()
+            if self.use_tls12:
+                session.mount("https://", TLS12Adapter())
+            response = session.post(
+                url,
+                data=body,
+                headers=post_headers,
+                timeout=self.timeout,
+                verify=self.verify_ssl,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        self._log_pull_response_summary(data)
+        orders = self._parse_formal_api_response(data)
+        for o in orders:
+            self._log_parsed_order_summary(o)
+        self.logger.info("成功从议价接口获取 %s 个订单", len(orders))
+        return orders
+
     def _load_pending_order_ids(self) -> List[str]:
         """从配置的 JSON 文件加载待处理订单 ID 列表（demo 模拟）。"""
         file_path = self.pending_order_ids_file.strip()
@@ -534,6 +606,7 @@ class OrderFetcher(LoggerMixin):
             'products': [],
             'mark': data.get('Mark'),
             'secret': data.get('Secret'),
+            'service_type_ids': list(data.get('ServiceTypeIds') or []),
         }
         
         for item in goods_list:
@@ -579,6 +652,12 @@ class OrderFetcher(LoggerMixin):
                 'goods_id': goods_id,
                 'goods_no': goods_no,
             }
+            bp_raw = item.get('BargainPrice')
+            if bp_raw is not None and str(bp_raw).strip() != '':
+                try:
+                    product['bargain_price'] = float(bp_raw)
+                except (TypeError, ValueError):
+                    product['bargain_price'] = 0
             # 为后续支付逻辑预留标记字段
             product['shop_id'] = shop_id
             product['is_third_party'] = is_third_party
@@ -627,6 +706,7 @@ class OrderFetcher(LoggerMixin):
                         "GoodsNo": p.get("goods_no"),
                         "GoodsNumber": p.get("quantity"),
                         "GoodsPrice": p.get("price"),
+                        "BargainPrice": p.get("bargain_price"),
                         "GoodsUrl": p.get("url"),
                     }
                 )
