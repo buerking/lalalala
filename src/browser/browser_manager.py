@@ -3,7 +3,7 @@
 """
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import SessionNotCreatedException, TimeoutException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
@@ -110,6 +110,52 @@ class BrowserManager(LoggerMixin):
     def _get_chromedriver_path(self) -> Optional[Path]:
         """兼容旧调用；Edge 时读 edgedriver_path。"""
         return self._get_driver_binary_path()
+
+    @staticmethod
+    def _is_driver_version_mismatch(exc: BaseException) -> bool:
+        if isinstance(exc, SessionNotCreatedException):
+            msg = str(exc).lower()
+        else:
+            msg = str(exc or "").lower()
+        if "session not created" not in msg and "this version of" not in msg:
+            return False
+        return any(
+            s in msg
+            for s in (
+                "only supports",
+                "this version of chromedriver",
+                "this version of msedgedriver",
+                "chrome version",
+            )
+        )
+
+    def _create_webdriver(
+        self,
+        engine: str,
+        options: Union[ChromeOptions, EdgeOptions],
+        driver_path: Optional[Path],
+    ) -> WebDriver:
+        if engine == "edge":
+            if driver_path:
+                self.logger.info("使用固定 msedgedriver: %s", driver_path)
+                return webdriver.Edge(
+                    service=EdgeService(executable_path=str(driver_path)),
+                    options=options,
+                )
+            self.logger.info(
+                "未使用固定 msedgedriver，由 Selenium Manager 按当前 Edge 版本自动匹配"
+            )
+            return webdriver.Edge(options=options)
+        if driver_path:
+            self.logger.info("使用固定 chromedriver: %s", driver_path)
+            return webdriver.Chrome(
+                service=ChromeService(executable_path=str(driver_path)),
+                options=options,
+            )
+        self.logger.info(
+            "未使用固定 chromedriver，由 Selenium Manager 按当前 Chrome 版本自动匹配"
+        )
+        return webdriver.Chrome(options=options)
 
     @staticmethod
     def detect_profile_lock_markers(user_data_dir: Optional[Path]) -> Dict[str, Any]:
@@ -231,31 +277,22 @@ class BrowserManager(LoggerMixin):
 
             driver_path = self._get_driver_binary_path()
             self.logger.info("启动浏览器 engine=%s binary=%s", engine, binary)
-            if engine == "edge":
-                if driver_path:
-                    self.logger.info("使用固定 msedgedriver: %s", driver_path)
-                    self.driver = webdriver.Edge(
-                        service=EdgeService(executable_path=str(driver_path)),
-                        options=options,
-                    )
-                else:
+            try:
+                self.driver = self._create_webdriver(engine, options, driver_path)
+            except Exception as e:
+                auto_match = self.browser_config.get("driver_auto_match", True)
+                if (
+                    driver_path
+                    and auto_match is not False
+                    and self._is_driver_version_mismatch(e)
+                ):
                     self.logger.warning(
-                        "未配置 browser.edgedriver_path 且 tools/msedgedriver.exe 不存在，"
-                        "将使用 Selenium Manager 解析 msedgedriver（国内网络常失败，建议本机放置驱动）"
+                        "固定驱动与浏览器版本不一致，改由 Selenium Manager 自动匹配当前浏览器: %s",
+                        e,
                     )
-                    self.driver = webdriver.Edge(options=options)
-            else:
-                if driver_path:
-                    self.logger.info("使用固定 chromedriver: %s", driver_path)
-                    self.driver = webdriver.Chrome(
-                        service=ChromeService(executable_path=str(driver_path)),
-                        options=options,
-                    )
+                    self.driver = self._create_webdriver(engine, options, None)
                 else:
-                    self.logger.warning(
-                        "未配置 browser.chromedriver_path，将使用 Selenium Manager，首次启动可能较慢"
-                    )
-                    self.driver = webdriver.Chrome(options=options)
+                    raise
 
             implicit_wait = self.browser_config.get("implicit_wait", 10)
             self.driver.implicitly_wait(implicit_wait)
