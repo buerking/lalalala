@@ -676,6 +676,17 @@ class SiteRunner:
                         "update_errors": [],
                     }
                 )
+                try:
+                    from src.notification.feishu_notifier import FeishuNotifier
+
+                    FeishuNotifier(self.merged_config).notify_order_issue(
+                        str(order.get("order_id") or order_no),
+                        ["处理订单未捕获异常: %s" % e],
+                        user_id=order.get("user_id"),
+                        extra="若刚才已点注文確定/确认购买，请核对是否已出单。",
+                    )
+                except Exception:
+                    pass
             finally:
                 self._sleep_order_cooldown_if_needed()
 

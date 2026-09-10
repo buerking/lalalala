@@ -97,10 +97,12 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         time.sleep(sec)
 
     def _store_name(self) -> str:
-        return (self.y_cfg.get("store_name") or "雅虎闲置").strip()
+        return str(self.y_cfg.get("store_name") or "雅虎闲置").strip()
 
     def _credit_card(self) -> str:
-        return (self.config.get("payment") or {}).get("add_no_credit_card", "GMO2167")
+        return str(
+            (self.config.get("payment") or {}).get("add_no_credit_card") or "GMO2167"
+        ).strip()
 
     @staticmethod
     def _yen_text_to_int(raw: str) -> Optional[int]:

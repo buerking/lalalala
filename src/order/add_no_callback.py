@@ -90,6 +90,8 @@ def send_add_no_callback(
     mark_raw = order.get("mark")
     mark_str = "" if mark_raw is None else str(mark_raw)
 
+    # YAML 纯数字会被解析成 int；签名与回传一律当字符串
+    credit_card = str(credit_card or "").strip()
     # 转交锁定的 CreditCard 优先于入参（防止误传书店站默认）
     credit_locked = str(pull.get("credit_card") or "").strip()
     if credit_locked:

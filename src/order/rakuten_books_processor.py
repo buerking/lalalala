@@ -38,6 +38,17 @@ from src.auth.rakuten_session import RakutenLoginError, RakutenSessionGuard
 from src.utils.logger import LoggerMixin
 
 _RB_ID_RE = re.compile(r"/rb/(?P<id>\d+)", re.IGNORECASE)
+
+
+def _cfg_text(*vals: Any, default: str = "") -> str:
+    """YAML 里纯数字可能被解析成 int，不能直接 .strip()。"""
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return str(default or "")
 _BOOK_SHOP_ID_RE = re.compile(
     r"item\.rakuten\.co\.jp/book/(?P<id>\d+)", re.IGNORECASE
 )
@@ -217,26 +228,29 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if snap.get("store_name"):
             return snap["store_name"]
         if self._is_ichiba_handoff():
-            return (
-                self.rb_cfg.get("pull_store_name")
-                or self.rb_cfg.get("store_name")
-                or "乐天市场"
-            ).strip()
-        return (self.rb_cfg.get("store_name") or "乐天书店").strip()
+            return _cfg_text(
+                self.rb_cfg.get("pull_store_name"),
+                self.rb_cfg.get("store_name"),
+                default="乐天市场",
+            )
+        return _cfg_text(self.rb_cfg.get("store_name"), default="乐天书店")
 
     def _credit_card_label(self, order: Optional[Dict[str, Any]] = None) -> str:
         snap = self._pull_site_from_order(order)
         if snap.get("credit_card"):
-            return snap["credit_card"]
+            return str(snap["credit_card"]).strip()
         if self._is_ichiba_handoff():
             # 转交时绝不能落到独立书店默认 rakuten_books
-            return (
-                self.rb_cfg.get("pull_credit_card")
-                or self.rb_cfg.get("add_no_credit_card")
-                or ((self.config.get("payment") or {}).get("add_no_credit_card") or "")
-                or "8828"
-            ).strip()
-        return (self.rb_cfg.get("add_no_credit_card") or "rakuten_books").strip()
+            pay = (self.config.get("payment") or {})
+            return _cfg_text(
+                self.rb_cfg.get("pull_credit_card"),
+                self.rb_cfg.get("add_no_credit_card"),
+                pay.get("add_no_credit_card"),
+                default="8828",
+            )
+        return _cfg_text(
+            self.rb_cfg.get("add_no_credit_card"), default="rakuten_books"
+        )
 
     def _ensure_callback_pc_mark(self, order: Optional[Dict[str, Any]] = None) -> str:
         """保证 config.order_api.pc_mark 为拉单站；转交时强制 rakuten。"""

@@ -33,6 +33,19 @@ from src.auth.rakuten_session import RakutenLoginError, RakutenSessionGuard
 from src.utils.logger import LoggerMixin
 
 _BOOKS_RB_URL_RE = re.compile(r"books\.rakuten\.co\.jp/rb/", re.IGNORECASE)
+
+
+def _cfg_text(*vals: Any, default: str = "") -> str:
+    """YAML 里 8828 可能被解析成 int，不能直接 .strip()。"""
+    for v in vals:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return str(default or "")
+
+
 _BOOKS_HOST_RE = re.compile(r"books\.rakuten\.co\.jp", re.IGNORECASE)
 # 接口常给 item.rakuten.co.jp/book/...，打开后会跳到书店站
 _BOOKS_ICHIBA_SHOP_RE = re.compile(
@@ -211,14 +224,16 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         time.sleep(sec)
 
     def _store_name(self) -> str:
-        return (self.ri_cfg.get("store_name") or "乐天市场").strip()
+        return _cfg_text(self.ri_cfg.get("store_name"), default="乐天市场")
 
     def _credit_card_label(self) -> str:
         """addNoCallbackSimple 回传的 CreditCard（与后端约定标识，默认 8828；非浏览器选卡）。"""
         pay = self.config.get("payment") or {}
-        return (
-            (self.ri_cfg.get("add_no_credit_card") or pay.get("add_no_credit_card") or "8828")
-        ).strip()
+        return _cfg_text(
+            self.ri_cfg.get("add_no_credit_card"),
+            pay.get("add_no_credit_card"),
+            default="8828",
+        )
 
     @staticmethod
     def _line_no_for_check_cart(product: Dict[str, Any]) -> str:
@@ -3582,15 +3597,12 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         cfg = dict(self.config)
         rb = dict(cfg.get("rakuten_books") or {})
         api = dict(cfg.get("order_api") or {})
-        ichiba_store = (self.ri_cfg.get("store_name") or "乐天市场").strip()
-        ichiba_pc_mark = (
-            (api.get("pc_mark") or "").strip()
-            or "rakuten"
-        )
-        ichiba_card = (
-            (self.ri_cfg.get("add_no_credit_card") or "").strip()
-            or ((cfg.get("payment") or {}).get("add_no_credit_card") or "").strip()
-            or "8828"
+        ichiba_store = _cfg_text(self.ri_cfg.get("store_name"), default="乐天市场")
+        ichiba_pc_mark = _cfg_text(api.get("pc_mark"), default="rakuten")
+        ichiba_card = _cfg_text(
+            self.ri_cfg.get("add_no_credit_card"),
+            (cfg.get("payment") or {}).get("add_no_credit_card"),
+            default="8828",
         )
         # 锁定拉单站身份（转书店仅换流程，不换站点回调身份）
         api["pc_mark"] = ichiba_pc_mark
@@ -3651,9 +3663,9 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         order2["products"] = merged
         # 订单级锁定：后续 addNo / updateGoodsNo 优先读此快照，避免误用书店站默认
         order2["_pull_site"] = {
-            "pc_mark": (rb.get("pull_pc_mark") or "rakuten").strip(),
-            "store_name": (rb.get("pull_store_name") or "乐天市场").strip(),
-            "credit_card": (rb.get("pull_credit_card") or "8828").strip(),
+            "pc_mark": _cfg_text(rb.get("pull_pc_mark"), default="rakuten"),
+            "store_name": _cfg_text(rb.get("pull_store_name"), default="乐天市场"),
+            "credit_card": _cfg_text(rb.get("pull_credit_card"), default="8828"),
         }
         books = RakutenBooksOrderProcessor(handoff_cfg, self.browser_manager)
         return books.process_order(order2)
