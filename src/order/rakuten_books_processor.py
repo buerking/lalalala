@@ -430,6 +430,10 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         点击书店确认页「注文を確定する」。
         不依赖 element_to_be_clickable（右侧绝对定位浮层常导致误判不可点）。
         """
+        from src.utils.dev_test import DevTestStopBeforePurchase, stop_before_purchase
+
+        if stop_before_purchase(self.config):
+            raise DevTestStopBeforePurchase("本地测试：停在注文確定前")
         self._random_pre_click_wait("注文を確定する")
         last_err = ""
         for attempt in range(1, 4):
@@ -1466,6 +1470,17 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 self._pass_books_checkout_intermediates(driver)
             self._click_books_commit_order(driver, commit_sel)
         except Exception as e:
+            from src.utils.dev_test import DevTestStopBeforePurchase
+
+            if isinstance(e, DevTestStopBeforePurchase):
+                self.logger.warning("%s order=%s", e, order_id)
+                return True, self._make_summary(
+                    order,
+                    success=True,
+                    failure_reason=str(e),
+                    check_cart_requested=True,
+                    check_cart_response="ok",
+                )
             return False, self._make_summary(
                 order,
                 failure_reason="点击注文確定失败: %s" % e,

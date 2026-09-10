@@ -240,20 +240,37 @@ class YahooBargainService(LoggerMixin):
         if status in ("time_out", "lost") and messages:
             self._notify(rec, messages, "雅虎闲置议价 %s" % status)
 
+    def _dev_accept_unverified_submit(self, rec: Dict[str, Any]) -> bool:
+        """本地测试：未登录也可把 pending_submit 当成已提交，进入盯价。"""
+        from src.utils.dev_test import skip_bargain_submit_verify
+
+        if not skip_bargain_submit_verify(self.config):
+            return False
+        if str(rec.get("status") or "") != "pending_submit":
+            return False
+        rec["status"] = "watching"
+        rec["bargain_submitted_at"] = rec.get("bargain_submitted_at") or _now_iso()
+        rec["note"] = "本地测试：不验证议价提交成功，直接进入盯价"
+        self.store.upsert(rec)
+        self.logger.warning(
+            "本地测试：order=%s 跳过登录/协商页校验，进入盯价队列",
+            rec.get("order_id"),
+        )
+        return True
+
     def monitor_and_purchase(self) -> None:
         """每轮定时任务最前面：处理本地已提交的议价单。"""
         if not self.enabled_monitor():
             return
+        for rec in list(self.store.list_active()):
+            self._dev_accept_unverified_submit(rec)
         actives = self.store.list_active()
         if not actives:
             self.logger.info("雅虎闲置议价：本地队列无待处理记录")
             return
         hours = self._timeout_hours()
-        self.logger.info(
-            "雅虎闲置议价：开始盯价，本地活跃 %s 条（超时 %s 小时）",
-            len(actives),
-            hours,
-        )
+        watching = []
+        pending = []
         for rec in actives:
             oid = str(rec.get("order_id") or "")
             st = str(rec.get("status") or "")
@@ -270,8 +287,40 @@ class YahooBargainService(LoggerMixin):
                         ],
                     )
                     continue
-                if st != "watching":
-                    continue
+            except Exception as e:
+                self.logger.error(
+                    "雅虎闲置议价：超时检查异常 order=%s: %s", oid, e, exc_info=True
+                )
+            if st == "watching":
+                watching.append(rec)
+            elif st == "pending_submit":
+                pending.append(rec)
+        if pending:
+            self.logger.info(
+                "雅虎闲置议价：本地 pending_submit %s 条（提交尚未确认成功，"
+                "本轮不盯价、不比对现价，稍后会重新打开议价页尝试提交）",
+                len(pending),
+            )
+            for rec in pending:
+                self.logger.info(
+                    "雅虎闲置议价：pending order=%s note=%s",
+                    rec.get("order_no") or rec.get("order_id"),
+                    rec.get("note") or "",
+                )
+        if not watching:
+            if pending:
+                self.logger.info("雅虎闲置议价：无 watching 记录，跳过盯价")
+            else:
+                self.logger.info("雅虎闲置议价：本地队列无待盯价记录")
+            return
+        self.logger.info(
+            "雅虎闲置议价：开始盯价，watching %s 条（超时 %s 小时）",
+            len(watching),
+            hours,
+        )
+        for rec in watching:
+            oid = str(rec.get("order_id") or "")
+            try:
                 self._monitor_one(rec)
             except Exception as e:
                 self.logger.error(
@@ -366,6 +415,16 @@ class YahooBargainService(LoggerMixin):
             bargain_yen,
             oid,
         )
+        from src.utils.dev_test import stop_before_purchase as _dev_stop_buy
+
+        if _dev_stop_buy(self.config):
+            self.logger.warning(
+                "本地测试：达价且信息一致，按配置不自动购买 order=%s item=%s 现价=%s",
+                oid,
+                item_id,
+                listed,
+            )
+            return
         order = record_to_order(rec)
         try:
             bought, summary = self._process_order(order)
@@ -433,6 +492,8 @@ class YahooBargainService(LoggerMixin):
                     oid,
                     rec.get("mark"),
                 )
+            if existing is not None and self._dev_accept_unverified_submit(rec):
+                continue
             self._submit_one(rec)
 
         # 接口没返回、但本地仍 pending 的，本轮补提交
@@ -441,6 +502,8 @@ class YahooBargainService(LoggerMixin):
                 continue
             oid = str(rec.get("order_id") or "")
             if any(str(o.get("order_id") or "") == oid for o in orders):
+                continue
+            if self._dev_accept_unverified_submit(rec):
                 continue
             self.logger.info("雅虎闲置议价：补提交本地 pending_submit order=%s", oid)
             self._submit_one(rec)

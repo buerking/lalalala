@@ -4,9 +4,12 @@
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.common.by import By
+from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from typing import Dict, Any, Optional, Union
@@ -30,8 +33,64 @@ class BrowserManager(LoggerMixin):
         """
         self.config = config
         self.browser_config = config.get('browser', {})
-        self.driver: Optional[webdriver.Chrome] = None
+        self.driver: Optional[WebDriver] = None
         self._headless_active: bool = bool(self.browser_config.get("headless", False))
+
+    def _engine(self) -> str:
+        raw = str(self.browser_config.get("type") or self.browser_config.get("engine") or "chrome")
+        kind = raw.strip().lower()
+        if kind in ("edge", "msedge", "microsoft-edge"):
+            return "edge"
+        return "chrome"
+
+    def _default_edge_binary(self) -> str:
+        candidates = [
+            str(self.browser_config.get("edge_path") or "").strip(),
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            os.path.join(
+                os.environ.get("LOCALAPPDATA") or "",
+                r"Microsoft\Edge\Application\msedge.exe",
+            ),
+        ]
+        for p in candidates:
+            if p and os.path.isfile(p):
+                return p
+        return ""
+
+    def _project_root(self) -> Path:
+        return Path(__file__).parent.parent.parent
+
+    def _get_driver_binary_path(self) -> Optional[Path]:
+        """固定驱动：Chrome 用 chromedriver_path，Edge 用 edgedriver_path。"""
+        if self._engine() == "edge":
+            raw = str(
+                self.browser_config.get("edgedriver_path")
+                or os.environ.get("EDGEDRIVER")
+                or os.environ.get("MSEDGEDRIVER")
+                or ""
+            ).strip()
+            key = "edgedriver_path"
+            default_name = "msedgedriver.exe"
+        else:
+            raw = str(
+                self.browser_config.get("chromedriver_path")
+                or os.environ.get("CHROMEDRIVER")
+                or ""
+            ).strip()
+            key = "chromedriver_path"
+            default_name = "chromedriver.exe"
+        if not raw:
+            fallback = self._project_root() / "tools" / default_name
+            if fallback.is_file():
+                return fallback.resolve()
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = (self._project_root() / path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError("%s 路径不存在: %s" % (key, path))
+        return path
 
     def is_headless(self) -> bool:
         """当前实例是否以无头模式启动（启动后不变，直至 stop/重建）。"""
@@ -49,21 +108,8 @@ class BrowserManager(LoggerMixin):
         return Path(user_data_dir).resolve()
 
     def _get_chromedriver_path(self) -> Optional[Path]:
-        """优先使用固定驱动路径，避免每次等待 Selenium Manager 联网解析。"""
-        raw = str(
-            self.browser_config.get("chromedriver_path")
-            or os.environ.get("CHROMEDRIVER")
-            or ""
-        ).strip()
-        if not raw:
-            return None
-        path = Path(raw)
-        if not path.is_absolute():
-            project_root = Path(__file__).parent.parent.parent
-            path = (project_root / path).resolve()
-        if not path.is_file():
-            raise FileNotFoundError("chromedriver 路径不存在: %s" % path)
-        return path
+        """兼容旧调用；Edge 时读 edgedriver_path。"""
+        return self._get_driver_binary_path()
 
     @staticmethod
     def detect_profile_lock_markers(user_data_dir: Optional[Path]) -> Dict[str, Any]:
@@ -111,39 +157,44 @@ class BrowserManager(LoggerMixin):
         if self.driver is not None:
             self.logger.warning("浏览器已经在运行中")
             return
-        
+
+        engine = self._engine()
         try:
-            chrome_path = self.browser_config.get('chrome_path', '')
-            if not chrome_path or not os.path.exists(chrome_path):
-                raise FileNotFoundError(f"Chrome浏览器路径不存在: {chrome_path}")
-            
-            # 配置Chrome选项
-            chrome_options = Options()
-            chrome_options.binary_location = chrome_path
-            
-            if self.browser_config.get('headless', False):
-                chrome_options.add_argument('--headless')
-                # 无头模式在部分 Windows 环境下易因 GPU/DevTools 端口启动失败，默认缓解
-                if self.browser_config.get('headless_disable_gpu', True):
-                    chrome_options.add_argument('--disable-gpu')
-                    chrome_options.add_argument('--disable-software-rasterizer')
+            if engine == "edge":
+                binary = self._default_edge_binary()
+                if not binary:
+                    raise FileNotFoundError(
+                        "未找到 Microsoft Edge。请安装 Edge，或在 config 配置 browser.edge_path"
+                    )
+                options: Union[ChromeOptions, EdgeOptions] = EdgeOptions()
+            else:
+                binary = str(self.browser_config.get("chrome_path") or "").strip()
+                if not binary or not os.path.exists(binary):
+                    raise FileNotFoundError("Chrome浏览器路径不存在: %s" % binary)
+                options = ChromeOptions()
+            options.binary_location = binary
+
+            if self.browser_config.get("headless", False):
+                options.add_argument("--headless")
+                if self.browser_config.get("headless_disable_gpu", True):
+                    options.add_argument("--disable-gpu")
+                    options.add_argument("--disable-software-rasterizer")
                 self._headless_active = True
             else:
                 self._headless_active = False
 
-            # 可选：由配置追加参数（如 --remote-debugging-port=0 等），见 config browser.extra_chrome_args
             for raw in self.browser_config.get("extra_chrome_args") or []:
                 s = str(raw).strip()
                 if s:
-                    chrome_options.add_argument(s)
+                    options.add_argument(s)
 
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-            chrome_options.add_argument('--lang=ja-JP')
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            chrome_options.add_experimental_option(
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--lang=ja-JP")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option("useAutomationExtension", False)
+            options.add_experimental_option(
                 "prefs",
                 {
                     "intl.accept_languages": str(
@@ -153,70 +204,73 @@ class BrowserManager(LoggerMixin):
                 },
             )
 
-            # eager：DOM 就绪即返回，不等待全部资源；none：完全不等待（需配合 navigate_allow_timeout）
             pls = str(self.browser_config.get("page_load_strategy") or "").strip().lower()
             if pls in ("normal", "eager", "none"):
-                chrome_options.page_load_strategy = pls
-                self.logger.info("Chrome page_load_strategy=%s", pls)
-            
-            # 设置窗口大小
-            window_width = self.browser_config.get('window_width', 1920)
-            window_height = self.browser_config.get('window_height', 1080)
-            chrome_options.add_argument(f'--window-size={window_width},{window_height}')
-            
-            # 配置用户数据目录（用于保持登录状态）
+                options.page_load_strategy = pls
+                self.logger.info("%s page_load_strategy=%s", engine, pls)
+
+            window_width = self.browser_config.get("window_width", 1920)
+            window_height = self.browser_config.get("window_height", 1080)
+            options.add_argument("--window-size=%s,%s" % (window_width, window_height))
+
             user_data_dir_obj = self.get_user_data_dir_path(self.config)
             if user_data_dir_obj:
-                # 创建目录（如果不存在）
                 user_data_dir_obj.mkdir(parents=True, exist_ok=True)
                 lock_info = self.detect_profile_lock_markers(user_data_dir_obj)
                 if lock_info.get("occupied"):
                     raise RuntimeError(
-                        "检测到 user_data_dir 正在被占用（发现锁文件），请先关闭占用该 profile 的 Chrome/自动化：%s"
+                        "检测到 user_data_dir 正在被占用（发现锁文件），请先关闭占用该 profile 的浏览器/自动化：%s"
                         % ", ".join(lock_info.get("markers") or [])
                     )
                 user_data_dir = str(user_data_dir_obj)
-
-                chrome_options.add_argument(f'--user-data-dir={user_data_dir}')
-                self.logger.info(f"使用用户数据目录保持登录状态: {user_data_dir}")
-                self.logger.info("提示：如果Chrome浏览器正在运行，请先关闭后再启动系统")
+                options.add_argument("--user-data-dir=%s" % user_data_dir)
+                self.logger.info("使用用户数据目录保持登录状态: %s", user_data_dir)
             else:
                 self.logger.warning("未配置用户数据目录，登录状态将不会保持")
                 self.logger.warning("建议在config.yaml中配置 browser.user_data_dir")
-            
-            # 配置固定 chromedriver 后完全绕过 Selenium Manager。
-            chromedriver_path = self._get_chromedriver_path()
-            if chromedriver_path:
-                self.logger.info("使用固定 chromedriver: %s", chromedriver_path)
-                self.driver = webdriver.Chrome(
-                    service=Service(executable_path=str(chromedriver_path)),
-                    options=chrome_options,
-                )
+
+            driver_path = self._get_driver_binary_path()
+            self.logger.info("启动浏览器 engine=%s binary=%s", engine, binary)
+            if engine == "edge":
+                if driver_path:
+                    self.logger.info("使用固定 msedgedriver: %s", driver_path)
+                    self.driver = webdriver.Edge(
+                        service=EdgeService(executable_path=str(driver_path)),
+                        options=options,
+                    )
+                else:
+                    self.logger.warning(
+                        "未配置 browser.edgedriver_path 且 tools/msedgedriver.exe 不存在，"
+                        "将使用 Selenium Manager 解析 msedgedriver（国内网络常失败，建议本机放置驱动）"
+                    )
+                    self.driver = webdriver.Edge(options=options)
             else:
-                self.logger.warning(
-                    "未配置 browser.chromedriver_path，将使用 Selenium Manager，首次启动可能较慢"
-                )
-                self.driver = webdriver.Chrome(options=chrome_options)
-            
-            # 设置超时时间
-            implicit_wait = self.browser_config.get('implicit_wait', 10)
+                if driver_path:
+                    self.logger.info("使用固定 chromedriver: %s", driver_path)
+                    self.driver = webdriver.Chrome(
+                        service=ChromeService(executable_path=str(driver_path)),
+                        options=options,
+                    )
+                else:
+                    self.logger.warning(
+                        "未配置 browser.chromedriver_path，将使用 Selenium Manager，首次启动可能较慢"
+                    )
+                    self.driver = webdriver.Chrome(options=options)
+
+            implicit_wait = self.browser_config.get("implicit_wait", 10)
             self.driver.implicitly_wait(implicit_wait)
-            
-            page_load_timeout = self.browser_config.get('page_load_timeout', 30)
+
+            page_load_timeout = self.browser_config.get("page_load_timeout", 30)
             self.driver.set_page_load_timeout(page_load_timeout)
 
-            # 降低 Selenium 自动化指纹（不破解验证码，仅减少 webdriver 暴露）
             self._apply_stealth_patches()
-            
-            # 打开一个空白页（避免显示data:,）
             self.driver.get("about:blank")
-            
-            self.logger.info("浏览器启动成功")
-        
+            self.logger.info("浏览器启动成功（%s）", engine)
+
         except Exception as e:
-            self.logger.error(f"浏览器启动失败: {e}")
+            self.logger.error("浏览器启动失败: %s", e)
             if "user data directory is already in use" in str(e).lower():
-                self.logger.error("Chrome用户数据目录正在被使用，请关闭其他Chrome浏览器实例")
+                self.logger.error("用户数据目录正在被使用，请关闭占用同一 profile 的浏览器实例")
             raise
 
     def _apply_stealth_patches(self) -> None:
@@ -278,7 +332,7 @@ try {
             finally:
                 self.driver = None
     
-    def get_driver(self) -> webdriver.Chrome:
+    def get_driver(self) -> WebDriver:
         """
         获取WebDriver实例
         

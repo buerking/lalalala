@@ -10,6 +10,27 @@ from typing import Dict, Any, Optional, List
 from src.utils.logger import LoggerMixin
 from src.utils.retry import retry
 
+# 已点确认购买 / 注文確定之后才出现的文案 → 购买后；其余默认购买前。
+_AFTER_PURCHASE_MARKERS = (
+    "二次确认后",
+    "未在 120 秒内进入成功页",
+    "超时未检测到成功页",
+    "/order/done",
+    "ご注文ありがとうございます",
+    "注文を確定する」已消失",
+    "确认页「注文を確定する」已消失",
+)
+
+
+def classify_purchase_stage(
+    messages: Optional[List[str]] = None, extra: Optional[str] = None
+) -> str:
+    """返回 'after'（购买后）或 'before'（购买前）。"""
+    blob = "\n".join(list(messages or []) + [str(extra or "")])
+    if any(m in blob for m in _AFTER_PURCHASE_MARKERS):
+        return "after"
+    return "before"
+
 
 class FeishuNotifier(LoggerMixin):
     """飞书通知器"""
@@ -37,6 +58,11 @@ class FeishuNotifier(LoggerMixin):
         """统一 POST 到 webhook，校验 v2 要求的 msg_type / content。"""
         if not self.enabled:
             return
+        from src.utils.dev_test import skip_feishu as _dev_skip_feishu
+
+        if _dev_skip_feishu(self.config):
+            self.logger.info("本地测试：跳过飞书 Webhook")
+            return
         webhook_url = self._resolve_webhook_url(use_paypay_scan_webhook=use_paypay_scan_webhook)
         if not webhook_url:
             self.logger.warning("飞书Webhook URL未配置")
@@ -48,28 +74,41 @@ class FeishuNotifier(LoggerMixin):
             raise RuntimeError(f"飞书返回错误: {ret.get('msg', ret)}")
     
     @retry(max_attempts=3, delay=2.0)
-    def send_message(self, title: str, content: str, use_paypay_scan_webhook: bool = False):
+    def send_message(
+        self,
+        title: str,
+        content: str,
+        use_paypay_scan_webhook: bool = False,
+        header_template: str = "red",
+    ):
         """
         发送文本/卡片消息到飞书（v2：msg_type + content）
         
         Args:
             title: 消息标题
             content: 消息内容（支持 markdown 式排版）
+            header_template: 卡片标题色，如 red / orange / yellow
         """
         if not self.enabled:
             self.logger.debug("飞书通知已禁用")
+            return
+        from src.utils.dev_test import skip_feishu as _dev_skip_feishu
+
+        if _dev_skip_feishu(self.config):
+            self.logger.info("本地测试：跳过飞书 Webhook")
             return
         webhook_url = self._resolve_webhook_url(use_paypay_scan_webhook=use_paypay_scan_webhook)
         if not webhook_url:
             self.logger.warning("飞书Webhook URL未配置")
             return
+        color = (header_template or "red").strip().lower() or "red"
         try:
             # 飞书 v2 要求 msg_type + content；先尝试卡片，失败则降级为纯文本
             card = {
                 "config": {"wide_screen_mode": True},
                 "header": {
                     "title": {"tag": "plain_text", "content": title},
-                    "template": "red"
+                    "template": color,
                 },
                 "elements": [
                     {"tag": "div", "text": {"tag": "lark_md", "content": content}}
@@ -112,8 +151,25 @@ class FeishuNotifier(LoggerMixin):
             self.logger.warning("飞书Webhook URL未配置，跳过订单异常提醒")
             return
         try:
-            title = "【代购】自动下单异常，请人工处理"
+            stage = classify_purchase_stage(messages, extra)
+            if stage == "after":
+                title = "【购买后】已点确认/付款，请核对是否已出单"
+                header_template = "red"
+                banner = (
+                    "<font color='red'>**■■■ 购买后报错 · 已点确认/付款 · "
+                    "优先核对是否已扣款/已出单 ■■■**</font>"
+                )
+            else:
+                title = "【购买前】尚未付款，请人工处理"
+                header_template = "orange"
+                banner = (
+                    "<font color='orange'>**■■■ 购买前报错 · 尚未付款 · "
+                    "登录/加购/议价/限购/结算校验 ■■■**</font>"
+                )
             lines = [
+                banner,
+                "",
+                f"**阶段**: {'购买后' if stage == 'after' else '购买前'}",
                 f"**订单ID**: {order_id}",
                 "",
             ]
@@ -131,8 +187,12 @@ class FeishuNotifier(LoggerMixin):
                 lines.append("")
                 lines.append(extra)
             content = "\n".join(lines)
-            self.send_message(title, content)
-            self.logger.info(f"已发送飞书提醒: 订单 {order_id} 需人工处理")
+            self.send_message(title, content, header_template=header_template)
+            self.logger.info(
+                "已发送飞书提醒: 订单 %s 需人工处理 stage=%s",
+                order_id,
+                "购买后" if stage == "after" else "购买前",
+            )
         except Exception as e:
             self.logger.error(f"发送飞书订单异常提醒失败: {e}")
             raise

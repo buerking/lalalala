@@ -37,6 +37,11 @@ class TicketCreator(LoggerMixin):
             messages: 消息列表
             user_id: 用户ID（如果为空，将尝试从配置中读取默认用户ID）
         """
+        from src.utils.dev_test import skip_side_effects
+
+        if skip_side_effects(self.config):
+            self.logger.info("本地测试：跳过创建工单 order=%s", order_id)
+            return
         if not self.base_url:
             self.logger.warning("工单API基础URL未配置，跳过工单创建")
             # 为方便排查问题，仍然在日志中输出工单内容

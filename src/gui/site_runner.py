@@ -281,7 +281,7 @@ class SiteRunner:
             return []
         ps_cmd = (
             "Get-CimInstance Win32_Process | "
-            "Where-Object { $_.Name -match '^(?i)(chrome|chromedriver)\\.exe$' } | "
+            "Where-Object { $_.Name -match '^(?i)(chrome|chromedriver|msedge|msedgedriver)\\.exe$' } | "
             "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
         )
         try:
@@ -615,6 +615,13 @@ class SiteRunner:
                 return False
 
         order_processor = self._new_order_processor()
+        from src.utils.dev_test import is_enabled as _dev_test_on
+
+        if _dev_test_on(self.merged_config):
+            self._logger().warning(
+                "======== 本地测试模式 ======== 使用假单，不请求正式拉单接口；购买前停止"
+            )
+
         bargain = self._yahoo_bargain_service(order_processor)
         if bargain is not None:
             try:
@@ -647,6 +654,12 @@ class SiteRunner:
                 summaries.append(summary)
                 if ok:
                     success_count += 1
+                    if order.get("from_dev_test"):
+                        from src.utils.dev_test import mark_order_processed
+
+                        mark_order_processed(
+                            self.merged_config, order.get("order_id")
+                        )
             except Exception as e:
                 self._logger().error("处理订单异常: %s", e, exc_info=True)
                 order_no = str(order.get("order_no") or order.get("order_id") or "未知")

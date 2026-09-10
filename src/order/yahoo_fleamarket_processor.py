@@ -621,6 +621,20 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         if not clickable:
             clickable = buy_links[0]
 
+        from src.utils.dev_test import stop_before_purchase as _dev_stop_buy
+
+        if _dev_stop_buy(self.config):
+            self.logger.warning(
+                "本地测试：已找到购买按钮，按配置停在购买前 item=%s url=%s",
+                item_id,
+                product_url,
+            )
+            return True, self._make_summary(
+                order,
+                success=True,
+                failure_reason="本地测试：停在购买前（未点击購入手続きへ）",
+            )
+
         try:
             self._random_pre_click_wait("商品页購入手続きへ")
             driver.execute_script("arguments[0].click();", clickable)
@@ -1141,6 +1155,16 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         if send_btn is None:
             return False, "议价窗口内未找到提交按钮"
 
+        from src.utils.dev_test import submit_bargain as _dev_submit_bargain
+
+        if not _dev_submit_bargain(self.config):
+            self.logger.warning(
+                "本地测试：已填入议价金额 %s，按配置不点击发送 item=%s",
+                yen_str,
+                item_id,
+            )
+            return True, "本地测试：已填金额未点发送"
+
         deadline = time.time() + 8.0
         while time.time() < deadline:
             try:
@@ -1162,6 +1186,15 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             driver.execute_script("arguments[0].click();", send_btn)
         except Exception as e:
             return False, "点击议价提交按钮失败: %s" % e
+
+        from src.utils.dev_test import skip_bargain_submit_verify as _dev_skip_nego
+
+        if _dev_skip_nego(self.config):
+            self.logger.warning(
+                "本地测试：不验证是否进入 /negotiate（未登录也会视为已提交）item=%s",
+                item_id,
+            )
+            return True, "本地测试：跳过协商页校验"
 
         try:
             WebDriverWait(driver, nego_sec).until(

@@ -86,6 +86,11 @@ class OrderFetcher(LoggerMixin):
             requests.RequestException: API请求失败
             ValueError: 数据解析失败
         """
+        from src.utils.dev_test import is_enabled as _dev_test_on
+
+        if _dev_test_on(self.config):
+            return self._fetch_from_dev_test_fixture("orders")
+
         # 优先：真实订单接口（待处理订单 ID 列表 + POST getOrderSimple 验签）
         if self.get_order_detail_url and self.secret:
             return self._fetch_from_real_order_api()
@@ -372,6 +377,11 @@ class OrderFetcher(LoggerMixin):
         拉取议价订单：POST getBargainOrderListSimple。
         不传 GroupIds；空 OrderId 默认不参与签名（与 getOrderListSimple 一致）。
         """
+        from src.utils.dev_test import is_enabled as _dev_test_on
+
+        if _dev_test_on(self.config):
+            return self._fetch_from_dev_test_fixture("bargain")
+
         url = self._bargain_list_url()
         self.logger.info(
             "[议价接口] 请求 URL: %s, PcMark: %s, verify_ssl: %s, use_tls12: %s",
@@ -424,6 +434,49 @@ class OrderFetcher(LoggerMixin):
         for o in orders:
             self._log_parsed_order_summary(o)
         self.logger.info("成功从议价接口获取 %s 个订单", len(orders))
+        return orders
+
+    def _fetch_from_dev_test_fixture(self, kind: str) -> List[Dict[str, Any]]:
+        from src.utils.dev_test import bargain_fixture_path, load_json_file, orders_fixture_path
+
+        path = bargain_fixture_path(self.config) if kind == "bargain" else orders_fixture_path(self.config)
+        self.logger.warning(
+            "本地测试：不请求正式接口，改读假单文件 kind=%s path=%s",
+            kind,
+            path,
+        )
+        if not path.is_file():
+            self.logger.warning("本地测试：假单文件不存在，视为 0 单: %s", path)
+            return []
+        try:
+            data = load_json_file(path)
+        except Exception as e:
+            raise ValueError("本地测试假单 JSON 无效 %s: %s" % (path, e)) from e
+        if not isinstance(data, dict):
+            raise ValueError("本地测试假单须为正式接口信封 {Success, Data}: %s" % path)
+        orders = self._parse_formal_api_response(data)
+        for o in orders:
+            o["from_dev_test"] = True
+            self._log_parsed_order_summary(o)
+        if kind == "orders":
+            from src.utils.dev_test import load_processed_order_ids
+
+            done = load_processed_order_ids(self.config)
+            if done:
+                before = len(orders)
+                orders = [
+                    o
+                    for o in orders
+                    if str(o.get("order_id") or "").strip() not in done
+                ]
+                skipped = before - len(orders)
+                if skipped:
+                    self.logger.warning(
+                        "本地测试：跳过上轮已处理假单 %s 个，本轮待处理 %s 个",
+                        skipped,
+                        len(orders),
+                    )
+        self.logger.info("本地测试：从假单文件解析 %s 个订单", len(orders))
         return orders
 
     def _load_pending_order_ids(self) -> List[str]:

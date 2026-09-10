@@ -72,6 +72,11 @@ def send_update_goods_no_callback(
         (ok, error_message)
         网络类失败会按：立即重试 → 1 分钟 → 5 分钟 再试。
     """
+    from src.utils.dev_test import skip_side_effects
+
+    if skip_side_effects(config):
+        return True, "dev_test_skip"
+
     api_config = config.get("order_api") or {}
     url = (api_config.get("update_goods_no_callback_url") or "").strip()
     from src.utils.api_sign import pick_sign_secret

@@ -46,6 +46,7 @@ class MainWindow:
         self.last_time_label: Optional[ttk.Label] = None
         self.log_text: Optional[scrolledtext.ScrolledText] = None
         self.progress_text: Optional[scrolledtext.ScrolledText] = None
+        self._dev_test_var: Optional[tk.BooleanVar] = None
 
         if self.multi_mode:
             entries = list_site_entries(config)
@@ -135,6 +136,7 @@ class MainWindow:
             state=tk.NORMAL,
         )
         self.process_paypay_button.pack(fill=tk.X, pady=(10, 0))
+        self._add_dev_test_toggle(button_frame)
 
         log_frame = ttk.LabelFrame(main_frame, text="日志", padding="10")
         log_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
@@ -174,6 +176,7 @@ class MainWindow:
         top = ttk.Frame(outer)
         top.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
         ttk.Button(top, text="全局：打开配置", command=self._open_settings).pack(side=tk.LEFT)
+        self._add_dev_test_toggle(top, inline=True)
 
         nb = ttk.Notebook(outer)
         nb.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -265,6 +268,47 @@ class MainWindow:
 
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(1, weight=1)
+
+    def _add_dev_test_toggle(self, parent, *, inline: bool = False) -> None:
+        from src.utils.dev_test import is_enabled
+
+        if not hasattr(self, "_dev_test_var") or self._dev_test_var is None:
+            self._dev_test_var = tk.BooleanVar(value=is_enabled(self.config))
+        box = ttk.Checkbutton(
+            parent,
+            text="本地测试（假单，购买前停止）",
+            variable=self._dev_test_var,
+            command=self._on_dev_test_toggle,
+        )
+        hint = ttk.Label(parent, text="仅开发机勾选；生产勿开", foreground="#a15c00")
+        if inline:
+            box.pack(side=tk.LEFT, padx=(16, 0))
+            hint.pack(side=tk.LEFT, padx=(8, 0))
+        else:
+            box.pack(fill=tk.X, pady=(10, 0))
+            hint.pack(anchor=tk.W)
+
+    def _on_dev_test_toggle(self) -> None:
+        from src.utils.dev_test import set_enabled
+
+        want = bool(self._dev_test_var.get())
+        if want:
+            ok = messagebox.askokcancel(
+                "开启本地测试？",
+                "将使用 tools/dev_test_fixtures 里的假单，不请求正式拉单接口，"
+                "也不会完成购买（议价提交仍可能点发送，除非把 submit_bargain 设为 false）。\n\n"
+                "普通假单处理成功后会记入 data/dev_test_processed_orders.json，"
+                "次轮不再重放；议价队列在 data/dev_test_yahoo_bargain_records.json。"
+                "要从头测，删这两个文件。\n\n"
+                "生产电脑请不要开启。",
+            )
+            if not ok:
+                self._dev_test_var.set(False)
+                return
+        set_enabled(self.config, want)
+        for r in self.runners:
+            set_enabled(r.merged_config, want)
+        self.logger.warning("本地测试模式已%s", "开启" if want else "关闭")
 
     def _setup_gui_log_handlers(self) -> None:
         gui_config = self.config.get("gui", {})

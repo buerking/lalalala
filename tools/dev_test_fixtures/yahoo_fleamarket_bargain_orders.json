@@ -1,0 +1,26 @@
+{
+  "Success": true,
+  "Data": [
+    {
+      "OrderId": 900002,
+      "OrderNo": "DEV-YAHOO-BARGAIN-001",
+      "UserId": 1,
+      "List": [
+        {
+          "GoodsId": 1,
+          "GoodsNo": "dev_yahoo_bargain",
+          "GoodsUrl": "https://paypayfleamarket.yahoo.co.jp/item/z673293694",
+          "GoodsNumber": 1,
+          "GoodsPrice": "1149.00",
+          "BargainPrice": "950.00"
+        }
+      ],
+      "ServiceTypeIds": [47],
+      "Mark": "dev-test-mark-yahoo-bargain",
+      "Secret": "dev-test-secret-not-for-production"
+    }
+  ],
+  "Message": null,
+  "ErrorCode": 400,
+  "LangParams": []
+}

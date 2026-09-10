@@ -21,10 +21,16 @@ def _now_iso() -> str:
 class YahooBargainStore:
     def __init__(self, config: Dict[str, Any]):
         y_cfg = config.get("yahoo_fleamarket") or {}
-        path = (
-            (y_cfg.get("bargain_records_file") or "").strip()
-            or "data/yahoo_bargain_records.json"
-        )
+        from src.utils.dev_test import bargain_records_path, is_enabled as _dev_on
+
+        path = ""
+        if _dev_on(config):
+            path = bargain_records_path(config) or ""
+        if not path:
+            path = (
+                (y_cfg.get("bargain_records_file") or "").strip()
+                or "data/yahoo_bargain_records.json"
+            )
         project_root = Path(__file__).resolve().parent.parent.parent
         if not os.path.isabs(path):
             path = str((project_root / path).resolve())

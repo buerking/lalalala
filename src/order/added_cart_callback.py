@@ -131,6 +131,13 @@ def send_added_cart_callback(
         (ok, message)
     密钥：默认优先 order_api.secret（global），可回退订单 Secret；见 api_sign.iter_sign_secrets。
     """
+    from src.utils.dev_test import skip_side_effects
+
+    if skip_side_effects(config):
+        log = _make_cb_log(config)
+        log("本地测试：跳过 addedCartCallbackSimple")
+        return True, "dev_test_skip"
+
     _ = use_curl
     log = _make_cb_log(config)
     api_config = config.get("order_api") or {}

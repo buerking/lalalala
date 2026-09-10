@@ -24,6 +24,7 @@ _MERGE_KEYS = (
     "rakuten_ichiba",
     "login",
     "cloudflare",
+    "dev_test",
 )
 
 

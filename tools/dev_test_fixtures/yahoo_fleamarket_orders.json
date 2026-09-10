@@ -1,0 +1,25 @@
+{
+  "Success": true,
+  "Data": [
+    {
+      "OrderId": 900001,
+      "OrderNo": "DEV-YAHOO-001",
+      "UserId": 1,
+      "List": [
+        {
+          "GoodsId": 1,
+          "GoodsNo": "dev_yahoo_item",
+          "GoodsUrl": "https://paypayfleamarket.yahoo.co.jp/item/z673293694",
+          "GoodsNumber": 1,
+          "GoodsPrice": "1149.00"
+        }
+      ],
+      "ServiceTypeIds": [47],
+      "Mark": "dev-test-mark-yahoo-order",
+      "Secret": "dev-test-secret-not-for-production"
+    }
+  ],
+  "Message": null,
+  "ErrorCode": 400,
+  "LangParams": []
+}

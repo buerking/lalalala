@@ -919,6 +919,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
 
     def _click_commit_order_button(self, driver, commit_sel: str) -> None:
         """点击确认页「注文を確定する」（调用方需先确保无阻塞弹窗）。"""
+        from src.utils.dev_test import DevTestStopBeforePurchase, stop_before_purchase
+
+        if stop_before_purchase(self.config):
+            raise DevTestStopBeforePurchase("本地测试：停在注文確定前")
         self._random_pre_click_wait("注文を確定する")
         commit_btn = WebDriverWait(driver, 25).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, commit_sel))
@@ -4009,6 +4013,17 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             # 点注文確定；若之后才弹出お届け日時，选最短お届け日→決定する，必要时再点一次確定
             self._commit_order_with_delivery_modal_gate(driver, commit_sel)
         except Exception as e:
+            from src.utils.dev_test import DevTestStopBeforePurchase
+
+            if isinstance(e, DevTestStopBeforePurchase):
+                self.logger.warning("%s order=%s", e, order_id)
+                return True, self._make_summary(
+                    order,
+                    success=True,
+                    failure_reason=str(e),
+                    check_cart_requested=True,
+                    check_cart_response="ok",
+                )
             msg = "点击注文確定失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
             try:
