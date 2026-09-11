@@ -704,6 +704,8 @@ class OrderFetcher(LoggerMixin):
                 'quantity': quantity,
                 'goods_id': goods_id,
                 'goods_no': goods_no,
+                'specification': str(item.get('Specification') or '').strip(),
+                'system_remark': str(item.get('SystemRemark') or '').strip(),
             }
             bp_raw = item.get('BargainPrice')
             if bp_raw is not None and str(bp_raw).strip() != '':
@@ -761,6 +763,8 @@ class OrderFetcher(LoggerMixin):
                         "GoodsPrice": p.get("price"),
                         "BargainPrice": p.get("bargain_price"),
                         "GoodsUrl": p.get("url"),
+                        "Specification": p.get("specification"),
+                        "SystemRemark": p.get("system_remark"),
                     }
                 )
             mark = "" if order.get("mark") is None else str(order.get("mark"))

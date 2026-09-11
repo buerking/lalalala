@@ -23,7 +23,7 @@ from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
 from src.order.added_cart_callback import send_added_cart_callback
-from src.order.update_goods_no_callback import send_update_goods_no_callback
+from src.order.rakuten_spec_check import compare_order_and_cart_specs, order_spec_raw
 from src.payment.confirm_page_verifier import (
     take_full_page_screenshot,
     upload_screenshot_get_url,
@@ -2153,6 +2153,229 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     out[key] = price
         return out
 
+    def _collect_cart_item_spec_texts(self, driver) -> Dict[str, List[str]]:
+        """
+        购物车每件商品 → 规格文案列表（如 サイズ：MEDIUM）。
+        优先 __INITIAL_STATE__ 里的规格轴，再用 DOM（gray 规格栏）兜底。
+        """
+        by_key: Dict[str, List[str]] = {}
+
+        def _add(url: str, texts: List[str]) -> None:
+            key = self._product_cart_key(str(url or ""))
+            if not key:
+                return
+            bucket = by_key.setdefault(key, [])
+            for t in texts or []:
+                s = str(t or "").strip()
+                if s and s not in bucket:
+                    bucket.append(s)
+
+        try:
+            state_rows = driver.execute_script(
+                """
+                try {
+                  var st = window.__INITIAL_STATE__ || {};
+                  var shops = st.shopItems || {};
+                  var rows = [];
+                  function pushPair(pairs, name, value) {
+                    name = String(name || '').trim();
+                    value = String(value || '').trim();
+                    if (!value) return;
+                    if (name && value) pairs.push(name + '：' + value);
+                    else pairs.push(value);
+                  }
+                  function walkPairs(node, depth, acc) {
+                    if (!node || depth > 5) return;
+                    if (Array.isArray(node)) {
+                      node.forEach(function(x) { walkPairs(x, depth + 1, acc); });
+                      return;
+                    }
+                    if (typeof node !== 'object') return;
+                    var n = node.name || node.label || node.attributeName
+                      || node.axisName || node.title || '';
+                    var v = node.value || node.attributeValue || node.selectedValue
+                      || node.text || '';
+                    if (typeof n === 'string' && typeof v === 'string' && v && v.length < 80) {
+                      pushPair(acc, n, v);
+                    }
+                    if (Array.isArray(node.selectorValues)) {
+                      node.selectorValues.forEach(function(sv) {
+                        if (typeof sv === 'string' && sv.trim()) acc.push(String(sv).trim());
+                      });
+                    }
+                    Object.keys(node).forEach(function(k) {
+                      var lk = String(k).toLowerCase();
+                      if (lk.indexOf('sku') >= 0 || lk.indexOf('attr') >= 0
+                          || lk.indexOf('option') >= 0 || lk.indexOf('select') >= 0
+                          || lk.indexOf('variation') >= 0 || lk.indexOf('spec') >= 0) {
+                        walkPairs(node[k], depth + 1, acc);
+                      }
+                    });
+                  }
+                  Object.keys(shops).forEach(function(sk) {
+                    var shop = shops[sk] || {};
+                    var box = shop.items || {};
+                    var items = (box.items && typeof box.items === 'object') ? box.items : box;
+                    Object.keys(items || {}).forEach(function(ik) {
+                      var it = items[ik] || {};
+                      if (typeof it !== 'object') return;
+                      var texts = [];
+                      walkPairs(it, 0, texts);
+                      rows.push({ url: String(it.itemUrl || ''), texts: texts });
+                    });
+                  });
+                  return rows;
+                } catch (e) { return []; }
+                """
+            )
+        except Exception as e:
+            self.logger.debug("乐天市场：INITIAL_STATE 规格读取失败: %s", e)
+            state_rows = []
+        if isinstance(state_rows, list):
+            for row in state_rows:
+                if not isinstance(row, dict):
+                    continue
+                _add(str(row.get("url") or ""), list(row.get("texts") or []))
+
+        try:
+            dom_rows = driver.execute_script(
+                """
+                var out = [];
+                var links = document.querySelectorAll('a[href]');
+                function specTexts(root) {
+                  var found = [];
+                  if (!root) return found;
+                  var spans = root.querySelectorAll('span');
+                  for (var i = 0; i < spans.length; i++) {
+                    var t = (spans[i].innerText || spans[i].textContent || '').replace(/\\s+/g, '');
+                    if (!t) continue;
+                    if (t.indexOf('：') >= 0 || t.indexOf(':') >= 0) {
+                      if (t.length <= 80 && found.indexOf(t) < 0) found.push(t);
+                    }
+                  }
+                  return found;
+                }
+                for (var i = 0; i < links.length; i++) {
+                  var href = links[i].href || '';
+                  if (href.indexOf('item.rakuten') < 0) continue;
+                  var box = links[i];
+                  var texts = [];
+                  for (var up = 0; up < 14 && box; up++) {
+                    texts = specTexts(box);
+                    if (texts.length) break;
+                    box = box.parentElement;
+                  }
+                  if (href) out.push({ url: href, texts: texts });
+                }
+                return out;
+                """
+            )
+        except Exception as e:
+            self.logger.debug("乐天市场：DOM 规格栏读取失败: %s", e)
+            dom_rows = []
+        if isinstance(dom_rows, list):
+            for row in dom_rows:
+                if not isinstance(row, dict):
+                    continue
+                _add(str(row.get("url") or ""), list(row.get("texts") or []))
+        return by_key
+
+    def _lookup_cart_specs(
+        self, by_key: Dict[str, List[str]], product_url: str
+    ) -> List[str]:
+        key = self._product_cart_key(product_url)
+        if key and key in by_key:
+            return list(by_key.get(key) or [])
+        path = key.split("?")[0] if key else ""
+        if path:
+            for ck, texts in by_key.items():
+                if ck.split("?")[0] == path and texts:
+                    return list(texts)
+        return []
+
+    def _verify_order_specs_in_cart(
+        self,
+        cart_products: List[Dict[str, Any]],
+        driver,
+    ) -> str:
+        """
+        结算前对照订单规格备注与购物车展示。
+        返回空字符串表示通过；否则为失败说明（已含商品链接）。
+        """
+        need: List[Dict[str, Any]] = []
+        for p in cart_products or []:
+            spec, remark = order_spec_raw(p)
+            if spec or remark:
+                need.append(p)
+        if not need:
+            self.logger.info("乐天市场：订单规格备注为空，跳过购物车规格二次校验")
+            return ""
+
+        self._ensure_cart_page(driver, quick=True)
+        by_key = self._collect_cart_item_spec_texts(driver)
+        self.logger.info(
+            "乐天市场：购物车规格栏 keys=%s",
+            {k: v for k, v in list(by_key.items())[:8]},
+        )
+        page_has_any_spec = any(bool(v) for v in by_key.values())
+        fails: List[str] = []
+        for p in need:
+            url = self._direct_product_url(str(p.get("url") or ""))
+            cart_texts = self._lookup_cart_specs(by_key, url) or self._lookup_cart_specs(
+                by_key, str(p.get("url") or "")
+            )
+            ok, why, expected, cart_vals = compare_order_and_cart_specs(p, cart_texts)
+            spec, remark = order_spec_raw(p)
+            self.logger.info(
+                "乐天市场：规格校验 goods_no=%s expected=%s cart=%s result=%s why=%s "
+                "Specification=%r SystemRemark=%r",
+                p.get("goods_no"),
+                expected,
+                cart_vals,
+                "ok" if ok else "mismatch",
+                why,
+                spec,
+                remark,
+            )
+            if ok:
+                continue
+            if not cart_vals and not page_has_any_spec:
+                self.logger.warning(
+                    "乐天市场：购物车整页未解析到规格栏，本行跳过规格校验（避免误杀） goods_no=%s",
+                    p.get("goods_no"),
+                )
+                continue
+            if not cart_vals:
+                fails.append(
+                    "购物车该商品未显示规格，无法与订单备注核对: %s 订单规格=%s"
+                    % (url, expected)
+                )
+            else:
+                fails.append(
+                    "订单规格与购物车不一致: %s 订单=%s 购物车=%s"
+                    % (url, expected, cart_vals)
+                )
+        return "\n".join(fails)
+
+    def _abort_after_spec_mismatch(self, driver, order: Dict[str, Any], detail: str) -> None:
+        order_id = order.get("order_id", "未知")
+        self.logger.error("乐天市场：规格二次校验失败 order=%s %s", order_id, detail)
+        try:
+            self._clear_cart(driver)
+            self.logger.info("乐天市场：规格不符已清空购物车 order=%s", order_id)
+        except Exception as e:
+            self.logger.warning("乐天市场：规格不符后清空购物车失败: %s", e)
+        try:
+            self.feishu_notifier.notify_order_issue(
+                str(order_id),
+                [x for x in str(detail).split("\n") if x.strip()][:15]
+                or ["订单规格与购物车不一致"],
+                user_id=order.get("user_id"),
+                extra="乐天市场：variantId/规格可能与订单备注不一致，已中止本单并清空购物车，继续后续订单。",
+            )
+        except Exception:
+            pass
+
     def _build_check_cart_from_cart(
         self, cart_products: List[Dict[str, Any]], driver
     ) -> Tuple[List[Dict[str, Any]], int, int, int]:
@@ -3920,6 +4143,14 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         try:
             self._ensure_cart_page(driver, quick=False)
             self._dismiss_interruptions(driver, timeout=2.0)
+            spec_fail = self._verify_order_specs_in_cart(cart_products, driver)
+            if spec_fail:
+                self._abort_after_spec_mismatch(driver, order, spec_fail)
+                return False, self._make_summary(
+                    order,
+                    failure_reason=spec_fail[:500],
+                    runner_pause_requested=False,
+                )
             goods_list, total, goods_fee, operate_fee = self._build_check_cart_from_cart(
                 cart_products, driver
             )
