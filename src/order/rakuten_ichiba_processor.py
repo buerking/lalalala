@@ -23,7 +23,12 @@ from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
 from src.order.added_cart_callback import send_added_cart_callback
-from src.order.rakuten_spec_check import compare_order_and_cart_specs, order_spec_raw
+from src.order.update_goods_no_callback import send_update_goods_no_callback
+from src.order.rakuten_spec_check import (
+    compare_order_and_cart_specs,
+    keep_cart_spec_text,
+    order_spec_raw,
+)
 from src.payment.confirm_page_verifier import (
     take_full_page_screenshot,
     upload_screenshot_get_url,
@@ -2167,7 +2172,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             bucket = by_key.setdefault(key, [])
             for t in texts or []:
                 s = str(t or "").strip()
-                if s and s not in bucket:
+                if s and keep_cart_spec_text(s) and s not in bucket:
                     bucket.append(s)
 
         try:
@@ -2247,11 +2252,19 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                   if (!root) return found;
                   var spans = root.querySelectorAll('span');
                   for (var i = 0; i < spans.length; i++) {
-                    var t = (spans[i].innerText || spans[i].textContent || '').replace(/\\s+/g, '');
+                    var raw = (spans[i].innerText || spans[i].textContent || '').trim();
+                    var t = raw.replace(/\\s+/g, '');
                     if (!t) continue;
-                    if (t.indexOf('：') >= 0 || t.indexOf(':') >= 0) {
-                      if (t.length <= 80 && found.indexOf(t) < 0) found.push(t);
-                    }
+                    if (t.indexOf('確認しました') >= 0 || t.indexOf('お届け') >= 0
+                        || t.indexOf('転売') >= 0 || t.indexOf('注文で') >= 0
+                        || t.indexOf('【') >= 0) continue;
+                    if (/\\d{1,2}[:：]\\d{2}/.test(raw) || /\\d{1,2}[:：]\\d{2}/.test(t)) continue;
+                    var sep = t.indexOf('：') >= 0 ? '：' : (t.indexOf(':') >= 0 ? ':' : '');
+                    if (!sep) continue;
+                    var left = t.split(sep)[0];
+                    var right = t.slice(left.length + sep.length);
+                    if (!left || !right || left.length > 12 || right.length > 40) continue;
+                    if (t.length <= 80 && found.indexOf(t) < 0) found.push(t);
                   }
                   return found;
                 }
@@ -4421,6 +4434,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             if not ok_u:
                 update_errors.append(uerr or "updateGoodsNoCallback 失败")
         except Exception as e:
+            self.logger.exception("乐天市场：分单回调阶段异常: %s", e)
             update_errors.append(str(e))
         finally:
             if shot2:
@@ -4437,7 +4451,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     str(order_id),
                     update_errors,
                     user_id=order.get("user_id"),
-                    extra="乐天市场分单回调异常",
+                    extra="乐天市场分单回调异常，请核对是否已出单。",
                 )
             except Exception:
                 pass

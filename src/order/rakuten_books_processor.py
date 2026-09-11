@@ -1720,7 +1720,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         "页面已下单；请核对 addNo/updateGoodsNo/截图是否落库",
                     ],
                     user_id=order.get("user_id"),
-                    extra="乐天书店分单回调异常",
+                    extra="乐天书店分单回调异常，请核对是否已出单。",
                 )
             except Exception:
                 pass

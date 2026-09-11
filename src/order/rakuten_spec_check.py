@@ -44,6 +44,12 @@ _LABEL_STOPWORDS = {
 _SPLIT_GROUPS = re.compile(r"[；;]+")
 _SPLIT_ATTRS = re.compile(r"[，,、]+")
 _SPLIT_KV = re.compile(r"[：:]")
+_SPLIT_WS = re.compile(r"[\s\u00a0\u3000]+")
+# 购物车规格栏旁常见噪声：卖家确认、配送时效（12:00 的冒号也会被当成「轴：值」）
+_CART_NOISE = re.compile(
+    r"確認しました|お届け|転売|注文で|までの注文|送料無料"
+)
+_TIME_COLON = re.compile(r"\d{1,2}[:：]\d{2}")
 
 
 def _norm(text: Any) -> str:
@@ -120,8 +126,13 @@ def parse_spec_text(*parts: Any) -> Tuple[List[str], List[str]]:
                     if right.strip():
                         _add_value(right)
                 else:
-                    # 尚不知是轴名还是取值，先当值；对照时再按购物车轴名过滤
-                    _add_value(chunk)
+                    # SystemRemark 常为「ONE     MBKF」（nbsp/空格分隔），不要整串当一个值
+                    pieces = [c for c in _SPLIT_WS.split(chunk) if c.strip()]
+                    if len(pieces) > 1:
+                        for piece in pieces:
+                            _add_value(piece)
+                    else:
+                        _add_value(chunk)
     return values, labels
 
 
@@ -162,15 +173,39 @@ def expected_spec_values(product: Dict[str, Any], cart_labels: Sequence[str] = (
     return out
 
 
+def keep_cart_spec_text(text: str) -> bool:
+    """是否保留购物车规格栏文案。丢掉卖家确认、配送时间等噪声。"""
+    t = str(text or "").strip()
+    if not t:
+        return False
+    compact = re.sub(r"[\s\u00a0\u3000]+", "", t)
+    if _CART_NOISE.search(t) or _CART_NOISE.search(compact):
+        return False
+    if _TIME_COLON.search(t) or _TIME_COLON.search(compact):
+        return False
+    if "【" in t or "】" in t:
+        return False
+    # 「軸：値」且轴名很短（サイズ/カラー）；纯值也允许（INITIAL_STATE 可能只有 ONE）
+    if "：" in compact or ":" in compact:
+        left, right = re.split(r"[：:]", compact, 1)
+        if not left or not right:
+            return False
+        if len(left) > 12 or len(right) > 40:
+            return False
+    elif len(compact) > 40:
+        return False
+    return True
+
+
 def parse_cart_spec_texts(texts: Sequence[str]) -> Tuple[List[str], List[str]]:
     """购物车一行规格文案（サイズ：MEDIUM）→ (values, labels)。"""
     values: List[str] = []
     labels: List[str] = []
     for raw in texts or []:
         t = str(raw or "").replace("\n", "").strip()
-        if not t:
+        if not t or not keep_cart_spec_text(t):
             continue
-        t = re.sub(r"\s+", "", t)
+        t = re.sub(r"[\s\u00a0\u3000]+", "", t)
         vs, ls = parse_spec_text(t)
         for x in vs:
             if x not in values:
@@ -193,10 +228,26 @@ def spec_value_matches(expected: str, cart_values: Sequence[str]) -> bool:
     for cn in cart_n:
         if not cn:
             continue
-        # 购物车值更完整（MEDIUM / MEDIUM（M））或接口值带多余前缀
-        if en in cn or cn in en:
-            if min(len(en), len(cn)) >= 2:
+        if en == cn:
+            return True
+        # MEDIUM（M）↔ MEDIUM：允许括号/分隔符包裹，禁止 ONE 命中拼接串 ONEMBKF
+        longer, shorter = (cn, en) if len(cn) >= len(en) else (en, cn)
+        if min(len(en), len(cn)) < 2:
+            continue
+        if longer.startswith(shorter):
+            rest = longer[len(shorter) :]
+            if not rest or rest[0] in "（([{/-":
                 return True
+            continue
+        idx = longer.find(shorter)
+        if idx < 0:
+            continue
+        before = longer[:idx]
+        after = longer[idx + len(shorter) :]
+        if (not before or before[-1] in "（([{/-") and (
+            not after or after[0] in "）)]}/-"
+        ):
+            return True
     return False
 
 
