@@ -197,17 +197,14 @@ class YahooBargainService(LoggerMixin):
         return bool(self.y_cfg.get("bargain_monitor_enabled", True))
 
     def _timeout_hours(self) -> float:
+        """盯价上限：默认 72 小时。不以 bargain_max_age_days×24 为准（7 天会变成 168）。"""
         hours = self.y_cfg.get("bargain_timeout_hours")
         if hours is not None and str(hours).strip() != "":
             try:
                 return max(1.0, float(hours))
             except (TypeError, ValueError):
                 pass
-        days = self.y_cfg.get("bargain_max_age_days")
-        try:
-            return max(1.0, float(days) * 24.0)
-        except (TypeError, ValueError):
-            return 72.0
+        return 72.0
 
     def _is_timeout(self, rec: Dict[str, Any]) -> bool:
         hours = self._timeout_hours()
