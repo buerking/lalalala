@@ -62,6 +62,24 @@ _BOOKS_ICHIBA_SHOP_ENCODED_RE = re.compile(
 )
 _ORDER_NO_RE = re.compile(r"(\d+)-(\d{8})-(\d{10})")
 _ADD_OK_TEXT = "商品をかごに追加しました"
+# 独立店域名（biccamera.rakuten.co.jp）不要当成 item.rakuten.co.jp 标准详情页
+_SHOP_SUBDOMAIN_SKIP = frozenset(
+    {
+        "item",
+        "www",
+        "books",
+        "cart",
+        "basket",
+        "search",
+        "event",
+        "coupon",
+        "login",
+        "member",
+        "ichiba",
+        "hb",
+        "afl",
+    }
+)
 
 
 class RakutenBooksHandoffNeeded(Exception):
@@ -1322,7 +1340,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 'div.quantity--qnq4Z select,'
                 'div.quantity--qnq4Z input[type="tel"],'
                 'div.stepper--3h7VX select,'
-                'div.stepper--3h7VX input[type="tel"]'
+                'div.stepper--3h7VX input[type="tel"],'
+                "#mainItemUnitPullDown,"
+                "#floatingItemUnitPullDown,"
+                'select[name="unit__pc"],'
+                'select[name="unit__sp"]'
             ),
             "dialog": (
                 'div[role="dialog"] div[irc="Quantity"] select,'
@@ -1625,32 +1647,123 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return ""
 
     @staticmethod
-    def _is_cart_add_label(label: str) -> bool:
+    def _is_store_pickup_label(label: str) -> bool:
+        text = label or ""
         return any(
-            tok in (label or "")
-            for tok in ("かごに追加", "カートに入れる", "カートに追加")
+            tok in text for tok in ("来店予約", "店舗に行く", "在庫のある店舗")
+        )
+
+    @staticmethod
+    def _is_cart_add_label(label: str) -> bool:
+        text = label or ""
+        if RakutenIchibaOrderProcessor._is_store_pickup_label(text):
+            return False
+        return any(
+            tok in text
+            for tok in (
+                "商品をかごに追加",
+                "かごに追加",
+                "カートに入れる",
+                "カートに追加",
+            )
         )
 
     @staticmethod
     def _is_purchase_as_add_label(label: str) -> bool:
         """详情页「購入手続きへ」在部分店铺等价于加购（无单独かご按钮时）。"""
         text = label or ""
+        if RakutenIchibaOrderProcessor._is_store_pickup_label(text):
+            return False
         if "購入手続き" not in text:
             return False
         # 购物车页结算按钮通常只有「購入手続き」，详情加购等价按钮多为「購入手続きへ」
         return "へ" in text or "購入手続きへ" in text
+
+    def _is_usable_add_element(self, el, *, allow_hidden: bool = False) -> bool:
+        try:
+            eid = (el.get_attribute("id") or "").strip()
+            cls = " %s " % (el.get_attribute("class") or "")
+            if " goShop " in cls or "c-btn--goShop" in cls:
+                return False
+            label = self._button_label(el)
+            if self._is_store_pickup_label(label):
+                return False
+            if el.get_attribute("disabled"):
+                return False
+            known_add = eid in (
+                "addToCartMainPcButton",
+                "addToCartFloatingPcButton",
+            )
+            displayed = False
+            try:
+                displayed = bool(el.is_displayed())
+            except Exception:
+                displayed = False
+            if displayed:
+                try:
+                    return bool(el.is_enabled()) or known_add
+                except Exception:
+                    return True
+            return bool(allow_hidden or known_add)
+        except Exception:
+            return False
+
+    def _looks_like_shop_subdomain_pdp(self, driver) -> bool:
+        """乐天ビック等独立店域名 / Nuxt 详情页（非 item.rakuten.co.jp 标准模板）。"""
+        try:
+            host = urlparse(driver.current_url or "").netloc.split(":")[0].lower()
+            if host.endswith(".rakuten.co.jp"):
+                shop = host[: -len(".rakuten.co.jp")]
+                if shop and "." not in shop and shop not in _SHOP_SUBDOMAIN_SKIP:
+                    return True
+            return bool(
+                self._find_elements_now(
+                    driver,
+                    By.CSS_SELECTOR,
+                    "#addToCartMainPcButton, .p-productDetailv2__cartButton, "
+                    ".p-productDetailv2",
+                )
+            )
+        except Exception:
+            return False
+
+    def _wait_for_add_to_cart_button(self, driver, timeout: float = 8.0) -> None:
+        if not self._looks_like_shop_subdomain_pdp(driver):
+            return
+        deadline = time.time() + max(1.0, float(timeout))
+        while time.time() < deadline:
+            if self._find_add_to_cart_button(
+                driver, True
+            ) or self._find_add_to_cart_button(driver, False):
+                return
+            time.sleep(0.3)
+        self.logger.info("乐天市场：独立店详情页等待加购按钮超时")
 
     def _find_add_to_cart_button(self, driver, prefer_fixed: bool):
         """
         查找加购按钮。
         优先「かごに追加」；若无，则「購入手続きへ」等价于加购。
         标准店铺：button[aria-label=...] + irc 容器。
-        楽天24 等子站：只有按钮文案、无 aria-label / irc。
+        楽天24 / 楽天ビック：文案或固定 id，无 irc。
+        楽天ビック PC：#addToCartMainPcButton（商品をかごに追加）；
+        浮动条是 div#addToCartFloatingPcButton，不是 button。
         """
+        bic_fixed = [
+            "#addToCartMainPcButton",
+            ".p-productDetailv2__cartButton.u-pc .c-btn--cartAdd button",
+            ".p-productDetailv2__cartButton .c-btn--cartAdd button",
+            ".c-sideProductv2--sp .c-btn--cartAdd button",
+        ]
+        bic_float = [
+            "#addToCartFloatingPcButton .c-btn__act.addCart",
+            "#addToCartFloatingPcButton .addCart",
+            "#addToCartFloatingPcButton",
+        ]
         css_list: List[str] = []
         if prefer_fixed:
             css_list = [
                 (self.ri_cfg.get("add_to_cart_fixed_css") or "").strip(),
+                *bic_fixed,
                 '#AddToCartPurchaseButtonFixed button[aria-label="かごに追加"]',
                 '[irc="AddToCartPurchaseButtonFixed"] button[aria-label="かごに追加"]',
                 '#AddToCartPurchaseButtonFixed button[aria-label*="購入手続き"]',
@@ -1661,12 +1774,14 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         else:
             css_list = [
                 (self.ri_cfg.get("add_to_cart_floating_css") or "").strip(),
+                *bic_float,
                 '[irc="AddToCartPurchaseButtonFloating"] button[aria-label="かごに追加"]',
                 '#floatingCartContainer button[aria-label="かごに追加"]',
                 '[irc="AddToCartPurchaseButtonFloating"] button[aria-label*="購入手続き"]',
                 '#floatingCartContainer button[aria-label*="購入手続き"]',
                 '[irc="AddToCartPurchaseButtonFloating"] button',
                 '#floatingCartContainer button',
+                *bic_fixed,
             ]
         purchase_btn = None
         seen_css = set()
@@ -1675,14 +1790,23 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 continue
             seen_css.add(css)
             try:
+                allow_hidden = any(
+                    tok in css
+                    for tok in (
+                        "addToCartMainPcButton",
+                        "addToCartFloatingPcButton",
+                        "p-productDetailv2__cartButton",
+                    )
+                )
                 for el in self._find_elements_now(driver, By.CSS_SELECTOR, css):
-                    try:
-                        if not (el.is_displayed() and el.is_enabled()):
-                            continue
-                    except Exception:
+                    if not self._is_usable_add_element(el, allow_hidden=allow_hidden):
                         continue
+                    eid = (el.get_attribute("id") or "").strip()
                     label = self._button_label(el)
-                    if self._is_cart_add_label(label):
+                    if eid in (
+                        "addToCartMainPcButton",
+                        "addToCartFloatingPcButton",
+                    ) or self._is_cart_add_label(label):
                         return el
                     if css.endswith('aria-label="かごに追加"]'):
                         return el
@@ -1691,9 +1815,13 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             except Exception:
                 continue
 
-        # 文案兜底：覆盖楽天24 / fast-delivery-mart 等无 irc 页面
         xpaths_cart = [
+            "//*[@id='addToCartMainPcButton']",
+            "//*[@id='addToCartFloatingPcButton']",
+            "//div[contains(@class,'c-btn--cartAdd') and not(contains(@class,'goShop'))]"
+            "//button[contains(normalize-space(.), 'かごに追加')]",
             "//button[@aria-label='かごに追加']",
+            "//button[contains(normalize-space(.), '商品をかごに追加')]",
             "//button[contains(normalize-space(.), 'かごに追加')]",
             "//button[contains(normalize-space(.), 'カートに入れる')]",
             "//button[contains(normalize-space(.), 'カートに追加')]",
@@ -1702,11 +1830,18 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         for xp in xpaths_cart:
             try:
                 for el in self._find_elements_now(driver, By.XPATH, xp):
-                    try:
-                        if el.is_displayed() and el.is_enabled():
-                            return el
-                    except Exception:
-                        continue
+                    allow_hidden = "addToCart" in xp
+                    if self._is_usable_add_element(
+                        el, allow_hidden=allow_hidden
+                    ) and (
+                        self._is_cart_add_label(self._button_label(el))
+                        or (el.get_attribute("id") or "")
+                        in (
+                            "addToCartMainPcButton",
+                            "addToCartFloatingPcButton",
+                        )
+                    ):
+                        return el
             except Exception:
                 continue
 
@@ -1714,19 +1849,17 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return purchase_btn
 
         xpaths_buy = [
+            "//*[@id='purchaseProcedureMainPcButton']",
             "//button[contains(@aria-label,'購入手続きへ')]",
+            "//button[contains(normalize-space(.), 'ご購入手続きへ')]",
             "//button[contains(normalize-space(.), '購入手続きへ')]",
             "//a[contains(normalize-space(.), '購入手続きへ')]",
         ]
         for xp in xpaths_buy:
             try:
                 for el in self._find_elements_now(driver, By.XPATH, xp):
-                    try:
-                        if not (el.is_displayed() and el.is_enabled()):
-                            continue
-                    except Exception:
+                    if not self._is_usable_add_element(el):
                         continue
-                    # 避开购物车页结算按钮（通常在 cart.step 域名）
                     if self._is_on_cart_page(driver):
                         continue
                     if self._is_purchase_as_add_label(self._button_label(el)):
@@ -1771,13 +1904,28 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         if btn is None:
             raise RuntimeError("未找到可点击的加购按钮（かごに追加 / 購入手続きへ）")
         label = self._button_label(btn)
+        eid = ""
+        try:
+            eid = (btn.get_attribute("id") or "").strip()
+        except Exception:
+            eid = ""
         action = (
             "購入手続きへ(加购)"
             if self._is_purchase_as_add_label(label)
-            else "かごに追加"
+            else ("商品をかごに追加" if "商品をかごに追加" in label else "かごに追加")
         )
-        self.logger.info("乐天市场：点击 %s", action)
+        if eid:
+            self.logger.info("乐天市场：点击 %s id=%s", action, eid)
+        else:
+            self.logger.info("乐天市场：点击 %s", action)
         self._random_pre_click_wait(action)
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center', inline:'nearest'});",
+                btn,
+            )
+        except Exception:
+            pass
         try:
             driver.execute_script("arguments[0].click();", btn)
         except Exception:
@@ -1789,11 +1937,34 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             str(product.get("url") or "")
         )
         try:
-            path = urlparse(direct_url).path.rstrip("/").lower()
+            parsed = urlparse(direct_url)
+            path = RakutenIchibaOrderProcessor._normalize_ichiba_item_path(
+                parsed.netloc, parsed.path
+            )
         except Exception:
             path = ""
         name = str(product.get("name") or "").strip()
         return path, name
+
+    @staticmethod
+    def _normalize_ichiba_item_path(host: str, path: str) -> str:
+        """
+        独立店域名详情页与市场商品页对齐：
+        biccamera.rakuten.co.jp/item/4902370554922
+        → /biccamera/4902370554922
+        （与 item.rakuten.co.jp/biccamera/4902370554922 同一核验键）
+        """
+        host = (host or "").split(":")[0].lower()
+        path = (path or "").rstrip("/").lower()
+        if not host.endswith(".rakuten.co.jp") or not path.startswith("/item/"):
+            return path
+        shop = host[: -len(".rakuten.co.jp")]
+        if not shop or "." in shop or shop in _SHOP_SUBDOMAIN_SKIP:
+            return path
+        item_id = path[len("/item/") :].split("/")[0]
+        if item_id:
+            return "/%s/%s" % (shop, item_id)
+        return path
 
     @staticmethod
     def _product_cart_key(url: str) -> str:
@@ -1801,7 +1972,9 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         direct_url = RakutenIchibaOrderProcessor._direct_product_url(url)
         try:
             parsed = urlparse(direct_url)
-            path = parsed.path.rstrip("/").lower()
+            path = RakutenIchibaOrderProcessor._normalize_ichiba_item_path(
+                parsed.netloc, parsed.path
+            )
             variant_id = (
                 (parse_qs(parsed.query).get("variantId") or [""])[0].strip()
                 or (parse_qs(parsed.query).get("variantid") or [""])[0].strip()
@@ -2270,7 +2443,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 }
                 for (var i = 0; i < links.length; i++) {
                   var href = links[i].href || '';
-                  if (href.indexOf('item.rakuten') < 0) continue;
+                  if (href.indexOf('item.rakuten') < 0
+                      && href.indexOf('.rakuten.co.jp/item/') < 0) continue;
                   var box = links[i];
                   var texts = [];
                   for (var up = 0; up < 14 && box; up++) {
@@ -2606,6 +2780,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             final_url or ""
         ):
             raise RakutenBooksHandoffNeeded(direct_url or final_url)
+        try:
+            self._wait_for_add_to_cart_button(driver)
+        except Exception:
+            pass
         selected_variant = self._select_product_requirements(driver, direct_url)
         if selected_variant:
             stamped = self._stamp_variant_id_on_url(direct_url, selected_variant)
