@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-乐天市场（item.rakuten.co.jp / cart.step.rakuten.co.jp）：
+乐天市场（item.rakuten.co.jp / cart.step.rakuten.co.jp，以及 biccamera 等独立店 /step/ 购物车）：
 清空购物车 → 逐品加购（含 SKU 弹窗/备用按钮）→ 领券 → 购物车取金额并 checkCart → 店铺结算 → 注文確定 → 回调。
 """
 
@@ -80,6 +80,8 @@ _SHOP_SUBDOMAIN_SKIP = frozenset(
         "afl",
     }
 )
+# 加购后使用店铺自有 /step/ 购物车（非 cart.step.rakuten.co.jp）
+_SHOP_OWNED_CART_SLUGS = frozenset({"biccamera"})
 
 
 class RakutenBooksHandoffNeeded(Exception):
@@ -231,6 +233,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             if RakutenSessionGuard.is_enabled(config)
             else None
         )
+        # 独立店（楽天ビック等）加购后进自家 /step/ 购物车，记住以免核验时跳去空的 cart.step
+        self._last_shop_cart_url = ""
 
     def _random_pre_click_wait(self, action: str) -> None:
         pay_cfg = self.config.get("payment") or {}
@@ -363,8 +367,122 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             resume_url=target or None, wait_seconds=min(float(wait_seconds), 1.5)
         )
 
-    def _cart_url(self) -> str:
+    def _default_cart_url(self) -> str:
         return (self.ri_cfg.get("cart_url") or "https://cart.step.rakuten.co.jp/cart").strip()
+
+    def _cart_url(self, driver=None) -> str:
+        """优先独立店 /step/ 购物车，否则标准 cart.step。"""
+        if driver is not None:
+            shop = self._shop_owned_cart_url(driver)
+            if shop:
+                return shop
+        last = (getattr(self, "_last_shop_cart_url", "") or "").strip()
+        if last:
+            return last
+        return self._default_cart_url()
+
+    @staticmethod
+    def _shop_slug_from_host(host: str) -> str:
+        host = (host or "").split(":")[0].lower()
+        if not host.endswith(".rakuten.co.jp"):
+            return ""
+        shop = host[: -len(".rakuten.co.jp")]
+        if not shop or "." in shop or shop in _SHOP_SUBDOMAIN_SKIP:
+            return ""
+        return shop
+
+    @staticmethod
+    def _is_shop_owned_cart_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url or "")
+        except Exception:
+            return False
+        shop = RakutenIchibaOrderProcessor._shop_slug_from_host(parsed.netloc)
+        if not shop:
+            return False
+        path = (parsed.path or "").lower()
+        # /step、/step/、/step/cart；详情页是 /item/，不能当成购物车
+        return "/step" in path
+
+    def _shop_uses_owned_cart(self, host: str) -> bool:
+        slug = self._shop_slug_from_host(host)
+        if not slug:
+            return False
+        known = set(_SHOP_OWNED_CART_SLUGS)
+        extra = self.ri_cfg.get("shop_owned_cart_hosts") or []
+        for item in extra:
+            raw = str(item or "").strip().lower()
+            if not raw:
+                continue
+            raw = raw.replace("https://", "").replace("http://", "")
+            raw = raw.split("/")[0].replace(".rakuten.co.jp", "")
+            if raw:
+                known.add(raw)
+        return slug in known
+
+    def _shop_owned_cart_url_from_page_url(self, url: str) -> str:
+        try:
+            parsed = urlparse(self._direct_product_url(url or ""))
+        except Exception:
+            return ""
+        if not self._shop_uses_owned_cart(parsed.netloc):
+            return ""
+        scheme = parsed.scheme or "https"
+        netloc = parsed.netloc
+        if not netloc:
+            return ""
+        return "%s://%s/step/" % (scheme, netloc)
+
+    def _remember_shop_cart_from_url(self, url: str) -> None:
+        shop = self._shop_owned_cart_url_from_page_url(url)
+        if shop:
+            self._last_shop_cart_url = shop
+
+    def _shop_owned_cart_url(self, driver) -> str:
+        try:
+            current = driver.current_url or ""
+        except Exception:
+            current = ""
+        if self._is_shop_owned_cart_url(current):
+            return current
+        return self._shop_owned_cart_url_from_page_url(current)
+
+    def _is_shop_owned_cart_page(self, driver) -> bool:
+        try:
+            url = driver.current_url or ""
+        except Exception:
+            url = ""
+        if self._is_shop_owned_cart_url(url):
+            return True
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            return False
+        if "p-cartv2__orderItem" not in src and 'id="go_next"' not in src:
+            return False
+        shop = self._shop_slug_from_host(urlparse(url).netloc)
+        path = (urlparse(url).path or "").lower()
+        return bool(shop) and "/item/" not in path
+
+    def _cart_urls_to_clear(
+        self, driver, products: Optional[List[Dict[str, Any]]] = None
+    ) -> List[str]:
+        urls: List[str] = []
+        seen = set()
+
+        def _add(raw: str) -> None:
+            u = (raw or "").strip()
+            if not u or u in seen:
+                return
+            seen.add(u)
+            urls.append(u)
+
+        _add(self._default_cart_url())
+        _add(self._shop_owned_cart_url(driver))
+        _add(getattr(self, "_last_shop_cart_url", "") or "")
+        for p in products or []:
+            _add(self._shop_owned_cart_url_from_page_url(str(p.get("url") or "")))
+        return urls
 
     def _find_elements_now(self, driver, by: By, value: str):
         """探测可选元素时禁用隐式等待，避免每个不存在的选择器额外等待 10 秒。"""
@@ -388,10 +506,12 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def _is_on_cart_page(driver) -> bool:
         try:
             url = (driver.current_url or "").lower()
-            # 仅认真正购物车域；basket.step 多为结算中间页，不能当成已在购物车
-            return "cart.step.rakuten.co.jp" in url
         except Exception:
             return False
+        # 仅认真正购物车域；basket.step 多为结算中间页，不能当成已在购物车
+        if "cart.step.rakuten.co.jp" in url:
+            return True
+        return RakutenIchibaOrderProcessor._is_shop_owned_cart_url(url)
 
     def _ensure_cart_page(self, driver, *, quick: bool = False) -> None:
         """进入购物车；若已在购物车页则跳过整页导航。"""
@@ -401,7 +521,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     float(self.ri_cfg.get("wait_after_cart_load_seconds", 2)) * 0.2
                 )
             return
-        self._navigate(driver, self._cart_url())
+        self._navigate(driver, self._cart_url(driver))
         base = float(self.ri_cfg.get("wait_after_cart_load_seconds", 2))
         time.sleep(min(base, 0.8) if quick else base)
 
@@ -448,7 +568,22 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             src = driver.page_source or ""
         except Exception:
             return False
-        return any(str(text).strip() and str(text).strip() in src for text in texts)
+        if any(str(text).strip() and str(text).strip() in src for text in texts):
+            return True
+        if not self._is_shop_owned_cart_page(driver):
+            return False
+        # 楽天ビック /step/：空车没有 p-cartv2__orderItem / delete[n]
+        try:
+            items = self._find_elements_now(
+                driver, By.CSS_SELECTOR, ".p-cartv2__orderItem"
+            )
+            deletes = self._find_elements_now(driver, By.CSS_SELECTOR, 'a[id^="delete"]')
+        except Exception:
+            return False
+        if items or deletes:
+            return False
+        # 页面壳已出来且无商品行，才认定空车；避免 /step/ 仍在加载时误判
+        return "p-cartv2" in src or 'id="go_next"' in src
 
     def _dismiss_interruptions(self, driver, timeout: float = 4.0) -> None:
         """关闭捐赠弹窗、通用 modal 等（失败不阻断）。"""
@@ -1026,66 +1161,113 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             except Exception:
                 continue
 
-    def _clear_cart(self, driver) -> None:
-        """逐条删除；每次等待原按钮失效并刷新，禁止连续点击同一个旧按钮。"""
-        def _is_window_dead_error(err: Exception) -> bool:
-            msg = str(err or "").lower()
-            return any(
-                tok in msg
-                for tok in (
-                    "no such window",
-                    "web view not found",
-                    "target window already closed",
-                    "invalid session id",
-                    "chrome not reachable",
-                )
+    @staticmethod
+    def _is_window_dead_error(err: Exception) -> bool:
+        msg = str(err or "").lower()
+        return any(
+            tok in msg
+            for tok in (
+                "no such window",
+                "web view not found",
+                "target window already closed",
+                "invalid session id",
+                "chrome not reachable",
             )
+        )
 
+    def _find_cart_delete_buttons(self, driver) -> List[Any]:
+        found: List[Any] = []
+        seen = set()
+        css_list = [
+            (self.ri_cfg.get("delete_item_button_css") or 'button[aria-label="削除する"]').strip(),
+            'a[id^="delete"]',
+        ]
+        for css in css_list:
+            if not css:
+                continue
+            try:
+                els = self._find_elements_now(driver, By.CSS_SELECTOR, css)
+            except Exception:
+                els = []
+            for el in els:
+                key = id(el)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(el)
         try:
-            self._navigate(driver, self._cart_url())
+            extra = self._find_elements_now(
+                driver,
+                By.XPATH,
+                "//button[@aria-label='削除する'] | //a[starts-with(@id,'delete')]",
+            )
+        except Exception:
+            extra = []
+        for el in extra:
+            key = id(el)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(el)
+        visible: List[Any] = []
+        for el in found:
+            try:
+                if el.is_displayed():
+                    visible.append(el)
+            except Exception:
+                continue
+        return visible
+
+    def _clear_cart(
+        self, driver, products: Optional[List[Dict[str, Any]]] = None
+    ) -> None:
+        """逐条删除；标准 cart.step 与独立店 /step/ 购物车都清。"""
+        urls = self._cart_urls_to_clear(driver, products)
+        if not urls:
+            urls = [self._default_cart_url()]
+        for url in urls:
+            self.logger.info("乐天市场：清空购物车 url=%s", url)
+            driver = self._clear_cart_at_url(driver, url)
+
+    def _clear_cart_at_url(self, driver, cart_url: str):
+        """逐条删除；每次等待原按钮失效并刷新，禁止连续点击同一个旧按钮。"""
+        try:
+            self._navigate(driver, cart_url)
         except Exception as e:
-            if _is_window_dead_error(e):
+            if self._is_window_dead_error(e):
                 self.logger.warning(
                     "乐天市场：打开购物车时窗口失效，尝试恢复浏览器后重试: %s", e
                 )
                 driver = self.browser_manager.ensure_alive(restart_if_dead=True)
-                self._navigate(driver, self._cart_url())
+                self._navigate(driver, cart_url)
             else:
                 raise
 
         time.sleep(float(self.ri_cfg.get("wait_after_cart_load_seconds", 2)))
         self._dismiss_interruptions(driver)
-        delete_sel = (self.ri_cfg.get("delete_item_button_css") or 'button[aria-label="削除する"]').strip()
         max_rounds = int(self.ri_cfg.get("clear_cart_max_delete_rounds", 30))
         no_button_checks = 0
         for rnd in range(max_rounds):
             try:
-                btns = self._find_elements_now(driver, By.CSS_SELECTOR, delete_sel)
+                visible = self._find_cart_delete_buttons(driver)
             except Exception as e:
-                if _is_window_dead_error(e):
+                if self._is_window_dead_error(e):
                     self.logger.warning(
                         "乐天市场：清车过程窗口失效，恢复后重开购物车: %s", e
                     )
                     driver = self.browser_manager.ensure_alive(restart_if_dead=True)
-                    self._navigate(driver, self._cart_url())
+                    self._navigate(driver, cart_url)
                     time.sleep(
                         float(self.ri_cfg.get("wait_after_cart_load_seconds", 2))
                     )
                     self._dismiss_interruptions(driver)
                     no_button_checks = 0
                     continue
-                btns = []
-            visible = []
-            for b in btns:
-                try:
-                    if b.is_displayed():
-                        visible.append(b)
-                except Exception:
-                    continue
+                visible = []
             if not visible:
                 if self._cart_is_explicitly_empty(driver):
-                    self.logger.info("乐天市场：已确认购物车为空")
-                    return
+                    self.logger.info("乐天市场：已确认购物车为空 url=%s", cart_url)
+                    return driver
                 no_button_checks += 1
                 if no_button_checks >= 3:
                     raise RuntimeError(
@@ -1099,14 +1281,14 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 try:
                     self._refresh_allow_timeout(driver)
                 except Exception as e:
-                    if _is_window_dead_error(e):
+                    if self._is_window_dead_error(e):
                         self.logger.warning(
                             "乐天市场：刷新购物车时窗口失效，恢复后重开: %s", e
                         )
                         driver = self.browser_manager.ensure_alive(
                             restart_if_dead=True
                         )
-                        self._navigate(driver, self._cart_url())
+                        self._navigate(driver, cart_url)
                         time.sleep(
                             float(self.ri_cfg.get("wait_after_cart_load_seconds", 2))
                         )
@@ -1129,7 +1311,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             try:
                 driver.execute_script("arguments[0].click();", btn)
             except Exception as e:
-                raise RuntimeError("点击削除する失败: %s" % e) from e
+                raise RuntimeError("点击削除失败: %s" % e) from e
             try:
                 WebDriverWait(
                     driver,
@@ -1353,7 +1535,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 '[aria-modal="true"] div[irc="Quantity"] select,'
                 '[aria-modal="true"] div[irc="Quantity"] input[type="tel"]'
             ),
-            "cart": 'select.select--3Nrso, select[class*="select--"], input[type="tel"]',
+            "cart": (
+                'select.select--3Nrso, select[class*="select--"], '
+                "select.c-formv2__selectItem, select[id*='item_unit'], "
+                "select[name*='itemKeyUnit'], input[type='tel']"
+            ),
         }
         default = defaults.get(scope) or defaults["pdp"]
         css_list = str(self.ri_cfg.get(cfg_key) or default).split(",")
@@ -1487,7 +1673,9 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         driver,
                         anchor,
                         By.XPATH,
-                        "./ancestor::*[.//button[@aria-label='削除する']][1]",
+                        "./ancestor::*[contains(@class,'p-cartv2__orderItem') "
+                        "or .//button[@aria-label='削除する'] "
+                        "or .//a[starts-with(@id,'delete')]][1]",
                     )
                     if rows:
                         return rows[0]
@@ -1501,9 +1689,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         saw_busy = False
         while time.time() < deadline:
             try:
-                btns = self._find_elements_now(
-                    driver, By.CSS_SELECTOR, 'button[aria-label="購入手続き"]'
-                )
+                btns = self._iter_visible_cart_checkout_buttons(driver)
                 if not btns:
                     time.sleep(0.25)
                     continue
@@ -1532,37 +1718,58 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
           </div>
         需与同页都道府县 select（同 class）区分。
         """
+        qty_select_css = (
+            "select.select--3Nrso, select[class*='select--'], "
+            "select.c-formv2__selectItem, select[id*='item_unit'], "
+            "select[name*='itemKeyUnit']"
+        )
+
+        def _select_parent_text(sel) -> str:
+            for xp in (
+                "./ancestor::div[contains(@class,'c-formv2__select')][1]",
+                "./ancestor::div[contains(@class,'container--')][1]",
+                "./../..",
+                "./..",
+            ):
+                try:
+                    parent = sel.find_element(By.XPATH, xp)
+                    text = (parent.text or "").strip()
+                    if text:
+                        return text
+                except Exception:
+                    continue
+            return ""
+
+        def _numeric_opts(sel) -> List[str]:
+            values = []
+            try:
+                for option in Select(sel).options:
+                    raw = (option.get_attribute("value") or option.text or "").strip()
+                    values.append(raw)
+            except Exception:
+                return []
+            return [v for v in values if re.fullmatch(r"\d+\+?", v)]
+
         # 1) 优先：同容器内带「数量」前缀的 select
-        for sel in self._find_elements_in(
-            driver, row, By.CSS_SELECTOR, "select.select--3Nrso, select[class*='select--']"
-        ):
+        # 预约商品可能只有 option 1，不能要求至少 2 个数字选项
+        for sel in self._find_elements_in(driver, row, By.CSS_SELECTOR, qty_select_css):
             try:
                 if not sel.is_displayed():
                     continue
             except Exception:
                 continue
-            try:
-                parent = sel.find_element(By.XPATH, "./..")
-                parent_text = (parent.text or "").strip()
-            except Exception:
-                parent_text = ""
+            parent_text = _select_parent_text(sel)
             if "数量" not in parent_text:
                 continue
-            option_values = []
-            try:
-                for option in Select(sel).options:
-                    raw = (option.get_attribute("value") or option.text or "").strip()
-                    option_values.append(raw)
-            except Exception:
-                continue
-            numeric_opts = [v for v in option_values if re.fullmatch(r"\d+\+?", v)]
-            if len(numeric_opts) >= 2 and "1" in {v.rstrip("+") for v in numeric_opts}:
+            numeric_opts = _numeric_opts(sel)
+            if numeric_opts and "1" in {v.rstrip("+") for v in numeric_opts}:
                 return sel
 
         # 2) 兜底：沿用候选过滤（排除都道府县等）
         for el in self._quantity_control_candidates(driver, row, "cart"):
             if (el.tag_name or "").lower() != "select":
                 continue
+            parent_text = _select_parent_text(el)
             option_values = []
             for option in Select(el).options:
                 raw = (option.get_attribute("value") or option.text or "").strip()
@@ -1570,6 +1777,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             if not option_values or option_values[0] == "":
                 continue
             numeric_opts = [v for v in option_values if re.fullmatch(r"\d+\+?", v)]
+            if "数量" in parent_text and numeric_opts:
+                return el
             if len(numeric_opts) < 2 or "1" not in {v.rstrip("+") for v in numeric_opts}:
                 continue
             if len(numeric_opts) < len(option_values) * 0.9:
@@ -1679,6 +1888,82 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         # 购物车页结算按钮通常只有「購入手続き」，详情加购等价按钮多为「購入手続きへ」
         return "へ" in text or "購入手続きへ" in text
 
+    @staticmethod
+    def _is_cart_checkout_label(label: str) -> bool:
+        t = label or ""
+        if "御見積" in t or "見積書" in t:
+            return False
+        if "手続きへ" in t:
+            return False
+        return "購入手続き" in t
+
+    def _cart_checkout_css_selectors(self) -> List[str]:
+        cfg = (
+            self.ri_cfg.get("shop_checkout_button_css")
+            or 'button[aria-label="購入手続き"]'
+        ).strip()
+        out: List[str] = []
+        for sel in (
+            cfg,
+            'button[aria-label="購入手続き"]',
+            "#go_next",
+            "button[name='go_next']",
+            "button[name='go_next_2']",
+        ):
+            s = (sel or "").strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    def _iter_visible_cart_checkout_buttons(self, driver) -> List[Any]:
+        found: List[Any] = []
+        seen = set()
+
+        def _take(el) -> None:
+            key = id(el)
+            if key in seen:
+                return
+            try:
+                if not el.is_displayed():
+                    return
+            except Exception:
+                return
+            cls = el.get_attribute("class") or ""
+            if "estimate_confirm" in cls:
+                return
+            eid = (el.get_attribute("id") or "").strip()
+            name = (el.get_attribute("name") or "").strip()
+            label = self._button_label(el)
+            if eid == "go_next" or name in ("go_next", "go_next_2"):
+                seen.add(key)
+                found.append(el)
+                return
+            if self._is_cart_checkout_label(label):
+                seen.add(key)
+                found.append(el)
+
+        for css in self._cart_checkout_css_selectors():
+            try:
+                els = self._find_elements_now(driver, By.CSS_SELECTOR, css)
+            except Exception:
+                els = []
+            for el in els:
+                _take(el)
+        try:
+            extra = self._find_elements_now(
+                driver,
+                By.XPATH,
+                "//button[@id='go_next' or @name='go_next' or @name='go_next_2' "
+                "or @aria-label='購入手続き' "
+                "or contains(normalize-space(.), 'ご購入手続き') "
+                "or contains(normalize-space(.), '購入手続き')]",
+            )
+        except Exception:
+            extra = []
+        for el in extra:
+            _take(el)
+        return found
+
     def _is_usable_add_element(self, el, *, allow_hidden: bool = False) -> bool:
         try:
             eid = (el.get_attribute("id") or "").strip()
@@ -1711,11 +1996,16 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def _looks_like_shop_subdomain_pdp(self, driver) -> bool:
         """乐天ビック等独立店域名 / Nuxt 详情页（非 item.rakuten.co.jp 标准模板）。"""
         try:
-            host = urlparse(driver.current_url or "").netloc.split(":")[0].lower()
+            parsed = urlparse(driver.current_url or "")
+            host = parsed.netloc.split(":")[0].lower()
+            path = (parsed.path or "").lower()
+            if "/step" in path:
+                return False
             if host.endswith(".rakuten.co.jp"):
                 shop = host[: -len(".rakuten.co.jp")]
                 if shop and "." not in shop and shop not in _SHOP_SUBDOMAIN_SKIP:
-                    return True
+                    if "/item/" in path:
+                        return True
             return bool(
                 self._find_elements_now(
                     driver,
@@ -2124,6 +2414,112 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return None
         return state if isinstance(state, dict) else None
 
+    def _read_shop_owned_cart_rows(self, driver) -> Optional[List[Dict[str, Any]]]:
+        """楽天ビック p-cartv2 购物车行：url / qty / price。非该页返回 None，空车返回 []。"""
+        try:
+            rows = driver.execute_script(
+                """
+                var hasCart = !!(
+                  document.querySelector('.p-cartv2')
+                  || document.getElementById('go_next')
+                  || document.querySelector('select[id*="item_unit"]')
+                );
+                if (!hasCart) return null;
+                var items = document.querySelectorAll('.p-cartv2__orderItem');
+                if (!items.length) {
+                  items = document.querySelectorAll('[id^="item["]');
+                }
+                var filtered = [];
+                for (var i = 0; i < items.length; i++) {
+                  var id = items[i].id || '';
+                  if (id.indexOf('item_sec') === 0) continue;
+                  filtered.push(items[i]);
+                }
+                var out = [];
+                for (var j = 0; j < filtered.length; j++) {
+                  var root = filtered[j];
+                  var a = root.querySelector('a[href*="/item/"], a[href*="item.rakuten"]');
+                  if (!a) continue;
+                  var sel = root.querySelector(
+                    'select[id*="item_unit"], select[name*="itemKeyUnit"], select.c-formv2__selectItem'
+                  );
+                  var qty = 1;
+                  if (sel) {
+                    var v = parseInt(sel.value, 10);
+                    if (isFinite(v) && v > 0) qty = v;
+                  }
+                  var priceEl = root.querySelector('[id*="item_price"]');
+                  var price = 0;
+                  if (priceEl) {
+                    var pt = (priceEl.innerText || priceEl.textContent || '').replace(/[^0-9]/g, '');
+                    if (pt) price = parseInt(pt, 10);
+                  }
+                  out.push({url: a.href || '', qty: qty, price: price});
+                }
+                return out;
+                """
+            )
+        except Exception as e:
+            self.logger.debug("乐天市场：独立店购物车 DOM 读取失败: %s", e)
+            return None
+        if rows is None:
+            return None
+        if not isinstance(rows, list):
+            return None
+        cleaned: List[Dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                cleaned.append(row)
+        return cleaned
+
+    def _parse_shop_owned_cart_totals(self, driver) -> Optional[Tuple[int, int, int]]:
+        try:
+            info = driver.execute_script(
+                """
+                function yenById(id) {
+                  var el = document.getElementById(id);
+                  if (!el) return 0;
+                  var t = (el.innerText || el.textContent || '').replace(/[^0-9]/g, '');
+                  return t ? parseInt(t, 10) : 0;
+                }
+                var sub = yenById('sub_total') || yenById('sub_total_sp1');
+                var itemSum = 0;
+                var prices = document.querySelectorAll('[id*="item_price"]');
+                for (var i = 0; i < prices.length; i++) {
+                  var t = (prices[i].innerText || prices[i].textContent || '').replace(/[^0-9]/g, '');
+                  if (t) itemSum += parseInt(t, 10);
+                }
+                var shipEl = document.getElementById('shippingPostage')
+                  || document.getElementById('shippingPostage-s');
+                var shipText = shipEl ? (shipEl.innerText || shipEl.textContent || '') : '';
+                var body = document.body ? (document.body.innerText || '') : '';
+                var free = shipText.indexOf('送料無料') >= 0 || body.indexOf('送料無料') >= 0;
+                var shipYen = 0;
+                if (!free) {
+                  var st = (shipText || '').replace(/[^0-9]/g, '');
+                  if (st) shipYen = parseInt(st, 10);
+                }
+                return {sub: sub, itemSum: itemSum, free: free, shipYen: shipYen};
+                """
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：独立店购物车金额读取失败: %s", e)
+            return None
+        if not isinstance(info, dict):
+            return None
+        goods = int(info.get("sub") or 0) or int(info.get("itemSum") or 0)
+        if goods <= 0:
+            return None
+        operate = 0 if info.get("free") else int(info.get("shipYen") or 0)
+        total = goods + operate
+        self.logger.info(
+            "乐天市场：独立店购物车金额 goods=%s operate=%s total=%s",
+            goods,
+            operate,
+            total,
+        )
+        return goods, operate, total
+
     def _parse_cart_totals(self, driver) -> Tuple[int, int, int]:
         """
         从购物车页读取金额（优先 window.__INITIAL_STATE__.shopItemSubtotals）。
@@ -2132,6 +2528,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         确认页含电话号，易把 080-7535-8884 误解析成运费；购物车侧栏更干净。
         """
         self._ensure_cart_page(driver, quick=True)
+        if self._is_shop_owned_cart_page(driver):
+            shop_totals = self._parse_shop_owned_cart_totals(driver)
+            if shop_totals and shop_totals[2] > 0 and shop_totals[0] > 0:
+                return shop_totals
         info = None
         try:
             info = driver.execute_script(
@@ -2249,6 +2649,20 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 src = driver.page_source or ""
             except Exception:
                 src = ""
+            try:
+                sub_txt = driver.execute_script(
+                    "var e=document.getElementById('sub_total')"
+                    "||document.getElementById('sub_total_sp1');"
+                    "return e ? (e.innerText||e.textContent||'') : '';"
+                )
+                sub_v = _parse_yen_int(str(sub_txt or ""))
+                if sub_v > 0:
+                    if goods_fee <= 0:
+                        goods_fee = sub_v
+                    if total <= 0:
+                        total = sub_v
+            except Exception:
+                pass
             # 送料無料
             shipping_dom = None
             if "送料無料" in src:
@@ -2291,8 +2705,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
 
         if total <= 0 or goods_fee <= 0:
             raise RuntimeError(
-                "购物车页未能解析总金额/商品金额（INITIAL_STATE/DOM），"
-                "请确认已在 cart.step 且 shopItemSubtotals 可用"
+                "购物车页未能解析总金额/商品金额（INITIAL_STATE/独立店DOM），"
+                "请确认已在 cart.step 或店铺 /step/ 购物车"
             )
         return goods_fee, operate_fee, total
 
@@ -2329,6 +2743,18 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     price = 0
                 if price > 0:
                     out[key] = price
+        if out:
+            return out
+        for row in self._read_shop_owned_cart_rows(driver) or []:
+            key = self._product_cart_key(str(row.get("url") or ""))
+            if not key:
+                continue
+            try:
+                price = int(row.get("price") or 0)
+            except Exception:
+                price = 0
+            if price > 0:
+                out[key] = price
         return out
 
     def _collect_cart_item_spec_texts(self, driver) -> Dict[str, List[str]]:
@@ -2673,18 +3099,48 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 actual[key] = actual.get(key, 0) + quantity
         return actual
 
+    def _actual_cart_quantities_from_shop_dom(self, driver) -> Optional[Dict[str, int]]:
+        rows = self._read_shop_owned_cart_rows(driver)
+        if rows is None:
+            return None
+        actual: Dict[str, int] = {}
+        for row in rows:
+            key = self._product_cart_key(str(row.get("url") or ""))
+            if not key:
+                continue
+            try:
+                quantity = max(1, int(row.get("qty") or 1))
+            except Exception:
+                quantity = 1
+            actual[key] = actual.get(key, 0) + quantity
+        return actual
+
     def _actual_cart_quantities(self, driver) -> Optional[Dict[str, int]]:
-        """优先读 __INITIAL_STATE__；若状态缺失则刷新一次再读，避免 eager 加载导致空状态误判。"""
+        """优先独立店 DOM / __INITIAL_STATE__；缺失则刷新再读。"""
+        if self._is_shop_owned_cart_page(driver):
+            shop = self._actual_cart_quantities_from_shop_dom(driver)
+            if shop is not None:
+                return shop
         actual = self._actual_cart_quantities_from_state(driver)
         if actual is not None:
             return actual
+        shop = self._actual_cart_quantities_from_shop_dom(driver)
+        if shop is not None:
+            return shop
         try:
             self._refresh_allow_timeout(driver)
             time.sleep(1.0)
             self._dismiss_interruptions(driver, timeout=1.0)
         except Exception:
             pass
-        return self._actual_cart_quantities_from_state(driver)
+        if self._is_shop_owned_cart_page(driver):
+            shop = self._actual_cart_quantities_from_shop_dom(driver)
+            if shop is not None:
+                return shop
+        actual = self._actual_cart_quantities_from_state(driver)
+        if actual is not None:
+            return actual
+        return self._actual_cart_quantities_from_shop_dom(driver)
 
     def _cart_contains_expected_products(
         self,
@@ -2717,7 +3173,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     "乐天市场：购物车状态未就绪，重新打开购物车后重试核验"
                 )
                 try:
-                    self._navigate(driver, self._cart_url())
+                    self._navigate(driver, self._cart_url(driver))
                     retry_wait = float(
                         self.ri_cfg.get("wait_after_cart_load_seconds", 2)
                     )
@@ -3269,6 +3725,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     ) -> None:
         """加购商品。无「かごに追加」时点击「購入手続きへ」（等价加购）。"""
         product_url = str(product.get("url") or "").strip()
+        self._remember_shop_cart_from_url(product_url)
         target_qty = max(1, int(product.get("quantity") or 1))
         product_key = self._product_cart_key(product_url)
 
@@ -3725,16 +4182,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             pass
 
         # 按钮存在但 disabled
-        sel = (
-            self.ri_cfg.get("shop_checkout_button_css")
-            or 'button[aria-label="購入手続き"]'
-        ).strip()
         seen_disabled = False
         try:
-            for b in self._find_elements_now(driver, By.CSS_SELECTOR, sel):
+            for b in self._iter_visible_cart_checkout_buttons(driver):
                 try:
-                    if not b.is_displayed():
-                        continue
                     disabled = bool(b.get_attribute("disabled"))
                     aria_dis = (b.get_attribute("aria-disabled") or "").lower()
                     cls = (b.get_attribute("class") or "").lower()
@@ -3776,12 +4227,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         block = self._cart_purchase_block_reason(driver)
         if block:
             raise RuntimeError(block)
-        sel = (self.ri_cfg.get("shop_checkout_button_css") or 'button[aria-label="購入手続き"]').strip()
-        btns = self._find_elements_now(driver, By.CSS_SELECTOR, sel)
         target = None
-        for b in btns:
+        for b in self._iter_visible_cart_checkout_buttons(driver):
             try:
-                if b.is_displayed() and b.is_enabled():
+                if b.is_enabled():
                     target = b
                     break
             except Exception:
@@ -4173,7 +4622,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
 
         try:
-            self._ensure_rakuten_session(resume_url=self._cart_url())
+            self._ensure_rakuten_session(resume_url=self._default_cart_url())
         except RakutenLoginError as e:
             msg = "乐天登录失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
@@ -4188,8 +4637,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 pass
             return False, self._make_summary(order, failure_reason=msg)
 
+        self._last_shop_cart_url = ""
+        for p in cart_products:
+            self._remember_shop_cart_from_url(str(p.get("url") or ""))
         try:
-            self._clear_cart(driver)
+            self._clear_cart(driver, cart_products)
         except Exception as e:
             msg = "清空购物车失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
