@@ -80,8 +80,9 @@ _SHOP_SUBDOMAIN_SKIP = frozenset(
         "afl",
     }
 )
-# 加购后使用店铺自有 /step/ 购物车（非 cart.step.rakuten.co.jp）
+# 加购后使用店铺自有结算车（{shop}.step.rakuten.co.jp/step/cart，非 cart.step）
 _SHOP_OWNED_CART_SLUGS = frozenset({"biccamera"})
+_SHOP_OWNED_CART_BIDS = {"biccamera": "269553"}
 
 
 class RakutenBooksHandoffNeeded(Exception):
@@ -344,10 +345,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def _ensure_session_after_action(self, resume_url=None, wait_seconds: float = 1.0) -> None:
         """
         点击購入手続き/次へ/注文確定等后可能异步跳到 session/upgrade。
-        仅短等 URL 是否进登录域，不做业务页 DOM 扫描。
+        独立店结算可能再出「追加の会員情報」性别页。
         """
-        if not self.session_guard:
-            return
         target = (resume_url or "").strip()
         try:
             low = target.lower()
@@ -363,20 +362,89 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 target = ""
         except Exception:
             pass
-        self.session_guard.ensure_after_possible_redirect(
-            resume_url=target or None, wait_seconds=min(float(wait_seconds), 1.5)
-        )
+        cap = 8.0 if (getattr(self, "_last_shop_cart_url", "") or "") else 1.5
+        if self.session_guard:
+            self.session_guard.ensure_after_possible_redirect(
+                resume_url=target or None,
+                wait_seconds=min(float(wait_seconds), cap),
+            )
+        try:
+            driver = self.browser_manager.get_driver()
+            self._handle_additional_member_profile_if_present(driver, timeout=4.0)
+        except Exception:
+            pass
+
+    def _handle_additional_member_profile_if_present(
+        self, driver, timeout: float = 6.0
+    ) -> bool:
+        """
+        楽天ビック SSO：追加の会員情報を登録する。
+        选择女性（#single-option-gender-F）后点「続く」（#cta）。
+        """
+        deadline = time.time() + max(1.0, float(timeout))
+        handled = False
+        while time.time() < deadline:
+            try:
+                src = driver.page_source or ""
+            except Exception:
+                return handled
+            is_profile = (
+                "single-option-gender-F" in src
+                or ("追加の会員情報" in src and "性別" in src)
+            )
+            if not is_profile:
+                if handled:
+                    return True
+                time.sleep(0.25)
+                continue
+            self.logger.info("乐天市场：检测到追加会员信息页，选择女性并继续")
+            try:
+                gender = None
+                for el in self._find_elements_now(
+                    driver, By.CSS_SELECTOR, "#single-option-gender-F"
+                ):
+                    gender = el
+                    break
+                if gender is None:
+                    driver.execute_script(
+                        "var el=document.getElementById('single-option-gender-F');"
+                        "if(el){el.click();}"
+                    )
+                else:
+                    driver.execute_script("arguments[0].click();", gender)
+                time.sleep(0.35)
+                cta = None
+                for el in self._find_elements_now(driver, By.CSS_SELECTOR, "#cta"):
+                    try:
+                        txt = (el.text or "") + " " + (el.get_attribute("id") or "")
+                        if el.is_displayed() or "cta" in (el.get_attribute("id") or ""):
+                            cta = el
+                            break
+                    except Exception:
+                        continue
+                if cta is None:
+                    driver.execute_script(
+                        "var el=document.getElementById('cta'); if(el){el.click();}"
+                    )
+                else:
+                    driver.execute_script("arguments[0].click();", cta)
+                handled = True
+                time.sleep(1.0)
+            except Exception as e:
+                self.logger.warning("乐天市场：补充会员信息页操作失败: %s", e)
+                return handled
+        return handled
 
     def _default_cart_url(self) -> str:
         return (self.ri_cfg.get("cart_url") or "https://cart.step.rakuten.co.jp/cart").strip()
 
     def _cart_url(self, driver=None) -> str:
-        """优先独立店 /step/ 购物车，否则标准 cart.step。"""
+        """优先独立店 {shop}.step.rakuten.co.jp/step/cart，否则标准 cart.step。"""
+        last = (getattr(self, "_last_shop_cart_url", "") or "").strip()
         if driver is not None:
             shop = self._shop_owned_cart_url(driver)
             if shop:
                 return shop
-        last = (getattr(self, "_last_shop_cart_url", "") or "").strip()
         if last:
             return last
         return self._default_cart_url()
@@ -392,22 +460,18 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         return shop
 
     @staticmethod
-    def _is_shop_owned_cart_url(url: str) -> bool:
-        try:
-            parsed = urlparse(url or "")
-        except Exception:
-            return False
-        shop = RakutenIchibaOrderProcessor._shop_slug_from_host(parsed.netloc)
-        if not shop:
-            return False
-        path = (parsed.path or "").lower()
-        # /step、/step/、/step/cart；详情页是 /item/，不能当成购物车
-        return "/step" in path
+    def _shop_slug_from_step_cart_host(host: str) -> str:
+        """biccamera.step.rakuten.co.jp → biccamera；排除 cart.step。"""
+        host = (host or "").split(":")[0].lower()
+        suffix = ".step.rakuten.co.jp"
+        if not host.endswith(suffix):
+            return ""
+        shop = host[: -len(suffix)]
+        if not shop or "." in shop or shop in ("cart", "basket"):
+            return ""
+        return shop
 
-    def _shop_uses_owned_cart(self, host: str) -> bool:
-        slug = self._shop_slug_from_host(host)
-        if not slug:
-            return False
+    def _shop_owned_cart_slugs(self) -> set:
         known = set(_SHOP_OWNED_CART_SLUGS)
         extra = self.ri_cfg.get("shop_owned_cart_hosts") or []
         for item in extra:
@@ -415,23 +479,71 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             if not raw:
                 continue
             raw = raw.replace("https://", "").replace("http://", "")
-            raw = raw.split("/")[0].replace(".rakuten.co.jp", "")
+            raw = raw.split("/")[0]
+            raw = raw.replace(".step.rakuten.co.jp", "").replace(".rakuten.co.jp", "")
             if raw:
                 known.add(raw)
-        return slug in known
+        return known
 
-    def _shop_owned_cart_url_from_page_url(self, url: str) -> str:
+    def _shop_uses_owned_cart_slug(self, slug: str) -> bool:
+        slug = (slug or "").strip().lower()
+        return bool(slug) and slug in self._shop_owned_cart_slugs()
+
+    def _shop_uses_owned_cart(self, host: str) -> bool:
+        slug = self._shop_slug_from_host(host) or self._shop_slug_from_step_cart_host(
+            host
+        )
+        return self._shop_uses_owned_cart_slug(slug)
+
+    def _shop_owned_cart_bid(self, slug: str) -> str:
+        cfg = self.ri_cfg.get("shop_owned_cart_bids") or {}
+        if isinstance(cfg, dict):
+            v = str(cfg.get(slug) or "").strip()
+            if v:
+                return v
+        return str(_SHOP_OWNED_CART_BIDS.get(slug) or "").strip()
+
+    def _shop_owned_cart_slug_from_url(self, url: str) -> str:
         try:
             parsed = urlparse(self._direct_product_url(url or ""))
         except Exception:
             return ""
-        if not self._shop_uses_owned_cart(parsed.netloc):
+        host = parsed.netloc
+        path = (parsed.path or "").lower()
+        slug = self._shop_slug_from_host(host)
+        if self._shop_uses_owned_cart_slug(slug):
+            return slug
+        slug = self._shop_slug_from_step_cart_host(host)
+        if self._shop_uses_owned_cart_slug(slug):
+            return slug
+        host_only = host.split(":")[0].lower()
+        if host_only in ("item.rakuten.co.jp", "m.rakuten.co.jp"):
+            parts = [p for p in path.split("/") if p]
+            if parts and self._shop_uses_owned_cart_slug(parts[0]):
+                return parts[0]
+        return ""
+
+    @staticmethod
+    def _is_shop_owned_cart_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url or "")
+        except Exception:
+            return False
+        slug = RakutenIchibaOrderProcessor._shop_slug_from_step_cart_host(parsed.netloc)
+        if not slug:
+            return False
+        path = (parsed.path or "").lower()
+        return "/step/cart" in path
+
+    def _shop_owned_cart_url_from_page_url(self, url: str) -> str:
+        slug = self._shop_owned_cart_slug_from_url(url)
+        if not slug:
             return ""
-        scheme = parsed.scheme or "https"
-        netloc = parsed.netloc
-        if not netloc:
-            return ""
-        return "%s://%s/step/" % (scheme, netloc)
+        out = "https://%s.step.rakuten.co.jp/step/cart" % slug
+        bid = self._shop_owned_cart_bid(slug)
+        if bid:
+            out += "?shop_bid=%s" % bid
+        return out
 
     def _remember_shop_cart_from_url(self, url: str) -> None:
         shop = self._shop_owned_cart_url_from_page_url(url)
@@ -460,9 +572,19 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return False
         if "p-cartv2__orderItem" not in src and 'id="go_next"' not in src:
             return False
-        shop = self._shop_slug_from_host(urlparse(url).netloc)
-        path = (urlparse(url).path or "").lower()
-        return bool(shop) and "/item/" not in path
+        parsed = urlparse(url)
+        path = (parsed.path or "").lower()
+        if "/item/" in path or "/step/confirm" in path:
+            return False
+        slug = self._shop_slug_from_step_cart_host(parsed.netloc)
+        return bool(slug)
+
+    def _already_on_wanted_cart(self, current: str, wanted: str) -> bool:
+        if self._is_shop_owned_cart_url(wanted):
+            return self._is_shop_owned_cart_url(current)
+        if self._is_shop_owned_cart_url(current):
+            return False
+        return "cart.step.rakuten.co.jp" in (current or "").lower()
 
     def _cart_urls_to_clear(
         self, driver, products: Optional[List[Dict[str, Any]]] = None
@@ -514,14 +636,19 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         return RakutenIchibaOrderProcessor._is_shop_owned_cart_url(url)
 
     def _ensure_cart_page(self, driver, *, quick: bool = False) -> None:
-        """进入购物车；若已在购物车页则跳过整页导航。"""
-        if self._is_on_cart_page(driver):
+        """进入本单应对应的购物车；Bic 单不得停在 cart.step。"""
+        wanted = self._cart_url(driver)
+        try:
+            current = driver.current_url or ""
+        except Exception:
+            current = ""
+        if self._already_on_wanted_cart(current, wanted):
             if not quick:
                 time.sleep(
                     float(self.ri_cfg.get("wait_after_cart_load_seconds", 2)) * 0.2
                 )
             return
-        self._navigate(driver, self._cart_url(driver))
+        self._navigate(driver, wanted)
         base = float(self.ri_cfg.get("wait_after_cart_load_seconds", 2))
         time.sleep(min(base, 0.8) if quick else base)
 
@@ -1097,11 +1224,51 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         if stop_before_purchase(self.config):
             raise DevTestStopBeforePurchase("本地测试：停在注文確定前")
         self._random_pre_click_wait("注文を確定する")
-        commit_btn = WebDriverWait(driver, 25).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, commit_sel))
-        )
+        commit_btn = None
+        deadline = time.time() + 25.0
+        while time.time() < deadline:
+            commit_btn = self._find_visible_commit_order_button(driver, commit_sel)
+            if commit_btn is not None:
+                break
+            time.sleep(0.35)
+        if commit_btn is None:
+            raise RuntimeError("确认页未找到可点击的「注文を確定する」（含 #order_confirm）")
         driver.execute_script("arguments[0].click();", commit_btn)
         self._ensure_session_after_action(wait_seconds=1.0)
+
+    def _commit_order_button_selectors(self, commit_sel: str) -> List[str]:
+        out: List[str] = []
+        for sel in (
+            (commit_sel or "").strip(),
+            '.commit-order-button button[aria-label="注文を確定する"]',
+            'button[aria-label="注文を確定する"]',
+            "#order_confirm",
+            "button#order_confirm",
+        ):
+            s = (sel or "").strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    def _find_visible_commit_order_button(self, driver, commit_sel: str = ""):
+        for css in self._commit_order_button_selectors(commit_sel):
+            for el in self._find_elements_now(driver, By.CSS_SELECTOR, css):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception:
+                    continue
+        for el in self._find_elements_now(
+            driver,
+            By.XPATH,
+            "//button[@id='order_confirm' or contains(normalize-space(.), '注文を確定する')]",
+        ):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    return el
+            except Exception:
+                continue
+        return None
 
     def _commit_order_with_delivery_modal_gate(
         self, driver, commit_sel: str
@@ -1146,20 +1313,12 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         # 仅当我们刚关掉强制弹窗、且确认按钮仍在时，再点一次（避免正常单重复提交）
         if not handled_delivery_modal:
             return
-        for el in self._find_elements_now(
-            driver,
-            By.CSS_SELECTOR,
-            'button[aria-label="注文を確定する"], .commit-order-button button',
-        ):
-            try:
-                if el.is_displayed() and el.is_enabled():
-                    self.logger.info(
-                        "乐天市场：お届け日時弹窗已关，再次点击注文を確定する"
-                    )
-                    self._click_commit_order_button(driver, commit_sel)
-                    return
-            except Exception:
-                continue
+        retry_btn = self._find_visible_commit_order_button(driver, commit_sel)
+        if retry_btn is not None:
+            self.logger.info(
+                "乐天市场：お届け日時弹窗已关，再次点击注文を確定する"
+            )
+            self._click_commit_order_button(driver, commit_sel)
 
     @staticmethod
     def _is_window_dead_error(err: Exception) -> bool:
@@ -3937,6 +4096,55 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             rows.append((price, num))
         return rows
 
+    def _parse_shop_owned_confirm_totals(self, driver) -> Optional[Tuple[int, int, int]]:
+        """楽天ビック确认页：#confirm_sub_total / #confirm_total_amount / 送料無料。"""
+        try:
+            info = driver.execute_script(
+                """
+                function yenById(id) {
+                  var el = document.getElementById(id);
+                  if (!el) return 0;
+                  var t = (el.innerText || el.textContent || '').replace(/[^0-9]/g, '');
+                  return t ? parseInt(t, 10) : 0;
+                }
+                var sub = yenById('confirm_sub_total') || yenById('confirm_sub_total_sp');
+                var total = yenById('confirm_total_amount') || yenById('confirm_total_amount_sp');
+                var shipEl = document.getElementById('confirm_shipping')
+                  || document.getElementById('confirm_shipping_sp');
+                var shipText = shipEl ? (shipEl.innerText || shipEl.textContent || '') : '';
+                var free = shipText.indexOf('送料無料') >= 0;
+                var shipYen = 0;
+                if (!free) {
+                  var st = (shipText || '').replace(/[^0-9]/g, '');
+                  if (st) shipYen = parseInt(st, 10);
+                }
+                var hasBtn = !!document.getElementById('order_confirm');
+                return {sub: sub, total: total, free: free, shipYen: shipYen, hasBtn: hasBtn};
+                """
+            )
+        except Exception:
+            return None
+        if not isinstance(info, dict):
+            return None
+        if not info.get("hasBtn") and not info.get("sub") and not info.get("total"):
+            return None
+        goods = int(info.get("sub") or 0)
+        total = int(info.get("total") or 0) or goods
+        if goods <= 0:
+            goods = total
+        if goods <= 0 or total <= 0:
+            return None
+        operate = 0 if info.get("free") else int(info.get("shipYen") or 0)
+        if total > 0 and goods > 0:
+            operate = total - goods
+        self.logger.info(
+            "乐天市场：独立店确认页金额 goods=%s operate=%s total=%s",
+            goods,
+            operate,
+            total,
+        )
+        return goods, operate, total
+
     def _parse_confirm_totals(self, driver) -> Tuple[int, int, int]:
         """
         返回 (goods_fee, operate_fee, total)。
@@ -3945,6 +4153,9 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         后端 checkCart 要求 GoodsFee + OperateFee == Total。
         OperateFee 最终一律用 Total - GoodsFee，避免把电话号/积分文案误当成运费或优惠。
         """
+        shop_confirm = self._parse_shop_owned_confirm_totals(driver)
+        if shop_confirm and shop_confirm[0] > 0 and shop_confirm[2] > 0:
+            return shop_confirm
         goods_fee = shipping = total = 0
         coupon = 0
 
@@ -4244,8 +4455,16 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         self._random_pre_click_wait("购物车購入手続き")
         driver.execute_script("arguments[0].click();", target)
         time.sleep(float(self.ri_cfg.get("wait_after_shop_checkout_seconds", 4)))
-        # 购物车结算常触发 session/upgrade（client=shopcart）
-        self._ensure_session_after_action(wait_seconds=1.0)
+        try:
+            self._handle_additional_member_profile_if_present(driver, timeout=6.0)
+        except Exception as e:
+            self.logger.debug("乐天市场：结算后会员信息页异常（忽略）: %s", e)
+        wait_login = 8.0 if (getattr(self, "_last_shop_cart_url", "") or "") else 1.0
+        self._ensure_session_after_action(wait_seconds=wait_login)
+        try:
+            self._handle_additional_member_profile_if_present(driver, timeout=6.0)
+        except Exception as e:
+            self.logger.debug("乐天市场：登录后会员信息页异常（忽略）: %s", e)
         # 药品确认页也可能出现在「購入手続き」之后
         try:
             self._handle_medicine_confirmation_page(driver, timeout=8.0)
@@ -4263,7 +4482,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         for el in self._find_elements_now(
             driver,
             By.CSS_SELECTOR,
-            'button[aria-label="注文を確定する"], .commit-order-button button',
+            'button[aria-label="注文を確定する"], .commit-order-button button, #order_confirm',
         ):
             try:
                 if el.is_displayed():
@@ -4429,7 +4648,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         for el in self._find_elements_now(
             driver,
             By.CSS_SELECTOR,
-            'button[aria-label="注文を確定する"], .commit-order-button button',
+            'button[aria-label="注文を確定する"], .commit-order-button button, #order_confirm',
         ):
             try:
                 if el.is_displayed():

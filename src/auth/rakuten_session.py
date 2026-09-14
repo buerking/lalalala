@@ -33,6 +33,7 @@ STAGE_NOT_LOGIN = "not_login"
 STAGE_USERNAME = "username"
 STAGE_PASSWORD = "password"
 STAGE_TWO_FACTOR = "two_factor"
+STAGE_PROFILE = "profile"
 STAGE_LOGIN_UNKNOWN = "login_unknown"
 
 
@@ -72,6 +73,7 @@ class RakutenSessionGuard(LoggerMixin):
         'input[aria-label*="メール"]',
     )
     CTA_SELECTORS = (
+        "#cta",
         "#cta011",
         "#cta01",
         ".h4k5-e2e-button__submit",
@@ -86,6 +88,7 @@ class RakutenSessionGuard(LoggerMixin):
         "Sign in",
         "Sign In",
         "続行",
+        "続く",
         "Continue",
     )
     TWO_FACTOR_HINTS = (
@@ -232,6 +235,9 @@ class RakutenSessionGuard(LoggerMixin):
         if not self._url_is_login_host(driver):
             return STAGE_NOT_LOGIN
 
+        if self._page_is_additional_profile(driver):
+            return STAGE_PROFILE
+
         _host, _path, frag = self._url_bits(driver)
         if any(h in frag for h in self.PASSWORD_HASH_HINTS):
             # hash 已是密码步（控件可能尚在 SPA 渲染中）
@@ -261,6 +267,16 @@ class RakutenSessionGuard(LoggerMixin):
         except Exception:
             return False
         return any(h in html for h in self.TWO_FACTOR_HINTS)
+
+    def _page_is_additional_profile(self, driver) -> bool:
+        """楽天ビック SSO：追加の会員情報（性别必填）。"""
+        try:
+            html = driver.page_source or ""
+        except Exception:
+            return False
+        if "single-option-gender-F" in html:
+            return True
+        return "追加の会員情報" in html and "性別" in html
 
     def _password_present(self, driver) -> bool:
         with self._no_implicit_wait(driver):
@@ -393,7 +409,7 @@ class RakutenSessionGuard(LoggerMixin):
             return True
         driver = self.browser_manager.get_driver()
         # 默认最多约 1 秒；已在登录域则立刻处理
-        deadline = time.time() + max(0.2, min(float(wait_seconds), 2.0))
+        deadline = time.time() + max(0.2, min(float(wait_seconds), 12.0))
         while time.time() < deadline:
             if self._url_is_login_host(driver):
                 break
@@ -416,6 +432,8 @@ class RakutenSessionGuard(LoggerMixin):
         last_stage = STAGE_LOGIN_UNKNOWN
         while time.time() < deadline:
             last_stage = self.detect_stage(driver)
+            if last_stage == STAGE_PROFILE:
+                return last_stage
             if last_stage in (STAGE_PASSWORD, STAGE_USERNAME, STAGE_TWO_FACTOR):
                 # password hash 但控件未出：继续等到控件 present
                 if last_stage == STAGE_PASSWORD and not self._password_present(driver):
@@ -434,6 +452,9 @@ class RakutenSessionGuard(LoggerMixin):
 
         if stage == STAGE_TWO_FACTOR:
             return False
+
+        if stage == STAGE_PROFILE or self._page_is_additional_profile(driver):
+            return self._complete_additional_profile(driver)
 
         if stage == STAGE_USERNAME or (
             stage == STAGE_LOGIN_UNKNOWN and self._username_present(driver)
@@ -487,10 +508,54 @@ class RakutenSessionGuard(LoggerMixin):
         while time.time() < deadline:
             if self.looks_like_two_factor(driver):
                 return False
+            if self._page_is_additional_profile(driver):
+                return self._complete_additional_profile(driver)
             if not self.is_login_page(driver):
                 return True
             time.sleep(0.5)
         return False
+
+    def _complete_additional_profile(self, driver) -> bool:
+        """补充会员信息：选女性后点「続く」。"""
+        self.logger.info("乐天登录适配器：补充会员信息，选择女性并继续")
+        try:
+            with self._no_implicit_wait(driver):
+                gender = None
+                for el in driver.find_elements(By.CSS_SELECTOR, "#single-option-gender-F"):
+                    gender = el
+                    break
+            if gender is not None:
+                driver.execute_script("arguments[0].click();", gender)
+            else:
+                driver.execute_script(
+                    "var el=document.getElementById('single-option-gender-F');"
+                    "if(el){el.click();}"
+                )
+        except Exception as e:
+            self.logger.warning("乐天登录：点击女性选项失败: %s", e)
+        time.sleep(0.4)
+        try:
+            self._click_next(driver)
+        except Exception:
+            try:
+                driver.execute_script(
+                    "var el=document.getElementById('cta'); if(el){el.click();}"
+                )
+            except Exception:
+                pass
+        time.sleep(self.wait_after_submit_seconds)
+        deadline = time.time() + self.login_timeout_seconds
+        while time.time() < deadline:
+            if not self.is_login_page(driver):
+                return True
+            if not self._page_is_additional_profile(driver):
+                stage = self.detect_stage(driver)
+                if stage in (STAGE_PASSWORD, STAGE_USERNAME, STAGE_TWO_FACTOR):
+                    return True
+                if stage == STAGE_NOT_LOGIN:
+                    return True
+            time.sleep(0.4)
+        return not self._page_is_additional_profile(driver)
 
     def _find_password_el(self, driver):
         """可见优先；否则接受 present（SPA/动画中 is_displayed=false 很常见）。"""
@@ -582,7 +647,7 @@ class RakutenSessionGuard(LoggerMixin):
         try:
             ok = driver.execute_script(
                 """
-                var ids = ['cta011','cta01'];
+                var ids = ['cta','cta011','cta01'];
                 for (var i=0;i<ids.length;i++) {
                   var el = document.getElementById(ids[i]);
                   if (el) { el.click(); return true; }
@@ -592,7 +657,8 @@ class RakutenSessionGuard(LoggerMixin):
                 );
                 for (var j=0;j<btns.length;j++) {
                   var t = (btns[j].innerText || btns[j].textContent || '').trim();
-                  if (t.indexOf('次へ') >= 0 || t === 'Next' || t.indexOf('ログイン') >= 0) {
+                  if (t.indexOf('次へ') >= 0 || t === 'Next' || t.indexOf('ログイン') >= 0
+                      || t.indexOf('続く') >= 0 || t.indexOf('続行') >= 0) {
                     btns[j].click();
                     return true;
                   }
