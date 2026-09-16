@@ -149,22 +149,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 target = (driver.current_url or "").strip()
             except Exception:
                 target = ""
-        # 登录站本身不要当 resume 目标
-        try:
-            low = target.lower()
-            if any(
-                h in low
-                for h in (
-                    "login.account.rakuten",
-                    "login.rakuten.co.jp",
-                    "member.id.rakuten",
-                    "glogin.rakuten",
-                    "id.rakuten.co.jp",
-                )
-            ):
-                target = ""
-        except Exception:
-            pass
+        target = self._sanitize_books_resume_url(target)
         self._ensure_rakuten_session(resume_url=target or None)
 
     def _ensure_session_after_action(
@@ -173,23 +158,36 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         """点击確定/次へ后可能异步跳到 session/upgrade。"""
         if not self.session_guard:
             return
-        target = (resume_url or "").strip()
-        try:
-            low = target.lower()
-            if any(
-                h in low
-                for h in (
-                    "login.account.rakuten",
-                    "login.rakuten.co.jp",
-                    "member.id.rakuten",
-                    "glogin.rakuten",
-                )
-            ):
-                target = ""
-        except Exception:
-            pass
+        target = self._sanitize_books_resume_url(resume_url or "")
         self.session_guard.ensure_after_possible_redirect(
             resume_url=target or None, wait_seconds=min(float(wait_seconds), 1.5)
+        )
+
+    @staticmethod
+    def _sanitize_books_resume_url(resume_url: str) -> str:
+        """登录站 / AuthReturn(u0001) 不能当 resume，否则 SSO 后再 get 一次会把 Cookie 弄乱。"""
+        target = (resume_url or "").strip()
+        if not target:
+            return ""
+        low = target.lower()
+        if any(
+            h in low
+            for h in (
+                "login.account.rakuten",
+                "login.rakuten.co.jp",
+                "member.id.rakuten",
+                "glogin.rakuten",
+                "id.rakuten.co.jp",
+            )
+        ):
+            return ""
+        if "authreturn" in low:
+            return ""
+        return target
+
+    def _books_cart_url(self) -> str:
+        return (self.rb_cfg.get("cart_url") or "").strip() or (
+            "https://books.step.rakuten.co.jp/rms/mall/book/bs/Cart"
         )
 
 
@@ -452,6 +450,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         last_err = ""
         for attempt in range(1, 4):
             self._ensure_session_after_nav(driver)
+            if self._is_books_cookie_invalid_page(driver):
+                self._recover_from_cookie_error_via_cart(driver)
             if not self._is_books_confirm_page(driver):
                 # 已离开确认页视为成功
                 if self._is_books_success_page(driver):
@@ -529,6 +529,14 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             self._ensure_session_after_action(wait_seconds=1.0)
             if self._is_books_success_page(driver):
                 return
+            if self._is_books_cookie_invalid_page(driver):
+                self.logger.warning(
+                    "乐天书店：注文確定后落到 Cookie 无效页(u0001)，返回购物车重试结算"
+                )
+                self._recover_from_cookie_error_via_cart(driver)
+                if not self._is_books_confirm_page(driver):
+                    self._pass_books_checkout_intermediates(driver)
+                continue
             if not self._is_books_confirm_page(driver):
                 self.logger.info("乐天书店：已离开注文確認页")
                 return
@@ -544,6 +552,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
     def _is_books_success_page(self, driver) -> bool:
         """注文完了（step5 thankyou）页，或已进入注文・配送状況の確認。"""
+        if self._is_books_cookie_invalid_page(driver):
+            return False
         try:
             title = (driver.title or "").strip()
             if "注文完了" in title:
@@ -765,13 +775,125 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             getattr(driver, "current_url", ""),
         )
 
+    def _is_books_cookie_invalid_page(self, driver) -> bool:
+        """SSO 回到 AuthReturn 后 Cookie 无效：エラー番号 u0001。"""
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            src = ""
+        if "クッキーが正しい内容ではございません" in src:
+            return True
+        if "u0001" in src and ("クッキー" in src or "エラー番号" in src):
+            return True
+        return False
+
+    def _find_books_control_by_texts(self, driver, texts: Tuple[str, ...]):
+        for t in texts:
+            xps = (
+                "//a[contains(normalize-space(.), '%s')]" % t,
+                "//button[contains(normalize-space(.), '%s')]" % t,
+                "//input[(@type='submit' or @type='button') and contains(@value, '%s')]" % t,
+                "//*[contains(normalize-space(.), '%s')]/ancestor::a[1]" % t,
+                "//*[contains(normalize-space(.), '%s')]/ancestor::button[1]" % t,
+            )
+            for xp in xps:
+                try:
+                    for el in driver.find_elements(By.XPATH, xp):
+                        try:
+                            if el.is_displayed():
+                                return el
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        return None
+
+    def _is_books_cart_page(self, driver) -> bool:
+        try:
+            url = (driver.current_url or "").lower()
+        except Exception:
+            return False
+        return "/bs/cart" in url or url.rstrip("/").endswith("/cart")
+
+    def _click_books_return_to_cart(self, driver) -> None:
+        btn = self._find_books_control_by_texts(driver, ("買い物かごに戻る",))
+        if btn is not None:
+            self._random_pre_click_wait("買い物かごに戻る")
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+            except Exception:
+                btn.click()
+            time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+        else:
+            self.logger.warning("乐天书店：Cookie 无效页未找到「買い物かごに戻る」，改为打开购物车 URL")
+            self._navigate(driver, self._books_cart_url().split("#")[0])
+            time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            if self._is_books_cart_page(driver) or self._is_books_confirm_page(driver):
+                return
+            if self._is_books_cookie_invalid_page(driver):
+                time.sleep(0.4)
+                continue
+            time.sleep(0.4)
+        if not self._is_books_cart_page(driver) and not self._is_books_confirm_page(driver):
+            self.logger.warning(
+                "乐天书店：点返回购物车后仍不在购物车，改导航 Cart URL=%s",
+                self._books_cart_url(),
+            )
+            self._navigate(driver, self._books_cart_url().split("#")[0])
+            time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+
+    def _click_books_go_checkout(self, driver) -> None:
+        if self._is_books_confirm_page(driver):
+            return
+        checkout_sel = (self.rb_cfg.get("checkout_button_css") or "button#js-cartBtn").strip()
+        self._random_pre_click_wait("ご購入手続き")
+        ck = WebDriverWait(driver, 25).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, checkout_sel))
+        )
+        driver.execute_script("arguments[0].click();", ck)
+        time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
+        self._ensure_session_after_nav(driver)
+
+    def _recover_from_cookie_error_via_cart(self, driver) -> bool:
+        """
+        SSO 后落到 u0001：点「買い物かごに戻る」，再从购物车走ご購入手続き。
+        返回 True 表示已恢复并重新进入结算；超次则抛错。
+        """
+        if not self._is_books_cookie_invalid_page(driver):
+            return False
+        n = int(getattr(self, "_cookie_error_recoveries", 0) or 0)
+        max_n = int(self.rb_cfg.get("cookie_error_retry_max", 3) or 3)
+        if n >= max_n:
+            raise RuntimeError(
+                "乐天书店：SSO 后 Cookie 无效页(u0001)已重试 %s 次仍失败 URL=%s"
+                % (max_n, getattr(driver, "current_url", "") or "")
+            )
+        self._cookie_error_recoveries = n + 1
+        self.logger.warning(
+            "乐天书店：检测到 Cookie 无效页(u0001)，返回购物车后重新结算（%s/%s） URL=%s",
+            n + 1,
+            max_n,
+            getattr(driver, "current_url", "") or "",
+        )
+        self._click_books_return_to_cart(driver)
+        if self._is_books_confirm_page(driver):
+            return True
+        self._click_books_go_checkout(driver)
+        return True
+
     def _pass_books_checkout_intermediates(self, driver) -> None:
         """
         购物车「ご購入手続き」后，可能先停在「支払いと配送」等中间页。
         自动点「次へ」类按钮直到出现注文確認页。
         """
         max_rounds = int(self.rb_cfg.get("checkout_intermediate_max_rounds", 3) or 3)
-        for round_idx in range(max(1, max_rounds)):
+        round_idx = 0
+        while round_idx < max(1, max_rounds):
+            if self._recover_from_cookie_error_via_cart(driver):
+                continue
             if self._is_books_confirm_page(driver):
                 if round_idx == 0:
                     self.logger.debug("乐天书店：已在注文確認页")
@@ -780,13 +902,13 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 return
 
             next_btn = None
-            # 优先：文案为「次へ」/进入确认
+            # 优先：文案为「次へ」/进入确认；勿点「買い物かごに戻る」等返回按钮
             xpaths = (
                 "//button[normalize-space(.)='次へ' or contains(normalize-space(.),'次へ')]",
                 "//input[@type='submit' and (contains(@value,'次へ') or contains(@value,'確認'))]",
                 "//a[normalize-space(.)='次へ' or contains(normalize-space(.),'次へ')]",
                 "//button[contains(normalize-space(.),'注文内容の確認')]",
-                "//button[contains(@class,'btn-red') and not(@name='commit_order')]",
+                "//button[contains(@class,'btn-red') and not(@name='commit_order') and not(contains(normalize-space(.),'戻る'))]",
             )
             for xp in xpaths:
                 for el in driver.find_elements(By.XPATH, xp):
@@ -794,7 +916,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         if not el.is_displayed() or not el.is_enabled():
                             continue
                         name = (el.get_attribute("name") or "").strip()
-                        # 避免点到变更/清空类按钮
+                        label = (
+                            (el.text or "")
+                            + (el.get_attribute("value") or "")
+                        )
+                        # 避免点到变更/清空/返回类按钮（Cookie 错误页两个红按钮都带「戻る」）
                         if name in (
                             "edit_sender",
                             "edit_delivery",
@@ -805,6 +931,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                             "basket_clear",
                             "commit_order",
                         ):
+                            continue
+                        if "戻る" in label:
                             continue
                         next_btn = el
                         break
@@ -831,7 +959,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
             # 中间页跳转后可能被踢到统一登录 / session/upgrade
             self._ensure_session_after_action(wait_seconds=1.0)
+            round_idx += 1
 
+        if self._recover_from_cookie_error_via_cart(driver):
+            if self._is_books_confirm_page(driver):
+                return
         if not self._is_books_confirm_page(driver):
             raise RuntimeError(
                 "未能进入乐天书店注文確認页（仍停在中间步骤），URL=%s"
@@ -1107,6 +1239,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         order_id = order.get("order_id", "未知")
         products: List[Dict[str, Any]] = order.get("products") or []
         self.logger.info("乐天书店：开始处理订单 %s，商品数 %s", order_id, len(products))
+        self._cookie_error_recoveries = 0
         if not products:
             return False, self._make_summary(order, failure_reason="订单无商品")
 
@@ -1308,19 +1441,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         % (tip or "-"),
                     )
 
-        cart_url = (self.rb_cfg.get("cart_url") or "").strip() or (
-            "https://books.step.rakuten.co.jp/rms/mall/book/bs/Cart"
-        )
-        self._navigate(driver, cart_url.split("#")[0])
+        self._navigate(driver, self._books_cart_url().split("#")[0])
         time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
 
-        checkout_sel = (self.rb_cfg.get("checkout_button_css") or "button#js-cartBtn").strip()
         try:
-            self._random_pre_click_wait("ご購入手続き")
-            ck = WebDriverWait(driver, 25).until(EC.element_to_be_clickable((By.CSS_SELECTOR, checkout_sel)))
-            driver.execute_script("arguments[0].click();", ck)
-            time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
-            self._ensure_session_after_nav(driver)
+            self._click_books_go_checkout(driver)
         except Exception as e:
             return False, self._make_summary(order, failure_reason="进入结算失败: %s" % e)
 
@@ -1480,6 +1605,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         try:
             # 截图/校验期间若会话失效，先自动登录再点确定
             self._ensure_session_after_nav(driver)
+            if self._recover_from_cookie_error_via_cart(driver):
+                pass
             if not self._is_books_confirm_page(driver):
                 self._pass_books_checkout_intermediates(driver)
             self._click_books_commit_order(driver, commit_sel)
@@ -1513,6 +1640,18 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             if self._is_books_success_page(driver):
                 ok_page = True
                 break
+            if self._is_books_cookie_invalid_page(driver):
+                try:
+                    self.logger.warning(
+                        "乐天书店：等待完了页期间落到 Cookie 无效页，返回购物车重试结算"
+                    )
+                    self._recover_from_cookie_error_via_cart(driver)
+                    if not self._is_books_confirm_page(driver):
+                        self._pass_books_checkout_intermediates(driver)
+                except Exception as e:
+                    self.logger.warning("乐天书店：Cookie 无效页恢复失败: %s", e)
+                time.sleep(1.5)
+                continue
             # 仍停在确认页：再点一次确定（偶发第一次未真正提交）
             if self._is_books_confirm_page(driver) and (deadline - time.time()) > 30:
                 try:
