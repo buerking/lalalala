@@ -192,6 +192,162 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             return price, ""
         return None, "无法从当前页面解析真实价格（阶段=%s）" % stage
 
+    def _extract_item_detail_listed_price(self, driver) -> Optional[int]:
+        """商品详情标价（ItemPrice），避开 PayPay カード「実質N円」和最安値。"""
+        sels = (
+            ".ItemPrice__Component",
+            "[class*='ItemPrice__Component']",
+        )
+        for sel in sels:
+            try:
+                els = driver.find_elements(By.CSS_SELECTOR, sel)
+            except Exception:
+                els = []
+            for el in els:
+                try:
+                    if not el.is_displayed():
+                        continue
+                    raw = (el.text or "").replace("\u00a0", " ").strip()
+                except Exception:
+                    continue
+                m = _YEN_AMOUNT_RE.search(raw.replace(" ", ""))
+                if not m:
+                    continue
+                v = self._yen_text_to_int(m.group(1))
+                if v:
+                    return v
+        return None
+
+    def _find_item_buy_button(self, driver):
+        """
+        商品页购买入口。议价被卖家同意后文案是「相談した価格で購入手続きへ」，
+        未登录/他人看到的是「購入手続きへ」；页面上常有两个相同 id。
+        """
+        try:
+            links = driver.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
+        except Exception:
+            links = []
+        accepted_vis = []
+        accepted_any = []
+        normal_vis = []
+        normal_any = []
+        for a in links:
+            txt = ""
+            try:
+                txt = "%s %s" % (a.text or "", a.get_attribute("innerText") or "")
+            except Exception:
+                pass
+            displayed = False
+            try:
+                displayed = bool(a.is_displayed())
+            except Exception:
+                displayed = False
+            if "相談した価格" in txt:
+                (accepted_vis if displayed else accepted_any).append(a)
+            else:
+                (normal_vis if displayed else normal_any).append(a)
+        for bucket in (accepted_vis, accepted_any, normal_vis, normal_any):
+            if bucket:
+                return bucket[0]
+        return None
+
+    def read_bargain_page_state(self, driver) -> Dict[str, Any]:
+        """
+        从已打开的商品页读取议价专属态。
+        卖家同意后的价格只出现在登录账号的页面上，商品 API 看不到。
+        """
+        src = ""
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            src = ""
+        title = ""
+        try:
+            heads = driver.find_elements(
+                By.CSS_SELECTOR, "h1.ItemTitle__Component, h1"
+            )
+            if heads:
+                title = " ".join((heads[0].text or "").split())
+        except Exception:
+            pass
+        exclusive = None
+        m = re.search(r"あなたが相談した価格\s*([0-9,]{1,9})\s*円", src)
+        if m:
+            exclusive = self._yen_text_to_int(m.group(1))
+        accepted = bool(
+            "あなたが相談した価格に出品者が同意しました" in src
+            or "相談した価格で購入手続きへ" in src
+            or exclusive
+        )
+        listed = self._extract_item_detail_listed_price(driver)
+        buy = self._find_item_buy_button(driver)
+        buy_text = ""
+        buy_kind = "none"
+        if buy is not None:
+            try:
+                buy_text = " ".join((buy.text or "").split())
+            except Exception:
+                buy_text = ""
+            if "相談した価格" in buy_text:
+                buy_kind = "accepted"
+                accepted = True
+            elif "購入手続き" in buy_text:
+                buy_kind = "normal"
+        sold_hints = (
+            "この商品は売り切れました",
+            "売り切れました",
+            "この商品は削除されました",
+            "お探しのページは見つかりません",
+        )
+        sold = (not accepted) and buy_kind == "none" and any(h in src for h in sold_hints)
+        if accepted:
+            deal = exclusive or listed
+        else:
+            deal = listed
+        return {
+            "accepted": accepted,
+            "exclusive_price": exclusive,
+            "listed_price": listed,
+            "deal_price": deal,
+            "buy_kind": buy_kind,
+            "buy_text": buy_text,
+            "sold": sold,
+            "title": title,
+        }
+
+    def inspect_bargain_watch_page(
+        self, product_url: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """打开商品页（需已登录会话）读取专属议价/标价。"""
+        driver = self.browser_manager.get_driver()
+        try:
+            self.browser_manager.navigate(product_url)
+        except Exception as e:
+            return None, "打开商品页失败: %s" % e
+        wait_sec = int(self.y_cfg.get("product_page_buy_button_wait_seconds", 45))
+        try:
+            WebDriverWait(driver, wait_sec).until(
+                lambda d: bool(
+                    d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
+                    or d.find_elements(By.CSS_SELECTOR, "#fltdscnt")
+                )
+            )
+        except TimeoutException:
+            pass
+        time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
+        state = self.read_bargain_page_state(driver)
+        self.logger.info(
+            "雅虎闲置议价：商品页状态 accepted=%s exclusive=%s listed=%s "
+            "deal=%s buy=%s sold=%s",
+            state.get("accepted"),
+            state.get("exclusive_price"),
+            state.get("listed_price"),
+            state.get("deal_price"),
+            state.get("buy_text") or state.get("buy_kind"),
+            state.get("sold"),
+        )
+        return state, ""
+
     def _item_api_url(self, item_id: str) -> str:
         tpl = (
             self.y_cfg.get("item_api_template")
@@ -602,8 +758,8 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
 
         # 页面兜底：无购买按钮则视为不可买
-        buy_links = driver.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
-        if not buy_links:
+        clickable = self._find_item_buy_button(driver)
+        if clickable is None:
             msg = "页面上未找到购买按钮 #item_buy_button，可能已售出或不可购 item=%s" % item_id
             self.logger.warning(msg)
             try:
@@ -612,16 +768,13 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 pass
             return False, self._make_summary(order, failure_reason=msg)
 
-        clickable = None
-        for a in buy_links:
-            try:
-                if a.is_displayed():
-                    clickable = a
-                    break
-            except Exception:
-                continue
-        if not clickable:
-            clickable = buy_links[0]
+        buy_label = ""
+        try:
+            buy_label = " ".join((clickable.text or "").split())
+        except Exception:
+            buy_label = ""
+        if not buy_label:
+            buy_label = "購入手続きへ"
 
         from src.utils.dev_test import stop_before_purchase as _dev_stop_buy
 
@@ -638,7 +791,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             )
 
         try:
-            self._random_pre_click_wait("商品页購入手続きへ")
+            self._random_pre_click_wait("商品页%s" % buy_label)
             driver.execute_script("arguments[0].click();", clickable)
             time.sleep(float(self.y_cfg.get("wait_after_buy_click_seconds", 3)))
         except Exception as e:
@@ -1083,16 +1236,37 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         widget = None
         try:
             widget = WebDriverWait(driver, wait_sec).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#fltdscnt"))
+                lambda d: (
+                    d.find_elements(By.CSS_SELECTOR, "#fltdscnt")
+                    or d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
+                    or d.find_elements(
+                        By.CSS_SELECTOR, 'input[placeholder="購入したい金額を入力"]'
+                    )
+                )
             )
         except TimeoutException:
+            widget = None
+        time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
+        page_state = self.read_bargain_page_state(driver)
+        if page_state.get("accepted"):
+            self.logger.info(
+                "雅虎闲置议价：商品页已是卖家同意专属价 exclusive=%s buy=%s",
+                page_state.get("exclusive_price"),
+                page_state.get("buy_text") or "",
+            )
+            return True, "卖家已同意议价"
+
+        if widget is None:
             try:
-                widget = driver.find_element(
-                    By.CSS_SELECTOR,
-                    'input[placeholder="購入したい金額を入力"]',
-                )
+                widget = driver.find_element(By.CSS_SELECTOR, "#fltdscnt")
             except Exception:
-                widget = None
+                try:
+                    widget = driver.find_element(
+                        By.CSS_SELECTOR,
+                        'input[placeholder="購入したい金額を入力"]',
+                    )
+                except Exception:
+                    widget = None
         if widget is None:
             return False, "商品页未找到议价窗口 #fltdscnt（価格の相談）"
 

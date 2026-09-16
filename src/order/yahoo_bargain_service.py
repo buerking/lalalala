@@ -340,78 +340,105 @@ class YahooBargainService(LoggerMixin):
             )
             return
 
-        data, err = self.yp._fetch_item_status(item_id)
-        if err or not data:
+        # 议价成交价是登录账号专属价，商品 API 看不到；必须打开页面判断。
+        state, page_err = self.yp.inspect_bargain_watch_page(url)
+        if page_err or not state:
             self.logger.warning(
-                "雅虎闲置议价：商品 API 失败，本轮跳过 order=%s item=%s err=%s",
+                "雅虎闲置议价：打开商品页失败，本轮跳过 order=%s item=%s err=%s",
                 oid,
                 item_id,
-                err,
+                page_err or "empty",
             )
             return
         rec["last_check_at"] = _now_iso()
-        rec["last_seen_price"] = item_listed_price(data)
-        current_snap = build_item_snapshot(data, item_id)
+        rec["last_seen_price"] = state.get("deal_price")
+        rec["last_page_accepted"] = bool(state.get("accepted"))
         self.store.upsert(rec)
 
-        if not item_is_on_sale(data):
+        if state.get("sold"):
             self._consume(
                 rec,
                 "lost",
-                "商品不可售 status=%s" % (_dig(data, "status") or ""),
-                [
-                    "议价商品已不可售/已售出 item=%s status=%s"
-                    % (item_id, _dig(data, "status")),
-                    url,
-                ],
+                "商品页显示已售出/不可购",
+                ["议价商品已不可售/已售出 item=%s" % item_id, url],
             )
             return
 
-        if not rec.get("item_snapshot"):
-            rec["item_snapshot"] = current_snap
-            self.store.upsert(rec)
-            self.logger.warning(
-                "雅虎闲置议价：记录无商品快照，已补写，本轮不自动购买 order=%s",
-                oid,
-            )
-            return
+        page_title = _norm_text(state.get("title"))
+        if page_title:
+            snap = dict(rec.get("item_snapshot") or {})
+            if not snap.get("title"):
+                snap["item_id"] = item_id
+                snap["title"] = page_title
+                rec["item_snapshot"] = snap
+                self.store.upsert(rec)
+            else:
+                saved_title = _norm_text(snap.get("title"))
+                # 专属价页标题与 API 快照可能略有差异；卖家已同意时不因此停买
+                if (
+                    saved_title
+                    and page_title
+                    and saved_title != page_title
+                    and not state.get("accepted")
+                ):
+                    listed = state.get("deal_price")
+                    self._consume(
+                        rec,
+                        "lost",
+                        "商品信息与议价时不一致: 标题不一致",
+                        [
+                            "议价后卖家可能改了商品（标题不一致），已停止自动购买",
+                            "item=%s 页面价=%s 议价=%s" % (item_id, listed, bargain_yen),
+                            url,
+                        ],
+                    )
+                    return
 
-        listed = item_listed_price(data)
+        listed = state.get("deal_price")
         if listed is None:
             self.logger.warning(
-                "雅虎闲置议价：无法读取现价，本轮跳过 order=%s item=%s", oid, item_id
-            )
-            return
-        if listed > bargain_yen:
-            self.logger.info(
-                "雅虎闲置议价：现价 %s > 议价 %s，继续等待 order=%s item=%s",
-                listed,
-                bargain_yen,
+                "雅虎闲置议价：商品页无法读取价格，本轮跳过 order=%s item=%s",
                 oid,
                 item_id,
             )
             return
-
-        ok_match, reason = snapshots_match(rec.get("item_snapshot"), current_snap)
-        if not ok_match:
-            self._consume(
-                rec,
-                "lost",
-                "商品信息与议价时不一致: %s" % reason,
-                [
-                    "议价后卖家可能改了商品（%s），已停止自动购买" % reason,
-                    "item=%s 现价=%s 议价=%s" % (item_id, listed, bargain_yen),
-                    url,
-                ],
-            )
+        if listed > bargain_yen:
+            if state.get("accepted"):
+                self.logger.info(
+                    "雅虎闲置议价：卖家已同意但专属价 %s > 议价 %s，继续等待 "
+                    "order=%s item=%s",
+                    listed,
+                    bargain_yen,
+                    oid,
+                    item_id,
+                )
+            else:
+                self.logger.info(
+                    "雅虎闲置议价：页面标价 %s > 议价 %s，卖家尚未同意专属价，继续等待 "
+                    "order=%s item=%s",
+                    listed,
+                    bargain_yen,
+                    oid,
+                    item_id,
+                )
             return
 
-        self.logger.info(
-            "雅虎闲置议价：现价 %s <= 议价 %s 且信息一致，开始自动购买 order=%s",
-            listed,
-            bargain_yen,
-            oid,
-        )
+        if state.get("accepted"):
+            self.logger.info(
+                "雅虎闲置议价：卖家已同意专属价 %s <= 议价 %s，开始自动购买 "
+                "order=%s buy=%s",
+                listed,
+                bargain_yen,
+                oid,
+                state.get("buy_text") or "相談した価格で購入手続きへ",
+            )
+        else:
+            self.logger.info(
+                "雅虎闲置议价：页面标价 %s <= 议价 %s，开始自动购买 order=%s",
+                listed,
+                bargain_yen,
+                oid,
+            )
         from src.utils.dev_test import stop_before_purchase as _dev_stop_buy
 
         if _dev_stop_buy(self.config):
