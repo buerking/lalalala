@@ -7,6 +7,8 @@
 !src/**
 !tools/
 !tools/**
+!main/
+!main/**
 
 # tools 里驱动较大且可本机准备时，可取消下一行注释以不上传 exe
 # *.exe
@@ -16,6 +18,8 @@ config.yaml
 data/
 logs/
 docs/
+main/**/machine.yaml
+main/**/__pycache__/
 *.log
 __pycache__/
 *.pyc

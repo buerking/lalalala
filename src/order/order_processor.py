@@ -133,6 +133,15 @@ class OrderProcessor(LoggerMixin):
             yp = YahooFleaMarketOrderProcessor(self.config, self.browser_manager)
             return yp.process_order(order)
 
+        if adapter == "playbook":
+            from src.config.playbook_path import ensure_playbook_importable
+
+            ensure_playbook_importable()
+            from playbook.processor import PlaybookOrderProcessor
+
+            pp = PlaybookOrderProcessor(self.config, self.browser_manager)
+            return pp.process_order(order)
+
         self.logger.info(f"开始处理订单: {order_id}")
         self.logger.info(f"订单包含 {len(products)} 个商品")
 

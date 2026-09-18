@@ -1,0 +1,128 @@
+id: gamers
+adapter: playbook
+enabled: true
+display_name: gamers
+manual_login_url: https://example.com/
+flow: no_cart
+identity:
+  pc_mark: new_site
+  group_ids:
+  - 0
+  store_name: 新站点
+  credit_card: PLACEHOLDER_CREDIT_CARD
+  goods_no_source: item_id
+  purchase_no_source: item_id
+  purchase_url_template: '{url}'
+  item_id_regex: /item/([^/?#]+)
+login:
+  enabled: true
+  url: https://example.com/login
+  wait_after_open_seconds: 2
+  wait_after_submit_seconds: 3
+  submit_after_username: false
+  login_url_contains:
+  - login
+  - signin
+  logged_in_url_contains: []
+  logged_in_indicator:
+    primary:
+    - by: text
+      value: マイページ
+  username:
+    primary:
+    - by: css
+      value: input[type="email"]
+    - by: css
+      value: input[name="username"]
+    fallback:
+    - by: aria
+      value: メール
+  password:
+    primary:
+    - by: css
+      value: input[type="password"]
+    fallback:
+    - by: css
+      value: input[name="password"]
+  submit:
+    primary:
+    - by: css
+      value: button[type="submit"]
+    fallback:
+    - by: text
+      value: ログイン
+cart:
+  enabled: false
+  url: ''
+  wait_after_load_seconds: 2
+  wait_after_clear_seconds: 1.5
+  max_item_removes: 30
+  empty_texts:
+  - カートに商品がありません
+  clear_all:
+    primary: []
+    fallback: []
+  clear_item:
+    primary: []
+    fallback: []
+spec_check:
+  enabled: false
+  wait_seconds: 5
+  option:
+    primary: []
+    fallback: []
+item_api:
+  enabled: false
+  url_template: ''
+  timeout_seconds: 12
+  status_field: status
+  sold_status_values:
+  - SOLD
+pages:
+  product:
+    wait_after_load_seconds: 2
+    buy_button_wait_seconds: 20
+    wait_after_buy_click_seconds: 2
+    sold_texts:
+    - 売り切れ
+    buy_button:
+      primary:
+      - by: text
+        value: 購入する
+      fallback:
+      - by: href
+        value: /transaction
+    price:
+      primary:
+      - by: text
+        value: 円
+      fallback: []
+  confirm:
+    wait_after_load_seconds: 1
+    wait_after_confirm_seconds: 2
+    skip_order_texts: []
+    modal_ok:
+      primary:
+      - by: text
+        value: OK
+        exact: true
+      fallback:
+      - by: css
+        value: button[type="button"]
+    confirm_button:
+      primary:
+      - by: text
+        value: 購入内容を確認する
+      fallback: []
+    price:
+      primary: []
+      fallback: []
+  success:
+    wait_seconds: 90
+    url_contains:
+    - /trade/
+    texts:
+    - 購入が完了
+    timeout_message: 超时未进入成功页，可能 3DS/风控，已跳过本单
+threeds:
+  detect_texts: []

@@ -128,6 +128,12 @@ class MainWindow:
         ttk.Button(button_frame, text="配置", command=self._open_settings, width=20).pack(
             fill=tk.X, pady=(10, 0)
         )
+        ttk.Button(
+            button_frame, text="打开配置后台", command=self._open_playbook_admin, width=20
+        ).pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(
+            button_frame, text="关闭配置后台", command=self._close_playbook_admin, width=20
+        ).pack(fill=tk.X, pady=(4, 0))
         self.process_paypay_button = ttk.Button(
             button_frame,
             text="处理PayPay队列（手动）",
@@ -176,6 +182,12 @@ class MainWindow:
         top = ttk.Frame(outer)
         top.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
         ttk.Button(top, text="全局：打开配置", command=self._open_settings).pack(side=tk.LEFT)
+        ttk.Button(top, text="打开配置后台", command=self._open_playbook_admin).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(top, text="关闭配置后台", command=self._close_playbook_admin).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
         self._add_dev_test_toggle(top, inline=True)
 
         nb = ttk.Notebook(outer)
@@ -604,6 +616,38 @@ class MainWindow:
 
         SettingsWindow(self.root, self.config, on_save_callback=on_save).open()
 
+    def _open_playbook_admin(self) -> None:
+        try:
+            from src.config.playbook_path import ensure_playbook_importable
+
+            ensure_playbook_importable()
+            from playbook.admin_server import start as admin_start
+        except Exception as e:
+            messagebox.showerror("配置后台", "无法加载配置后台: %s" % e)
+            return
+        ok, msg = admin_start(open_browser=True)
+        self.logger.info(msg)
+        if ok:
+            messagebox.showinfo("配置后台", msg)
+        else:
+            messagebox.showerror("配置后台", msg)
+
+    def _close_playbook_admin(self) -> None:
+        try:
+            from src.config.playbook_path import ensure_playbook_importable
+
+            ensure_playbook_importable()
+            from playbook.admin_server import stop as admin_stop
+        except Exception as e:
+            messagebox.showerror("配置后台", "无法关闭配置后台: %s" % e)
+            return
+        ok, msg = admin_stop()
+        self.logger.info(msg)
+        if ok:
+            messagebox.showinfo("配置后台", msg)
+        else:
+            messagebox.showerror("配置后台", msg)
+
     def _on_closing(self) -> None:
         for r in self.runners:
             if r.is_running:
@@ -611,6 +655,15 @@ class MainWindow:
                     r.stop()
                 except Exception:
                     pass
+        try:
+            from src.config.playbook_path import ensure_playbook_importable
+
+            ensure_playbook_importable()
+            from playbook.admin_server import stop as admin_stop
+
+            admin_stop()
+        except Exception:
+            pass
         self.root.destroy()
 
 

@@ -1,0 +1,28 @@
+# 把下面这段追加到根目录 config.yaml 的 sites: 列表。
+# 本文件可提交；真正的 config.yaml 不进 git。账密只写 config.yaml。
+# 选择器在 main/sites/rakuma/site.yaml。Chrome 用户目录：data/chrome_user_data_rakuma/
+
+- id: rakuma
+  enabled: true
+  display_name: rakuma
+  adapter: playbook
+  manual_login_url: https://fril.jp/
+  login:
+    enabled: true
+    email: ''
+    password: ''
+    max_attempts: 2
+    timeout_seconds: 25
+    wait_after_submit_seconds: 3
+  browser:
+    user_data_dir: data/chrome_user_data_rakuma
+    keep_browser_open_on_stop: true
+  order_api:
+    pc_mark: rakuma
+    get_order_list_group_ids:
+      - 225
+  logging:
+    log_file: order_processor.log
+  payment:
+    add_no_credit_card: GMO2167
+    paypay_queue_auto_process: false

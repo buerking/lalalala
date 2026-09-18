@@ -1,0 +1,244 @@
+id: rakuma
+adapter: playbook
+enabled: true
+display_name: rakuma
+manual_login_url: https://fril.jp/
+flow: no_cart
+identity:
+  pc_mark: rakuma
+  group_ids:
+  - 225
+  store_name: rakuma
+  credit_card: GMO2167
+  goods_no_source: item_id
+  purchase_no_source: page
+  purchase_url_template: https://fril.jp/item/{item_id}
+  item_id_regex: (?:/item/|item_id=)([A-Za-z0-9_-]+)
+login:
+  enabled: true
+  url: https://fril.jp/
+  wait_after_open_seconds: 2
+  wait_after_submit_seconds: 3
+  login_url_contains:
+  - login
+  - signin
+  - account
+  username:
+    primary:
+    - by: id
+      value: js-accordion-button
+    - by: css
+      value: input[type="email"]
+    - by: css
+      value: input[name="email"]
+    fallback: []
+  password:
+    primary:
+    - by: css
+      value: input[type="password"]
+  submit:
+    primary:
+    - by: css
+      value: button[type="submit"]
+    - by: text
+      value: ログイン
+  logged_in_indicator:
+    primary:
+    - by: text
+      value: マイページ
+    fallback:
+    - by: href
+      value: /mypage
+cart:
+  enabled: false
+  url: ''
+  empty_texts: []
+  clear_all:
+    primary: []
+    fallback: []
+  clear_item:
+    primary: []
+    fallback: []
+  checkout_button:
+    primary: []
+    fallback: []
+spec_check:
+  enabled: false
+  option:
+    primary: []
+    fallback: []
+item_api:
+  enabled: false
+  url_template: https://fril.jp/api/item/{item_id}
+  status_field: status
+  sold_status_values:
+  - SOLD
+inspect:
+  wait_after_load_seconds: 2
+  require_price: true
+  sold_texts:
+  - 売り切れました
+  - コピーして出品する
+  quantity_input:
+    primary: []
+    fallback: []
+  scrape:
+    name:
+      primary:
+      - by: css
+        value: .h1
+      - by: css
+        value: item__name notranslate-otft
+      fallback: []
+    price:
+      primary:
+      - by: css
+        value: span.item__price
+      - by: css
+        value: span.notranslate-otft
+      fallback: []
+      regex: ([0-9,]+)\s*送料込
+    stock:
+      primary: []
+  arrived:
+    wait_seconds: 15
+    url_contains:
+    - fril.jp/item
+    title_contains: []
+    texts: []
+add_cart:
+  button:
+    primary:
+    - by: css
+      value: p.sell-btn-fixed
+    - by: css
+      value: a.btn_buy
+    - by: text
+      value: 購入に進む
+    - by: href
+      value: /transaction
+    fallback: []
+  button_wait_seconds: 25
+  wait_after_click_seconds: 3
+  modal_ok:
+    primary:
+    - by: text
+      value: OK
+      exact: true
+    fallback:
+    - by: css
+      value: div[role="dialog"] button
+  arrived:
+    wait_seconds: 25
+    url_contains:
+    - web.fril.jp/v2/purchase
+    - /transaction
+    title_contains: []
+    texts: []
+check_cart:
+  single_from: next_page
+  multi_from: cart
+  cart_url: ''
+  checkout_url: ''
+  go_checkout_button:
+    primary: []
+    fallback: []
+  wait_after_load_seconds: 2
+  verify_quantity: true
+  required:
+  - price
+  skip_order_texts:
+  - 購入ができるユーザーが制限されています
+  modal_ok:
+    primary:
+    - by: text
+      value: OK
+      exact: true
+  collect:
+    price:
+      primary:
+      - by: text
+        value: 円
+      regex: ([0-9,]+)\s*円
+    total:
+      primary: []
+      regex: ([0-9,]+)\s*円
+  extract:
+    price:
+      primary:
+      - by: text
+        value: 円
+      regex: ([0-9,]+)\s*円
+    total:
+      primary: []
+      regex: ([0-9,]+)\s*円
+  scrape:
+    row:
+      primary: []
+      fallback: []
+    name:
+      primary: []
+    price:
+      primary: []
+    quantity:
+      primary: []
+  pages:
+  - id: checkout
+    title: 结算核对
+    arrived:
+      wait_seconds: 20
+      url_contains:
+      - web.fril.jp/v2/purchase
+      title_contains: []
+      texts: []
+    checkboxes: []
+    next_button:
+      primary: []
+      fallback: []
+confirm_pay:
+  wait_after_click_seconds: 2
+  modal_ok:
+    primary:
+    - by: text
+      value: OK
+      exact: true
+  pages:
+  - id: confirm
+    title: 确认购买
+    arrived:
+      wait_seconds: 20
+      url_contains:
+      - web.fril.jp/v2/purchase
+      title_contains: []
+      texts: []
+    checkboxes: []
+    next_button:
+      primary:
+      - by: text
+        value: 購入内容を確認する
+      fallback:
+      - by: text
+        value: 購入する
+  success_arrived:
+    wait_seconds: 90
+    url_contains:
+    - /trade/buyer
+    - /transaction
+    title_contains: []
+    texts:
+    - 購入が完了
+    - 取引が始まりました
+complete:
+  allow_item_id_fallback: true
+  extract:
+    purchase_no:
+      primary: []
+      regex: ([A-Za-z0-9_-]+)
+    purchase_url:
+      primary: []
+      source: href
+threeds:
+  detect_texts:
+  - 本人認証
+  - 3Dセキュア
+  - 3-D Secure

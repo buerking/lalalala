@@ -1,0 +1,177 @@
+# 新站点模板。流程固定对应 EDI 接口，不要自己编 steps JSON。
+# 账密写在根目录 config.yaml 的 sites[]。
+id: new_site
+adapter: playbook
+enabled: true
+display_name: 新站点
+manual_login_url: https://example.com/
+flow: no_cart   # no_cart=单品直买；cart=先加购再结算（多商品）
+
+identity:
+  pc_mark: new_site
+  group_ids: [0]
+  store_name: 新站点
+  credit_card: PLACEHOLDER_CREDIT_CARD
+  goods_no_source: item_id
+  purchase_no_source: page
+  purchase_url_template: "{url}"
+  item_id_regex: "/item/([^/?#]+)"
+
+login:
+  enabled: true
+  url: https://example.com/login
+  wait_after_open_seconds: 2
+  wait_after_submit_seconds: 3
+  login_url_contains: [login]
+  username:
+    primary: [{by: css, value: 'input[type="email"]'}]
+  password:
+    primary: [{by: css, value: 'input[type="password"]'}]
+  submit:
+    primary: [{by: css, value: 'button[type="submit"]'}]
+  logged_in_indicator:
+    primary: [{by: text, value: "マイページ"}]
+
+cart:
+  enabled: false
+  url: ""
+  empty_texts: [カートに商品がありません]
+  clear_all: {primary: [], fallback: []}
+  clear_item: {primary: [], fallback: []}
+  checkout_button:
+    primary: [{by: text, value: "購入手続きへ"}]
+
+spec_check:
+  enabled: false
+  option: {primary: [], fallback: []}
+
+item_api:
+  enabled: false
+  url_template: ""
+  status_field: status
+  sold_status_values: [SOLD]
+
+# ① 价格 / 库存。不过 → 飞书，跳过本单。
+inspect:
+  wait_after_load_seconds: 2
+  require_price: true
+  sold_texts:
+    - 売り切れ
+  quantity_input: {primary: [], fallback: []}
+  scrape:
+    name:
+      primary: [{by: css, value: "h1"}]
+    price:
+      primary: []
+      regex: '([0-9,]+)\s*円'
+    stock:
+      primary: []
+  arrived:
+    wait_seconds: 15
+    url_contains: []
+    title_contains: []
+    texts: []
+
+# ② 加入购物车（或无车站点的「去购买」）→ addedCartCallbackSimple
+add_cart:
+  button:
+    primary: [{by: text, value: "カートに入れる"}]
+    fallback: [{by: text, value: "購入する"}]
+  button_wait_seconds: 20
+  wait_after_click_seconds: 2
+  modal_ok: {primary: [], fallback: []}
+  arrived:
+    wait_seconds: 20
+    url_contains: []          # 加购后必须进入的 URL 片段
+    title_contains: []        # 页面 title 包含
+    texts: []                 # 页内文案，如 カートに追加しました
+
+# ③ checkCartGoodsSimple。进入后可以有多页确认；金额选择器会对每一页都试，后抓到的覆盖先抓到的。
+# 不必事先知道金额在哪一页。走完 pages 再打接口。最后一页不要配 next_button（留下截图）。
+check_cart:
+  single_from: next_page      # next_page | cart | checkout
+  multi_from: cart            # cart | checkout
+  cart_url: ""
+  checkout_url: ""
+  go_checkout_button: {primary: [], fallback: []}
+  wait_after_load_seconds: 2
+  verify_quantity: true
+  skip_order_texts: []
+  required: [price]           # price 与 total 互通，抓到其中一个即可
+  modal_ok: {primary: [], fallback: []}
+  collect:                    # 挂在接口上，每一页都试
+    price:
+      primary: []
+      regex: '([0-9,]+)\s*円'
+    total:
+      primary: []
+      regex: '([0-9,]+)\s*円'
+  extract:                    # 与 collect 合并，旧字段仍有效
+    price:
+      primary: []
+      regex: '([0-9,]+)\s*円'
+    total:
+      primary: []
+      regex: '([0-9,]+)\s*円'
+  scrape:                     # 多品时按行抓，同样每一页都试
+    row: {primary: [], fallback: []}
+    name: {primary: []}
+    price: {primary: [], regex: '([0-9,]+)\s*円'}
+    quantity: {primary: []}
+  pages:
+    - id: checkout
+      title: 结算核对
+      arrived:
+        wait_seconds: 20
+        url_contains: []
+        title_contains: []
+        texts: []
+      checkboxes: []
+      next_button: {primary: [], fallback: []}   # 若还有下一页确认，把按钮填在这里，并再加一页
+
+# ④ 确认支付。多页跳转；注文号选择器同样每一页都试（含点完后的成功页）。
+confirm_pay:
+  wait_after_click_seconds: 2
+  modal_ok:
+    primary: [{by: text, value: "OK", exact: true}]
+  pages:
+    - id: confirm_1
+      title: 确认内容
+      arrived:
+        wait_seconds: 20
+        url_contains: []
+        title_contains: []
+        texts: []
+      checkboxes: []
+      next_button:
+        primary: [{by: text, value: "次へ"}]
+    - id: confirm_pay
+      title: 最终确定
+      arrived:
+        wait_seconds: 20
+        url_contains: []
+        title_contains: []
+        texts: []
+      checkboxes: []
+      next_button:
+        primary: [{by: text, value: "注文を確定する"}]
+  success_arrived:            # 点完最后一页后，必须到达的成功页
+    wait_seconds: 90
+    url_contains: []          # 成功页 URL
+    title_contains: []
+    texts: []                 # 如 ご注文ありがとうございます
+
+# ⑤ 注文番号确认 → addNoCallbackSimple → 截图 → updateGoodsNoCallback
+# purchase_no 选择器会并入 ④，从所有确认页 + 成功页里收。
+complete:
+  allow_item_id_fallback: false
+  extract:
+    purchase_no:
+      primary: []
+      regex: '([A-Za-z0-9-]+)'
+    purchase_url:
+      primary: []
+      source: href
+
+threeds:
+  detect_texts: []

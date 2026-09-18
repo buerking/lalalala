@@ -1,0 +1,6 @@
+# 复制为 main/sites/{id}/machine.yaml（已 gitignore）。
+# 只放这台机器不一样的项：Chrome 路径、有头/无头。
+browser:
+  headless: false
+  # chrome_path: C:\Path\To\chrome.exe
+  # chromedriver_path: tools/chromedriver.exe

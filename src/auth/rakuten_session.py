@@ -105,6 +105,10 @@ class RakutenSessionGuard(LoggerMixin):
         "signin/password",
         "/password",
     )
+    UPGRADE_HASH_HINTS = (
+        "session_upgrade",
+        "session/upgrade",
+    )
     USERNAME_HASH_HINTS = (
         "sign_in/username",
         "signin/username",
@@ -125,8 +129,8 @@ class RakutenSessionGuard(LoggerMixin):
             login_cfg.get("wait_after_submit_seconds") or 2
         )
         self.login_timeout_seconds = float(login_cfg.get("timeout_seconds") or 20)
-        # SPA 密码框出现等待（市场 shopcart upgrade 常需 >3s）
-        self.form_ready_seconds = float(login_cfg.get("form_ready_seconds") or 12)
+        # Elm widget + r10-challenger 自身 watchdog 到 15/30s；默认 12s 会在表单注入前放弃
+        self.form_ready_seconds = float(login_cfg.get("form_ready_seconds") or 28)
         enabled = login_cfg.get("enabled")
         self.enabled = True if enabled is None else bool(enabled)
 
@@ -240,11 +244,15 @@ class RakutenSessionGuard(LoggerMixin):
 
         _host, _path, frag = self._url_bits(driver)
         if any(h in frag for h in self.PASSWORD_HASH_HINTS):
-            # hash 已是密码步（控件可能尚在 SPA 渲染中）
+            # hash 已是密码步（Elm 可能尚未把 #password_current 注入 DOM）
             if self._page_has_two_factor_text(driver) and not self._password_present(
                 driver
             ):
                 return STAGE_TWO_FACTOR
+            return STAGE_PASSWORD
+        if any(h in frag for h in self.UPGRADE_HASH_HINTS) and self._password_present(
+            driver
+        ):
             return STAGE_PASSWORD
         if any(h in frag for h in self.USERNAME_HASH_HINTS):
             return STAGE_USERNAME
@@ -278,19 +286,120 @@ class RakutenSessionGuard(LoggerMixin):
             return True
         return "追加の会員情報" in html and "性別" in html
 
-    def _password_present(self, driver) -> bool:
+    def _reset_frame(self, driver) -> None:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+    def _iframe_count(self, driver) -> int:
+        try:
+            with self._no_implicit_wait(driver):
+                return len(driver.find_elements(By.CSS_SELECTOR, "iframe, frame"))
+        except Exception:
+            return -1
+
+    _JS_DEEP_QUERY = """
+        var sels = arguments[0];
+        function walk(root, sel) {
+          if (!root) return null;
+          try {
+            var el = root.querySelector(sel);
+            if (el) return el;
+          } catch (e) {}
+          var nodes;
+          try { nodes = root.querySelectorAll('*'); } catch (e) { return null; }
+          for (var i = 0; i < nodes.length; i++) {
+            var sr = nodes[i].shadowRoot;
+            if (sr) {
+              var f = walk(sr, sel);
+              if (f) return f;
+            }
+          }
+          return null;
+        }
+        for (var s = 0; s < sels.length; s++) {
+          var found = walk(document, sels[s]);
+          if (found) return found;
+        }
+        return null;
+    """
+
+    def _js_deep_find(self, driver, selectors: Tuple[str, ...]):
+        try:
+            return driver.execute_script(self._JS_DEEP_QUERY, list(selectors))
+        except Exception:
+            return None
+
+    def _find_in_current_document(self, driver, selectors: Tuple[str, ...]):
+        try:
+            if "#password_current" in selectors or any(
+                s == "#password_current" for s in selectors
+            ):
+                el = driver.execute_script(
+                    "return document.getElementById('password_current');"
+                )
+                if el is not None:
+                    return el
+        except Exception:
+            pass
         with self._no_implicit_wait(driver):
-            if self._first_present(driver, self.PASSWORD_SELECTORS) is not None:
-                return True
-        return self._js_query_exists(
-            driver,
-            "#password_current, input[type='password'], "
-            "input[name='password'], input[autocomplete='current-password']",
-        )
+            el = self._first_visible(driver, selectors)
+            if el is not None:
+                return el
+            el = self._first_present(driver, selectors)
+            if el is not None:
+                return el
+        return self._js_deep_find(driver, selectors)
+
+    def _find_across_frames(self, driver, selectors: Tuple[str, ...], stay: bool = False):
+        """顶层 document → 嵌套 iframe。找到后 stay=True 则留在该 frame 以便填表。"""
+        self._reset_frame(driver)
+        el = self._find_in_current_document(driver, selectors)
+        if el is not None:
+            return el
+        el = self._search_iframes(driver, selectors, stay=stay, depth=2, path="")
+        if el is not None:
+            return el
+        self._reset_frame(driver)
+        return None
+
+    def _search_iframes(self, driver, selectors: Tuple[str, ...], stay: bool, depth: int, path: str):
+        if depth <= 0:
+            return None
+        frames = []
+        try:
+            with self._no_implicit_wait(driver):
+                frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+        except Exception:
+            frames = []
+        for i, fr in enumerate(frames):
+            try:
+                driver.switch_to.frame(fr)
+            except Exception:
+                continue
+            here = ("%s/%s" % (path, i)) if path else str(i)
+            el = self._find_in_current_document(driver, selectors)
+            if el is None:
+                el = self._search_iframes(driver, selectors, stay, depth - 1, here)
+            if el is not None:
+                if stay:
+                    self.logger.info("登录控件在 iframe[%s]", here)
+                    return el
+                self._reset_frame(driver)
+                return el
+            try:
+                driver.switch_to.parent_frame()
+            except Exception:
+                self._reset_frame(driver)
+                return None
+        return None
+
+    def _password_present(self, driver) -> bool:
+        return self._find_across_frames(driver, self.PASSWORD_SELECTORS, stay=False) is not None
 
     def _username_present(self, driver) -> bool:
-        with self._no_implicit_wait(driver):
-            return self._first_present(driver, self.USER_SELECTORS) is not None
+        return self._find_across_frames(driver, self.USER_SELECTORS, stay=False) is not None
 
     def ensure_logged_in(self, resume_url: Optional[str] = None) -> bool:
         """非登录页立即返回；仅 login 域才按阶段填密。"""
@@ -298,6 +407,7 @@ class RakutenSessionGuard(LoggerMixin):
             return True
 
         driver = self.browser_manager.get_driver()
+        self._reset_frame(driver)
         if not self.is_login_page(driver):
             return True
 
@@ -426,16 +536,63 @@ class RakutenSessionGuard(LoggerMixin):
             return ""
         return target
 
+    def _widget_snapshot(self, driver) -> Dict[str, Any]:
+        """对照 DevTools 拷贝：hash / Elm 壳 / 密码框是否已注入。"""
+        try:
+            snap = driver.execute_script(
+                """
+                var pwd = document.getElementById('password_current');
+                var ce = window.customElements;
+                return {
+                  hash: String(location.hash || ''),
+                  pwd: !!pwd,
+                  h4k5: !!document.getElementById('h4k5-container'),
+                  cta: !!document.getElementById('cta011'),
+                  anim: !!document.querySelector('.omni-main-view-animating'),
+                  elm: (typeof Elm !== 'undefined'),
+                  omni: !!(window.Rakuten && Rakuten.Omni),
+                  challenger: !!(ce && ce.get && ce.get('r10-challenger')),
+                  iframe: document.querySelectorAll('iframe,frame').length,
+                  bodyLen: document.body ? (document.body.innerHTML || '').length : -1
+                };
+                """
+            )
+            return snap if isinstance(snap, dict) else {}
+        except Exception as e:
+            return {"err": str(e)[:120]}
+
+    def _wait_animating_done(self, driver) -> None:
+        """`.omni-main-view-animating` 会把 password input 设成 visibility:hidden。"""
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                anim = bool(
+                    driver.execute_script(
+                        "return !!document.querySelector('.omni-main-view-animating');"
+                    )
+                )
+            except Exception:
+                anim = False
+            if not anim:
+                return
+            time.sleep(0.2)
+        self.logger.info("登录页仍带 omni-main-view-animating，继续填密")
+
     def _wait_form_ready(self, driver) -> str:
-        """等到账号框或密码框出现（含仅 present、尚未 displayed）。"""
+        """等到 Elm 注入 #password_current / 账号框（含 visibility:hidden）。"""
         deadline = time.time() + max(3.0, self.form_ready_seconds)
         last_stage = STAGE_LOGIN_UNKNOWN
+        logged_shell = False
         while time.time() < deadline:
             last_stage = self.detect_stage(driver)
             if last_stage == STAGE_PROFILE:
                 return last_stage
+            if not logged_shell:
+                snap = self._widget_snapshot(driver)
+                if snap.get("h4k5") or snap.get("pwd") or snap.get("elm"):
+                    self.logger.info("乐天登录 widget 快照 %s", snap)
+                    logged_shell = True
             if last_stage in (STAGE_PASSWORD, STAGE_USERNAME, STAGE_TWO_FACTOR):
-                # password hash 但控件未出：继续等到控件 present
                 if last_stage == STAGE_PASSWORD and not self._password_present(driver):
                     time.sleep(0.3)
                     continue
@@ -443,12 +600,20 @@ class RakutenSessionGuard(LoggerMixin):
                     time.sleep(0.3)
                     continue
                 return last_stage
+            if self._password_present(driver):
+                return STAGE_PASSWORD
             time.sleep(0.3)
         return last_stage
 
     def _submit_login(self, driver) -> bool:
+        self._reset_frame(driver)
+        self.logger.info("乐天登录 widget 初始快照 %s", self._widget_snapshot(driver))
         stage = self._wait_form_ready(driver)
-        self.logger.info("乐天登录适配器推进 stage=%s", stage)
+        self.logger.info(
+            "乐天登录适配器推进 stage=%s snap=%s",
+            stage,
+            self._widget_snapshot(driver),
+        )
 
         if stage == STAGE_TWO_FACTOR:
             return False
@@ -474,24 +639,20 @@ class RakutenSessionGuard(LoggerMixin):
             STAGE_USERNAME,
         ):
             # 再给一次短等（SPA 切到 password 路由）
-            deadline = time.time() + min(6.0, self.form_ready_seconds)
+            deadline = time.time() + min(12.0, max(6.0, self.form_ready_seconds / 2.0))
             while time.time() < deadline and password_el is None:
                 time.sleep(0.35)
                 password_el = self._find_password_el(driver)
 
         if password_el is None:
-            # 诊断：page_source 是否其实已有 id（便于对照人工截图）
-            has_id = False
-            try:
-                has_id = "password_current" in (driver.page_source or "")
-            except Exception:
-                pass
+            snap = self._widget_snapshot(driver)
             raise RakutenLoginError(
-                "登录页找不到密码输入框（#password_current；"
-                "page_source含id=%s stage=%s）" % (has_id, stage)
+                "登录页找不到密码输入框（#password_current；stage=%s snap=%s）"
+                % (stage, snap)
             )
 
-        user_el = self._find_username_el(driver)
+        # 只在当前 document 找账号框，避免再切 frame 把 password_el 弄失效
+        user_el = self._find_in_current_document(driver, self.USER_SELECTORS)
         if user_el is not None and self.email:
             try:
                 cur = (user_el.get_attribute("value") or "").strip()
@@ -500,8 +661,23 @@ class RakutenSessionGuard(LoggerMixin):
             if not cur:
                 self._fill_input(driver, user_el, self.email)
 
+        self._wait_animating_done(driver)
         self._fill_input(driver, password_el, self.password)
+        got = ""
+        try:
+            got = password_el.get_attribute("value") or ""
+        except Exception:
+            got = ""
+        if len(got) != len(self.password):
+            self.logger.warning(
+                "密码框填入后长度不符 期望=%s 实际=%s，再试一次按键输入",
+                len(self.password),
+                len(got),
+            )
+            self._fill_input(driver, password_el, self.password, prefer_keys=True)
+        self._wait_before_cta(driver)
         self._click_next(driver)
+        self._reset_frame(driver)
 
         time.sleep(self.wait_after_submit_seconds)
         deadline = time.time() + self.login_timeout_seconds
@@ -558,54 +734,29 @@ class RakutenSessionGuard(LoggerMixin):
         return not self._page_is_additional_profile(driver)
 
     def _find_password_el(self, driver):
-        """可见优先；否则接受 present（SPA/动画中 is_displayed=false 很常见）。"""
-        with self._no_implicit_wait(driver):
-            el = self._first_visible(driver, self.PASSWORD_SELECTORS)
-            if el is not None:
-                return el
-            el = self._first_present(driver, self.PASSWORD_SELECTORS)
-            if el is not None:
+        """可见优先；iframe / open shadow DOM 一并搜。找到后留在该 frame。"""
+        el = self._find_across_frames(driver, self.PASSWORD_SELECTORS, stay=True)
+        if el is not None:
+            try:
+                shown = bool(el.is_displayed())
+            except Exception:
+                shown = False
+            if not shown:
                 self.logger.info(
                     "密码框存在但未判定为 displayed，仍尝试填入（id=%s）",
                     (el.get_attribute("id") or "")[:40],
                 )
-                return el
-        # JS 兜底：直接 querySelector，再包成 Selenium 元素
-        try:
-            found = driver.execute_script(
-                """
-                var sel = [
-                  '#password_current',
-                  'input[name=\"password\"]',
-                  'input[type=\"password\"]',
-                  'input[autocomplete=\"current-password\"]'
-                ];
-                for (var i = 0; i < sel.length; i++) {
-                  var el = document.querySelector(sel[i]);
-                  if (el) return true;
-                }
-                return false;
-                """
-            )
-            if found:
-                with self._no_implicit_wait(driver):
-                    el = self._first_present(driver, self.PASSWORD_SELECTORS)
-                    if el is not None:
-                        return el
-        except Exception:
-            pass
+            return el
         return None
 
     def _find_username_el(self, driver):
-        with self._no_implicit_wait(driver):
-            el = self._first_visible(driver, self.USER_SELECTORS)
-            if el is not None:
-                return el
-            return self._first_present(driver, self.USER_SELECTORS)
+        return self._find_across_frames(driver, self.USER_SELECTORS, stay=True)
 
     def _click_next(self, driver) -> None:
         with self._no_implicit_wait(driver):
             btn = self._find_next_button(driver)
+        if btn is None:
+            btn = self._js_deep_find(driver, self.CTA_SELECTORS)
         if btn is None:
             with self._no_implicit_wait(driver):
                 pwd = self._find_password_el(driver)
@@ -629,11 +780,7 @@ class RakutenSessionGuard(LoggerMixin):
         ).strip()
         self.logger.info("点击乐天登录按钮: %s", label[:40])
         try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block:'center'});"
-                "arguments[0].click();",
-                btn,
-            )
+            driver.execute_script(self._JS_CLICK_HUMAN, btn)
         except Exception:
             try:
                 driver.execute_script("arguments[0].click();", btn)
@@ -643,27 +790,79 @@ class RakutenSessionGuard(LoggerMixin):
                 except Exception:
                     self._js_click_cta(driver)
 
+    def _wait_before_cta(self, driver) -> None:
+        """密码页常带 r10-challenger；填完立刻点次へ会被吃掉，页面看起来像没自动登录。"""
+        has_ch = False
+        try:
+            has_ch = bool(
+                driver.execute_script(
+                    """
+                    function walk(root, sel) {
+                      try { if (root.querySelector(sel)) return true; } catch (e) {}
+                      var nodes; try { nodes = root.querySelectorAll('*'); } catch (e) { return false; }
+                      for (var i = 0; i < nodes.length; i++) {
+                        if (nodes[i].shadowRoot && walk(nodes[i].shadowRoot, sel)) return true;
+                      }
+                      return false;
+                    }
+                    return walk(document, 'r10-challenger, omni-11-1-ja-jp');
+                    """
+                )
+            )
+        except Exception:
+            has_ch = False
+        wait = 2.0 if has_ch else 0.5
+        if has_ch:
+            self.logger.info("登录页有 r10-challenger，填密后先等 %.1f 秒再点次へ", wait)
+        time.sleep(wait)
+
     def _js_click_cta(self, driver) -> bool:
         try:
             ok = driver.execute_script(
                 """
+                function fire(el) {
+                  if (!el) return false;
+                  el.scrollIntoView({block:'center'});
+                  var o = {bubbles:true, cancelable:true, view:window, buttons:1};
+                  try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+                  try { el.dispatchEvent(new MouseEvent('mousedown', o)); } catch (e) {}
+                  try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
+                  try { el.dispatchEvent(new MouseEvent('mouseup', o)); } catch (e) {}
+                  try { el.dispatchEvent(new MouseEvent('click', o)); } catch (e) {}
+                  try { el.click(); } catch (e) {}
+                  return true;
+                }
+                function walk(root, fn) {
+                  if (!root) return false;
+                  if (fn(root)) return true;
+                  var nodes; try { nodes = root.querySelectorAll('*'); } catch (e) { return false; }
+                  for (var i = 0; i < nodes.length; i++) {
+                    if (nodes[i].shadowRoot && walk(nodes[i].shadowRoot, fn)) return true;
+                  }
+                  return false;
+                }
                 var ids = ['cta','cta011','cta01'];
                 for (var i=0;i<ids.length;i++) {
-                  var el = document.getElementById(ids[i]);
-                  if (el) { el.click(); return true; }
+                  if (walk(document, function(root) {
+                    try {
+                      var el = root.getElementById ? root.getElementById(ids[i]) : root.querySelector('#'+ids[i]);
+                      return fire(el);
+                    } catch (e) { return false; }
+                  })) return true;
                 }
-                var btns = document.querySelectorAll(
-                  '.h4k5-e2e-button__submit, [role=\"button\"]'
-                );
-                for (var j=0;j<btns.length;j++) {
-                  var t = (btns[j].innerText || btns[j].textContent || '').trim();
-                  if (t.indexOf('次へ') >= 0 || t === 'Next' || t.indexOf('ログイン') >= 0
-                      || t.indexOf('続く') >= 0 || t.indexOf('続行') >= 0) {
-                    btns[j].click();
-                    return true;
+                return walk(document, function(root) {
+                  var btns;
+                  try { btns = root.querySelectorAll('.h4k5-e2e-button__submit, [role=\"button\"]'); }
+                  catch (e) { return false; }
+                  for (var j=0;j<btns.length;j++) {
+                    var t = (btns[j].innerText || btns[j].textContent || '').trim();
+                    if (t.indexOf('次へ') >= 0 || t === 'Next' || t.indexOf('ログイン') >= 0
+                        || t.indexOf('続く') >= 0 || t.indexOf('続行') >= 0) {
+                      return fire(btns[j]);
+                    }
                   }
-                }
-                return false;
+                  return false;
+                });
                 """
             )
             if ok:
@@ -779,48 +978,90 @@ class RakutenSessionGuard(LoggerMixin):
             pass
         return True
 
-    @staticmethod
-    def _fill_input(driver, element, value: str) -> None:
+    _JS_CLICK_HUMAN = """
+        var el = arguments[0];
+        if (!el) return false;
+        el.scrollIntoView({block:'center'});
+        var o = {bubbles:true, cancelable:true, view:window, buttons:1};
+        try { el.dispatchEvent(new PointerEvent('pointerdown', o)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('mousedown', o)); } catch (e) {}
+        try { el.dispatchEvent(new PointerEvent('pointerup', o)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('mouseup', o)); } catch (e) {}
+        try { el.dispatchEvent(new MouseEvent('click', o)); } catch (e) {}
+        try { el.click(); } catch (e) {}
+        return true;
+    """
+
+    _JS_SET_INPUT = """
+        const el = arguments[0], val = arguments[1];
+        el.focus();
+        const proto = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype, 'value'
+        );
+        if (proto && proto.set) { proto.set.call(el, val); }
+        else { el.value = val; }
+        try {
+          el.dispatchEvent(new InputEvent('input', {
+            bubbles:true, cancelable:true, data: val, inputType:'insertFromPaste'
+          }));
+        } catch (e) {
+          el.dispatchEvent(new Event('input', {bubbles:true}));
+        }
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+    """
+
+    def _fill_input(self, driver, element, value: str, prefer_keys: bool = False) -> None:
+        """乐天 SPA 只认按键/InputEvent；一次性赋 value 看起来填了，界面仍是空的。"""
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'}); arguments[0].focus();",
+                element,
+            )
+        except Exception:
+            pass
         try:
             element.click()
         except Exception:
             pass
+        time.sleep(0.12)
         try:
-            element.clear()
+            element.send_keys(Keys.CONTROL, "a")
+            element.send_keys(Keys.DELETE)
         except Exception:
             try:
-                element.send_keys(Keys.CONTROL, "a")
-                element.send_keys(Keys.DELETE)
+                element.clear()
             except Exception:
                 pass
+        keyed = False
         try:
-            driver.execute_script(
-                """
-                const el = arguments[0], val = arguments[1];
-                const proto = Object.getOwnPropertyDescriptor(
-                  window.HTMLInputElement.prototype, 'value'
-                );
-                if (proto && proto.set) { proto.set.call(el, val); }
-                else { el.value = val; }
-                el.dispatchEvent(new Event('input', {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur', {bubbles:true}));
-                """,
-                element,
-                value,
-            )
-        except Exception:
-            try:
-                element.send_keys(value)
-            except Exception:
-                pass
+            element.send_keys(value)
+            keyed = True
+        except Exception as e:
+            self.logger.info("密码/账号 send_keys 失败，改 JS: %s", e)
         try:
             current = element.get_attribute("value") or ""
-            if current != value:
-                element.clear()
-                element.send_keys(value)
         except Exception:
-            pass
+            current = ""
+        if current != value:
+            try:
+                driver.execute_script(self._JS_SET_INPUT, element, value)
+            except Exception as e:
+                self.logger.warning("JS 写入输入框失败: %s", e)
+                if not keyed:
+                    try:
+                        element.send_keys(value)
+                    except Exception:
+                        pass
+        try:
+            current = element.get_attribute("value") or ""
+        except Exception:
+            current = ""
+        if current != value:
+            self.logger.warning(
+                "输入框写入后仍不匹配 期望长度=%s 实际长度=%s",
+                len(value),
+                len(current),
+            )
 
     @staticmethod
     def _visible(el) -> bool:

@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>站点配置后台</title>
+  <style>
+    :root { --bg:#0f1419; --card:#1a2330; --fg:#e8eef5; --muted:#8aa0b5; --acc:#3d8bfd; --danger:#e05a5a; --step:#2a6f4a; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: "Segoe UI", "PingFang SC", sans-serif; background:var(--bg); color:var(--fg); }
+    header { display:flex; align-items:center; gap:12px; padding:14px 18px; border-bottom:1px solid #2a3544; }
+    h1 { font-size:16px; margin:0; font-weight:600; }
+    button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:7px 12px; cursor:pointer; }
+    button.ghost { background:#2a3544; }
+    button.danger { background:var(--danger); }
+    button.okbtn { min-width:64px; }
+    .wrap { display:flex; min-height: calc(100vh - 54px); }
+    aside { width:220px; border-right:1px solid #2a3544; padding:12px; }
+    aside ul { list-style:none; margin:0; padding:0; }
+    aside li { padding:8px 10px; border-radius:6px; cursor:pointer; margin-bottom:4px; }
+    aside li:hover, aside li.active { background:#243044; }
+    main { flex:1; padding:16px 20px 40px; overflow:auto; }
+    label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+    input, textarea, select { width:100%; background:#0f1419; color:var(--fg); border:1px solid #334155; border-radius:6px; padding:8px; font-family: ui-monospace, Consolas, monospace; font-size:13px; }
+    textarea { min-height: 72px; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    .row3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:12px; }
+    .card { background:var(--card); padding:14px 16px 16px; border-radius:10px; margin-bottom:14px; }
+    .card.step { border-left: 4px solid var(--step); }
+    .hint { color:var(--muted); font-size:12px; line-height:1.55; }
+    .api { color:#7dd3c7; font-size:12px; margin:0 0 8px; }
+    pre { background:#0f1419; padding:10px; border-radius:8px; overflow:auto; font-size:12px; }
+    .ok { color:#6dd38a; } .err { color:var(--danger); }
+    h2 { font-size:15px; margin:0 0 6px; }
+    .arrived { background:#121a24; padding:10px 12px; border-radius:8px; margin-top:8px; }
+    .arrived strong { font-size:12px; color:#c9e4d0; }
+    .page-card { background:#121a24; padding:12px; border-radius:8px; margin:10px 0; border:1px solid #2a3544; }
+    .page-card h3 { font-size:13px; margin:0 0 8px; color:#c9d8e8; }
+    .loc-box { background:#121a24; padding:10px 12px; border-radius:8px; margin:10px 0; border:1px solid #2a3544; }
+    .loc-title { font-size:12px; color:#c9e4d0; margin-bottom:4px; }
+    .loc-row { display:flex; align-items:flex-start; gap:8px; margin:6px 0; }
+    .loc-k { flex:0 0 220px; color:var(--muted); font-size:12px; text-align:right; line-height:1.4; padding-top:10px; }
+    .loc-br { display:flex; align-items:center; flex:1; gap:6px; color:var(--muted); font-size:16px; min-width:0; }
+    .loc-br input, .loc-br textarea { flex:1; }
+    .loc-br textarea { min-height: 72px; }
+    .ok-col { flex:0 0 64px; display:flex; flex-direction:column; align-items:stretch; }
+    .ok-col .okbtn { width:100%; }
+    .ok-tip { font-size:11px; line-height:1.3; text-align:center; margin-top:4px; word-break:break-word; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>站点配置后台</h1>
+    <span class="hint">每个输入框右侧确定即保存 · 账密在 config.yaml · 改完重启 Tab</span>
+    <span style="flex:1"></span>
+    <button class="ghost" onclick="newSite()">新建站点</button>
+    <button class="danger" onclick="shutdown()">关闭后台</button>
+  </header>
+  <div class="wrap">
+    <aside><ul id="list"></ul></aside>
+    <main>
+      <div id="status" class="hint"></div>
+      <div id="editor"></div>
+    </main>
+  </div>
+<script>
+const $ = (s, el=document) => el.querySelector(s);
+let currentId = null, currentData = null;
+
+async function api(path, opt) {
+  const r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opt||{}));
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || j.message || r.statusText);
+  return j;
+}
+function setStatus(msg, ok) {
+  const el = $("#status"); el.className = ok ? "ok" : "err"; el.textContent = msg || "";
+}
+function setTip(tipId, msg, ok) {
+  const el = tipId ? $("#"+tipId) : null;
+  if (!el) { setStatus(msg, ok); return; }
+  el.className = "ok-tip " + (ok ? "ok" : "err");
+  el.textContent = msg || "";
+}
+function okCol(tipId, onclick, label) {
+  return `<div class="ok-col">
+    <button type="button" class="okbtn" onclick="${onclick}">${label || "确定"}</button>
+    <div class="ok-tip" id="${esc(tipId)}"></div>
+  </div>`;
+}
+async function refreshList(selectId) {
+  const data = await api("/api/sites");
+  const ul = $("#list"); ul.innerHTML = "";
+  (data.sites||[]).forEach(s => {
+    const li = document.createElement("li");
+    li.textContent = (s.display_name || s.id) + (s.error ? " (损坏)" : "");
+    li.dataset.id = s.id;
+    if (s.id === (selectId || currentId)) li.classList.add("active");
+    li.onclick = () => loadSite(s.id);
+    ul.appendChild(li);
+  });
+}
+function esc(s) {
+  return String(s ?? "").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
+}
+function field(label, id, value, extra="") {
+  const ro = /\breadonly\b/i.test(extra);
+  const btn = ro ? "" : okCol("tip_"+id, `saveInput('${id}')`);
+  return `<div class="loc-row">
+    <span class="loc-k">${label}</span>
+    <span class="loc-br">[<input id="${id}" value="${esc(value)}" ${extra} />]</span>
+    ${btn}
+  </div>`;
+}
+function area(label, id, value) {
+  return `<div class="loc-row">
+    <span class="loc-k">${label}</span>
+    <span class="loc-br" style="align-items:stretch">[<textarea id="${id}">${String(value??"").replace(/</g,"&lt;")}</textarea>]</span>
+    ${okCol("tip_"+id, `saveInput('${id}')`)}
+  </div>`;
+}
+function linesOf(v) { return Array.isArray(v) ? v.join("\n") : (v || ""); }
+function locPrefix(path) { return "loc_" + String(path).replace(/[^a-zA-Z0-9]/g, "_"); }
+function parseList(s) {
+  return String(s || "").split(/[\n,，]+/).map(x => x.trim()).filter(Boolean);
+}
+function locItems(spec) {
+  if (!spec) return [];
+  if (Array.isArray(spec)) return spec.filter(x => x && typeof x === "object");
+  const out = [];
+  for (const key of ["primary", "fallback"]) {
+    let items = (spec && spec[key]) || [];
+    if (items && !Array.isArray(items) && typeof items === "object") items = [items];
+    (items || []).forEach(it => {
+      if (typeof it === "string" && it.trim()) out.push({by:"css", value:it.trim()});
+      else if (it && typeof it === "object") out.push(it);
+    });
+  }
+  if ((!spec.primary && !spec.fallback) && spec.by && spec.value) out.push(spec);
+  return out;
+}
+function locSpecOf(value) {
+  if (Array.isArray(value) && value[0]) {
+    const x = value[0];
+    return x.locators || x.locator || x;
+  }
+  return value && typeof value === "object" ? value : {};
+}
+function splitLoc(spec) {
+  const classes = [], ids = [], texts = [], others = [];
+  locItems(spec).forEach(it => {
+    const by = String(it.by || "css").toLowerCase();
+    const v = String(it.value || "").trim();
+    if (!v) return;
+    if (by === "id") { ids.push(v.replace(/^#/, "")); return; }
+    if ((by === "css" || by === "css_selector") && /^#[\w-]+$/.test(v)) { ids.push(v.slice(1)); return; }
+    if (by === "text" || by === "link_text" || by === "partial_text") { texts.push(v); return; }
+    if (by === "class" || by === "css" || by === "css_selector") {
+      if (/^\.?[\w-]+$/.test(v)) classes.push(v.replace(/^\./, ""));
+      else classes.push(v);
+      return;
+    }
+    others.push(it);
+  });
+  return {
+    classes, ids, texts, others,
+    regex: String((spec && spec.regex) || ""),
+    source: String((spec && spec.source) || ""),
+    attr: String((spec && spec.attr) || ""),
+  };
+}
+function classToCss(v) {
+  const s = String(v || "").trim();
+  if (!s) return "";
+  if (/^[\w-]+$/.test(s)) return "." + s;
+  return s;
+}
+function buildLoc(split, prev) {
+  const primary = [];
+  (split.ids || []).forEach(v => primary.push({by:"id", value:v}));
+  (split.classes || []).forEach(v => {
+    const css = classToCss(v);
+    if (css) primary.push({by:"css", value:css});
+  });
+  (split.texts || []).forEach(v => primary.push({by:"text", value:v}));
+  (split.others || []).forEach(it => primary.push({by:it.by, value:it.value, exact:it.exact, tag:it.tag}));
+  const out = {primary, fallback: []};
+  const regex = (split.regex || "").trim();
+  if (regex) out.regex = regex;
+  const src = (split.source || (prev && prev.source) || "").trim();
+  if (src) out.source = src;
+  const attr = (split.attr || (prev && prev.attr) || "").trim();
+  if (attr) out.attr = attr;
+  return out;
+}
+function locRow(path, kind, label, value) {
+  const prefix = locPrefix(path);
+  return `<div class="loc-row">
+    <span class="loc-k">${label} =</span>
+    <span class="loc-br">[<input id="${prefix}_${kind}" value="${esc(value)}" />]</span>
+    ${okCol("tip_"+prefix+"_"+kind, `saveLocField('${path}','${kind}')`)}
+  </div>`;
+}
+function locBox(path, spec, title, opts) {
+  opts = opts || {};
+  const u = splitLoc(spec);
+  let html = `<div class="loc-box" data-path="${esc(path)}">
+    <div class="loc-title">${title}</div>
+    <p class="hint">多个值用逗号分隔。点该行「确定」立刻写入 YAML。不要填 sc- 开头的哈希 class。</p>
+    ${locRow(path, "class", "class", u.classes.join(", "))}
+    ${locRow(path, "id", "id", u.ids.join(", "))}
+    ${locRow(path, "text", "按钮/元素文本", u.texts.join(", "))}`;
+  if (opts.regex) html += locRow(path, "regex", "regex", u.regex);
+  html += `</div>`;
+  return html;
+}
+function getNested(obj, path) {
+  let cur = obj;
+  String(path).split(".").forEach(p => {
+    if (cur == null) return;
+    cur = cur[/^\d+$/.test(p) ? Number(p) : p];
+  });
+  return cur;
+}
+function setNested(obj, path, value) {
+  const parts = String(path).split(".");
+  let cur = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = /^\d+$/.test(parts[i]) ? Number(parts[i]) : parts[i];
+    const nextIsIdx = /^\d+$/.test(parts[i + 1]);
+    if (cur[p] == null || typeof cur[p] !== "object") cur[p] = nextIsIdx ? [] : {};
+    cur = cur[p];
+  }
+  const last = parts[parts.length - 1];
+  cur[/^\d+$/.test(last) ? Number(last) : last] = value;
+}
+function wrapIfCheckbox(path, spec) {
+  if (String(path).endsWith(".checkboxes")) return [{locators: spec, must_check: true}];
+  return spec;
+}
+function unwrapIfCheckbox(path, value) {
+  if (String(path).endsWith(".checkboxes")) return locSpecOf(value);
+  return value;
+}
+function readLocBox(path, fallback) {
+  const prefix = locPrefix(path);
+  if (!$("#"+prefix+"_class")) return fallback;
+  const prev = unwrapIfCheckbox(path, getNested(currentData, path)) || {};
+  const split = splitLoc(prev);
+  split.classes = parseList($("#"+prefix+"_class").value);
+  split.ids = parseList($("#"+prefix+"_id").value);
+  split.texts = parseList($("#"+prefix+"_text").value);
+  const re = $("#"+prefix+"_regex");
+  if (re) split.regex = re.value.trim();
+  return wrapIfCheckbox(path, buildLoc(split, prev));
+}
+function syncPriceAlias(d, spec) {
+  if (!d.check_cart) d.check_cart = {};
+  if (!d.check_cart.extract) d.check_cart.extract = {};
+  if (!d.check_cart.collect) d.check_cart.collect = {};
+  d.check_cart.extract.price = spec;
+  d.check_cart.collect.price = spec;
+}
+function syncTotalAlias(d, spec) {
+  if (!d.check_cart) d.check_cart = {};
+  if (!d.check_cart.extract) d.check_cart.extract = {};
+  if (!d.check_cart.collect) d.check_cart.collect = {};
+  d.check_cart.extract.total = spec;
+  d.check_cart.collect.total = spec;
+}
+async function saveLocField(path, kind) {
+  const tipId = "tip_"+locPrefix(path)+"_"+kind;
+  try {
+    if (!currentId || !currentData) throw new Error("请先选站点");
+    const prefix = locPrefix(path);
+    const el = $("#"+prefix+"_"+kind);
+    if (!el) throw new Error("找不到输入框");
+    const d = JSON.parse(JSON.stringify(currentData));
+    const prev = unwrapIfCheckbox(path, getNested(d, path)) || {};
+    const split = splitLoc(prev);
+    if (kind === "regex") split.regex = el.value.trim();
+    else if (kind === "class") split.classes = parseList(el.value);
+    else if (kind === "id") split.ids = parseList(el.value);
+    else if (kind === "text") split.texts = parseList(el.value);
+    else throw new Error("未知字段");
+    const spec = buildLoc(split, prev);
+    setNested(d, path, wrapIfCheckbox(path, spec));
+    if (path === "check_cart.collect.price") syncPriceAlias(d, spec);
+    if (path === "check_cart.collect.total") syncTotalAlias(d, spec);
+    await persistSite(d, "已保存", tipId);
+  } catch (e) { setTip(tipId, String(e.message || e), false); }
+}
+async function persistSite(d, msg, tipId) {
+  await api("/api/sites/"+encodeURIComponent(d.id), {method:"PUT", body: JSON.stringify({data:d})});
+  currentData = d;
+  if (tipId) setTip(tipId, msg || "已保存", true);
+  else setStatus(msg || ("已保存 "+d.id+"。重启该站 Tab 后生效。"), true);
+  await refreshList(d.id);
+}
+
+const SIMPLE_FIELDS = {
+  f_display_name: {path:"display_name", kind:"str", label:"显示名"},
+  f_pc_mark: {path:"identity.pc_mark", kind:"str", label:"PcMark"},
+  f_store_name: {path:"identity.store_name", kind:"str", label:"StoreName"},
+  f_group_ids: {path:"identity.group_ids", kind:"csvnum", label:"GroupIds"},
+  f_credit_card: {path:"identity.credit_card", kind:"str", label:"CreditCard"},
+  f_flow: {path:"flow", kind:"str", label:"流程"},
+  f_manual_login_url: {path:"manual_login_url", kind:"str", label:"手动登录 URL"},
+  f_item_id_regex: {path:"identity.item_id_regex", kind:"str", label:"item_id 正则"},
+  f_goods_no_source: {path:"identity.goods_no_source", kind:"str", label:"goods_no 来源"},
+  f_require_price: {path:"inspect.require_price", kind:"bool", label:"必须抓到价格"},
+  f_inspect_wait: {path:"inspect.wait_after_load_seconds", kind:"num", label:"打开商品页后等待秒"},
+  f_sold_texts: {path:"inspect.sold_texts", kind:"lines", label:"售罄文案"},
+  f_add_btn_wait: {path:"add_cart.button_wait_seconds", kind:"num", label:"找不到按钮等待秒"},
+  f_add_after: {path:"add_cart.wait_after_click_seconds", kind:"num", label:"加购点击后等待秒"},
+  f_single_from: {path:"check_cart.single_from", kind:"str", label:"单品数据来源"},
+  f_multi_from: {path:"check_cart.multi_from", kind:"str", label:"多品数据来源"},
+  f_cart_url: {path:"check_cart.cart_url", kind:"str", label:"购物车 URL"},
+  f_checkout_url: {path:"check_cart.checkout_url", kind:"str", label:"结算页 URL"},
+  f_chk_required: {path:"check_cart.required", kind:"lines", label:"必填字段"},
+  f_pay_after: {path:"confirm_pay.wait_after_click_seconds", kind:"num", label:"确认支付点击后等待秒"},
+  f_allow_item_fallback: {path:"complete.allow_item_id_fallback", kind:"bool", label:"注文号回退 item_id"},
+  f_purchase_url_template: {path:"identity.purchase_url_template", kind:"str", label:"订单详情 URL 模板"},
+};
+function coerceValue(kind, raw) {
+  const s = String(raw ?? "");
+  if (kind === "num") {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (kind === "bool") return boolish(s);
+  if (kind === "csvnum") return s.split(/[,，]/).map(x => x.trim()).filter(Boolean).map(x => /^\d+$/.test(x) ? Number(x) : x);
+  if (kind === "lines") return s.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  return s;
+}
+function arrivedPathOf(prefix) {
+  if (prefix === "inspect") return "inspect.arrived";
+  if (prefix === "add") return "add_cart.arrived";
+  if (prefix === "pay_ok") return "confirm_pay.success_arrived";
+  const m = String(prefix).match(/^(chk|pay)_p(\d+)$/);
+  if (m) return (m[1] === "chk" ? "check_cart" : "confirm_pay") + ".pages." + m[2] + ".arrived";
+  return "";
+}
+function ensurePages(d, stage, idx) {
+  if (!d[stage] || typeof d[stage] !== "object") d[stage] = {};
+  if (!Array.isArray(d[stage].pages)) d[stage].pages = [];
+  while (d[stage].pages.length <= idx) d[stage].pages.push(emptyPage(d[stage].pages.length));
+  if (!d[stage].pages[idx] || typeof d[stage].pages[idx] !== "object") d[stage].pages[idx] = emptyPage(idx);
+}
+async function saveInput(id) {
+  const tipId = "tip_"+id;
+  try {
+    if (!currentId || !currentData) throw new Error("请先选站点");
+    const el = $("#"+id);
+    if (!el) throw new Error("找不到输入框");
+    const d = JSON.parse(JSON.stringify(currentData));
+    const meta = SIMPLE_FIELDS[id];
+    if (meta) {
+      setNested(d, meta.path, coerceValue(meta.kind, el.value));
+      await persistSite(d, "已保存", tipId);
+      return;
+    }
+    const page = String(id).match(/^(chk|pay)_p(\d+)_(id|title|waitload)$/);
+    if (page) {
+      const stage = page[1] === "chk" ? "check_cart" : "confirm_pay";
+      const idx = Number(page[2]);
+      ensurePages(d, stage, idx);
+      const key = page[3] === "waitload" ? "wait_after_load_seconds" : page[3];
+      const val = page[3] === "waitload" ? Number(el.value || 0) : el.value;
+      if (page[3] === "waitload" && !el.value) delete d[stage].pages[idx].wait_after_load_seconds;
+      else d[stage].pages[idx][key] = val;
+      await persistSite(d, "已保存", tipId);
+      return;
+    }
+    const arrived = String(id).match(/^(.*)_(wait|url|title|texts)$/);
+    if (arrived) {
+      const path = arrivedPathOf(arrived[1]);
+      if (!path) throw new Error("未知输入框 " + id);
+      const cur = Object.assign({wait_seconds:20, url_contains:[], title_contains:[], texts:[]}, getNested(d, path) || {});
+      const part = arrived[2];
+      if (part === "wait") cur.wait_seconds = Number(el.value || 20);
+      if (part === "url") cur.url_contains = coerceValue("lines", el.value);
+      if (part === "title") cur.title_contains = coerceValue("lines", el.value);
+      if (part === "texts") cur.texts = coerceValue("lines", el.value);
+      setNested(d, path, cur);
+      await persistSite(d, "已保存", tipId);
+      return;
+    }
+    throw new Error("未知输入框 " + id);
+  } catch (e) { setTip(tipId, String(e.message || e), false); }
+}
+
+function arrivedBox(prefix, arrived, hint) {
+  const a = arrived || {};
+  return `<div class="arrived"><strong>本环节怎样算成功（必填至少一项）</strong>
+    <p class="hint">${hint}</p>
+    ${field("等待秒", prefix+"_wait", a.wait_seconds || 20)}
+    ${area("到达 URL 包含（每行一条，命中任一即可）", prefix+"_url", linesOf(a.url_contains))}
+    ${area("到达标题 title 包含（每行一条）", prefix+"_title", linesOf(a.title_contains))}
+    ${area("到达页文案包含（每行一条）", prefix+"_texts", linesOf(a.texts))}
+  </div>`;
+}
+function emptyPage(i) {
+  return {
+    id: "page"+(i+1),
+    title: "第"+(i+1)+"页",
+    arrived: {wait_seconds:20, url_contains:[], title_contains:[], texts:[]},
+    next_button: {primary:[], fallback:[]},
+    checkboxes: [],
+  };
+}
+function pagesOf(stage) {
+  if (Array.isArray(stage.pages) && stage.pages.length) return stage.pages;
+  return [{
+    id: "page1",
+    title: "第1页",
+    arrived: stage.arrived || {},
+    next_button: stage.next_button || {primary:[], fallback:[]},
+    checkboxes: stage.checkboxes || [],
+  }];
+}
+function payPages(pay) {
+  if (Array.isArray(pay.pages) && pay.pages.length) return pay.pages;
+  return [{
+    id: "page1",
+    title: "确认支付",
+    arrived: {},
+    next_button: pay.button || pay.next_button || {primary:[], fallback:[]},
+    checkboxes: pay.checkboxes || [],
+  }];
+}
+function pagesBox(prefix, pages, extraHint) {
+  const list = (pages && pages.length) ? pages : [emptyPage(0)];
+  const stage = prefix === "chk" ? "check_cart" : "confirm_pay";
+  let html = `<div id="${prefix}_pages_wrap"><p class="hint">${extraHint}</p>`;
+  list.forEach((p, i) => {
+    const nextPath = stage+".pages."+i+".next_button";
+    const boxPath = stage+".pages."+i+".checkboxes";
+    html += `<div class="page-card">
+      <h3>第 ${i+1} 页</h3>
+      <div class="row3">
+        ${field("页 id", prefix+"_p"+i+"_id", p.id || ("page"+(i+1)))}
+        ${field("页标题（日志用）", prefix+"_p"+i+"_title", p.title || "")}
+        ${field("进入后等待秒", prefix+"_p"+i+"_waitload", p.wait_after_load_seconds || "")}
+      </div>
+      ${arrivedBox(prefix+"_p"+i, p.arrived, "确认已经到这一页。本页没特征可留空，靠上一页点完自然进入。")}
+      ${locBox(nextPath, p.next_button || p.button, "本页下一步按钮（checkCart 最后一页留空；确认支付最后一页是「确定下单」）")}
+      ${locBox(boxPath, locSpecOf(p.checkboxes), "本页勾选（没有就全留空）")}
+      <button type="button" class="ghost" onclick="removePage('${prefix}', ${i})">删掉本页</button>
+    </div>`;
+  });
+  html += `<button type="button" class="ghost" onclick="addPage('${prefix}')">再加一页</button></div>`;
+  return html;
+}
+function countPages(prefix) {
+  let n = 0;
+  while ($("#"+prefix+"_p"+n+"_id")) n++;
+  return n;
+}
+function collectPages(prefix) {
+  const pages = [];
+  const n = countPages(prefix);
+  const stage = prefix === "chk" ? "check_cart" : "confirm_pay";
+  for (let i=0; i<n; i++) {
+    const waitRaw = $("#"+prefix+"_p"+i+"_waitload").value;
+    const row = {
+      id: $("#"+prefix+"_p"+i+"_id").value || ("page"+(i+1)),
+      title: $("#"+prefix+"_p"+i+"_title").value,
+      arrived: collectArrived(prefix+"_p"+i),
+      next_button: readLocBox(stage+".pages."+i+".next_button", {primary:[], fallback:[]}),
+      checkboxes: readLocBox(stage+".pages."+i+".checkboxes", []),
+    };
+    if (waitRaw) row.wait_after_load_seconds = Number(waitRaw);
+    if (Array.isArray(row.checkboxes) && row.checkboxes[0] && !locItems(row.checkboxes[0].locators || {}).length) {
+      row.checkboxes = [];
+    }
+    pages.push(row);
+  }
+  return pages;
+}
+function addPage(prefix) {
+  try {
+    const d = collect();
+    const key = prefix === "chk" ? "check_cart" : "confirm_pay";
+    const pages = collectPages(prefix);
+    pages.push(emptyPage(pages.length));
+    d[key] = Object.assign({}, d[key]||{}, {pages});
+    currentData = d;
+    const snip = $("#snippet").textContent;
+    renderEditor(d);
+    $("#snippet").textContent = snip;
+  } catch (e) { setStatus(String(e.message||e), false); }
+}
+function removePage(prefix, idx) {
+  try {
+    const d = collect();
+    const key = prefix === "chk" ? "check_cart" : "confirm_pay";
+    const pages = collectPages(prefix);
+    if (pages.length <= 1) { setStatus("至少保留一页", false); return; }
+    pages.splice(idx, 1);
+    d[key] = Object.assign({}, d[key]||{}, {pages});
+    currentData = d;
+    const snip = $("#snippet").textContent;
+    renderEditor(d);
+    $("#snippet").textContent = snip;
+  } catch (e) { setStatus(String(e.message||e), false); }
+}
+function ident(d) { return d.identity || {}; }
+function renderEditor(d) {
+  const idn = ident(d);
+  const login = d.login || {};
+  const inspect = d.inspect || {};
+  const addc = d.add_cart || {};
+  const chk = d.check_cart || {};
+  const pay = d.confirm_pay || {};
+  const done = d.complete || {};
+  const scrape = inspect.scrape || {};
+  const chkCollect = Object.assign({}, chk.extract||{}, chk.collect||{});
+  const cartScrape = chk.scrape || {};
+  $("#editor").innerHTML = `
+    <div class="card">
+      <h2>站点身份</h2>
+      <p class="hint">接口 URL / Secret 仍用根 config.yaml；这里只换站点参数。flow=no_cart 单品直买；cart 多品先加购。</p>
+      ${field("站点 id", "f_id", d.id, "readonly")}
+      ${field("显示名", "f_display_name", d.display_name)}
+      ${field("PcMark", "f_pc_mark", idn.pc_mark)}
+      ${field("StoreName", "f_store_name", idn.store_name)}
+      ${field("GroupIds（逗号）", "f_group_ids", (idn.group_ids||[]).join(","))}
+      ${field("CreditCard（addNo）", "f_credit_card", idn.credit_card)}
+      ${field("流程 no_cart / cart", "f_flow", d.flow || "no_cart")}
+      ${field("手动登录 URL", "f_manual_login_url", d.manual_login_url)}
+      ${field("item_id 正则", "f_item_id_regex", idn.item_id_regex || "")}
+      ${field("goods_no 来源 item_id / order_goods_no", "f_goods_no_source", idn.goods_no_source || "item_id")}
+      ${locBox("login.username", login.username, "用户名输入框")}
+      ${locBox("login.password", login.password, "密码输入框")}
+      ${locBox("login.submit", login.submit, "登录提交按钮")}
+    </div>
+
+    <div class="card step">
+      <h2>① 价格 / 库存</h2>
+      <p class="api">页面检测。价格抓不到或库存不够 / 售罄 → 飞书，跳过本单。不调 EDI。</p>
+      ${field("必须抓到价格 true/false", "f_require_price", inspect.require_price === false ? "false" : "true")}
+      ${field("打开商品页后等待秒", "f_inspect_wait", inspect.wait_after_load_seconds || 2)}
+      ${area("售罄/不可购文案（每行一条）", "f_sold_texts", (inspect.sold_texts||[]).join("\n"))}
+      ${locBox("inspect.scrape.name", scrape.name, "商品名")}
+      ${locBox("inspect.scrape.price", scrape.price, "价格", {regex:true})}
+      ${locBox("inspect.scrape.stock", scrape.stock, "库存（空=不检查数字库存）", {regex:true})}
+      ${arrivedBox("inspect", inspect.arrived, "打开商品页后：例如 URL 含 /item/ 。可以只填 URL。")}
+    </div>
+
+    <div class="card step">
+      <h2>② 加入购物车</h2>
+      <p class="api">点击按钮 → 校验已到达下一页 → 调用 addedCartCallbackSimple。无购物车站点这里就是「購入に進む」。</p>
+      ${locBox("add_cart.button", addc.button, "加购 / 去购买按钮")}
+      ${field("找不到按钮等待秒", "f_add_btn_wait", addc.button_wait_seconds || 20)}
+      ${field("点击后等待秒", "f_add_after", addc.wait_after_click_seconds || 2)}
+      ${locBox("add_cart.modal_ok", addc.modal_ok, "弹窗 OK（没有就留空）")}
+      ${arrivedBox("add", addc.arrived, "点完必须进入的页面。单品通常是结算页 URL（如 /purchase）。多品通常是购物车 URL 或「已加入购物车」文案。")}
+    </div>
+
+    <div class="card step">
+      <h2>③ 核对结算信息 checkCart</h2>
+      <p class="api">可走多页。金额选择器每一页都试抓，后出现的覆盖先出现的；齐了再截图打 checkCartGoodsSimple。</p>
+      ${field("单品数据来源 next_page / cart / checkout", "f_single_from", chk.single_from || "next_page")}
+      ${field("多品数据来源 cart / checkout", "f_multi_from", chk.multi_from || "cart")}
+      ${field("购物车 URL（多品 from=cart 时）", "f_cart_url", chk.cart_url || "")}
+      ${field("结算页 URL（多品 from=checkout 时）", "f_checkout_url", chk.checkout_url || "")}
+      ${locBox("check_cart.go_checkout_button", chk.go_checkout_button, "从购物车点「去结算」")}
+      ${area("必填字段（每行一个，price 与 total 互通）", "f_chk_required", (chk.required||["price"]).join("\n"))}
+      ${locBox("check_cart.collect.price", chkCollect.price, "抓单价（每一页都试）", {regex:true})}
+      ${locBox("check_cart.collect.total", chkCollect.total, "抓合计（每一页都试）", {regex:true})}
+      ${locBox("check_cart.scrape.row", cartScrape.row, "多品：商品行")}
+      ${locBox("check_cart.scrape.name", cartScrape.name, "多品：行内商品名")}
+      ${locBox("check_cart.scrape.price", cartScrape.price, "多品：行内价格", {regex:true})}
+      ${locBox("check_cart.scrape.quantity", cartScrape.quantity, "多品：行内数量")}
+      ${pagesBox("chk", pagesOf(chk), "中间页填下一步按钮；最后一页按钮留空，停在金额页截图打接口。")}
+    </div>
+
+    <div class="card step">
+      <h2>④ 确认支付</h2>
+      <p class="api">多页跳转。注文号选择器同样每一页都试。最后一页按钮是「确定下单」。</p>
+      ${field("点击后等待秒", "f_pay_after", pay.wait_after_click_seconds || 2)}
+      ${locBox("confirm_pay.modal_ok", pay.modal_ok, "弹窗 OK")}
+      ${pagesBox("pay", payPages(pay), "有几张确认页就加几页。不知道注文号在哪一页：选择器配在⑤，引擎每页都试。")}
+      ${arrivedBox("pay_ok", pay.success_arrived || pay.arrived || done.arrived, "点完最后一页后必须到达的成功页。")}
+    </div>
+
+    <div class="card step">
+      <h2>⑤ 下单成功：注文番号 + 两个回调</h2>
+      <p class="api">必须抓到注文番号才算成功 → addNoCallbackSimple → 截图 → updateGoodsNoCallback。</p>
+      ${field("抓不到注文号时用 item_id 回退 true/false", "f_allow_item_fallback", done.allow_item_id_fallback ? "true" : "false")}
+      ${field("订单详情 URL 模板", "f_purchase_url_template", idn.purchase_url_template || "")}
+      ${locBox("complete.extract.purchase_no", (done.extract||{}).purchase_no, "注文番号（每一页都试）", {regex:true})}
+      ${locBox("complete.extract.purchase_url", (done.extract||{}).purchase_url, "订单详情链接（找到元素后读 href）")}
+    </div>
+
+    <div class="card">
+      <div class="ok-col" style="flex:0 0 auto; width:auto; align-items:flex-start">
+        <button onclick="save()">保存本页全部</button>
+        <div class="ok-tip" id="tip_save_all"></div>
+      </div>
+      <p class="hint" style="margin-top:10px">每个输入框右侧「确定」只保存这一项。底部按钮一次写入当前页全部。新建站还需把下面片段写入 config.yaml 的 sites[] 后重启 GUI。</p>
+      <pre id="snippet"></pre>
+    </div>
+  `;
+}
+function boolish(v) { const s=String(v||"").toLowerCase(); return s==="true"||s==="1"||s==="yes"; }
+function lines(id) {
+  const el = $(id.charAt(0)==="#" ? id : "#"+id);
+  return ((el && el.value) || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+}
+function csv(id) {
+  const el = $(id.charAt(0)==="#" ? id : "#"+id);
+  return ((el && el.value) || "").split(",").map(s => s.trim()).filter(Boolean);
+}
+function collectArrived(prefix) {
+  return {
+    wait_seconds: Number($("#"+prefix+"_wait").value || 20),
+    url_contains: lines(prefix+"_url"),
+    title_contains: lines(prefix+"_title"),
+    texts: lines(prefix+"_texts"),
+  };
+}
+async function loadSite(id) {
+  currentId = id;
+  const res = await api("/api/sites/"+encodeURIComponent(id));
+  currentData = res.data;
+  document.querySelectorAll("aside li").forEach(li => li.classList.toggle("active", li.dataset.id===id));
+  renderEditor(currentData);
+  $("#snippet").textContent = res.config_snippet || "";
+  setStatus("已加载 "+id, true);
+}
+function collect() {
+  const d = JSON.parse(JSON.stringify(currentData || {}));
+  d.id = $("#f_id").value;
+  d.display_name = $("#f_display_name").value;
+  d.manual_login_url = $("#f_manual_login_url").value;
+  d.flow = $("#f_flow").value || "no_cart";
+  d.adapter = "playbook";
+  d.identity = Object.assign({}, d.identity||{}, {
+    pc_mark: $("#f_pc_mark").value,
+    store_name: $("#f_store_name").value,
+    group_ids: csv("f_group_ids").map(x => /^\d+$/.test(x) ? Number(x) : x),
+    credit_card: $("#f_credit_card").value,
+    goods_no_source: $("#f_goods_no_source").value,
+    purchase_url_template: $("#f_purchase_url_template").value,
+    item_id_regex: $("#f_item_id_regex").value,
+  });
+  d.login = Object.assign({}, d.login||{}, {
+    username: readLocBox("login.username", d.login&&d.login.username),
+    password: readLocBox("login.password", d.login&&d.login.password),
+    submit: readLocBox("login.submit", d.login&&d.login.submit),
+  });
+  d.inspect = Object.assign({}, d.inspect||{}, {
+    require_price: boolish($("#f_require_price").value),
+    wait_after_load_seconds: Number($("#f_inspect_wait").value||2),
+    sold_texts: lines("f_sold_texts"),
+    scrape: {
+      name: readLocBox("inspect.scrape.name", {}),
+      price: readLocBox("inspect.scrape.price", {}),
+      stock: readLocBox("inspect.scrape.stock", {}),
+    },
+    arrived: collectArrived("inspect"),
+  });
+  d.add_cart = Object.assign({}, d.add_cart||{}, {
+    button: readLocBox("add_cart.button", {}),
+    button_wait_seconds: Number($("#f_add_btn_wait").value||20),
+    wait_after_click_seconds: Number($("#f_add_after").value||2),
+    modal_ok: readLocBox("add_cart.modal_ok", {}),
+    arrived: collectArrived("add"),
+  });
+  const priceSpec = readLocBox("check_cart.collect.price", {});
+  const totalSpec = readLocBox("check_cart.collect.total", {});
+  d.check_cart = Object.assign({}, d.check_cart||{}, {
+    single_from: $("#f_single_from").value || "next_page",
+    multi_from: $("#f_multi_from").value || "cart",
+    cart_url: $("#f_cart_url").value,
+    checkout_url: $("#f_checkout_url").value,
+    go_checkout_button: readLocBox("check_cart.go_checkout_button", {}),
+    required: lines("f_chk_required").length ? lines("f_chk_required") : ["price"],
+    collect: {price: priceSpec, total: totalSpec},
+    extract: {price: priceSpec, total: totalSpec},
+    scrape: {
+      row: readLocBox("check_cart.scrape.row", {}),
+      name: readLocBox("check_cart.scrape.name", {}),
+      price: readLocBox("check_cart.scrape.price", {}),
+      quantity: readLocBox("check_cart.scrape.quantity", {}),
+    },
+    pages: collectPages("chk"),
+  });
+  delete d.check_cart.arrived;
+  delete d.check_cart.button;
+  delete d.check_cart.next_button;
+  delete d.check_cart.checkboxes;
+  d.confirm_pay = Object.assign({}, d.confirm_pay||{}, {
+    wait_after_click_seconds: Number(($("#f_pay_after")||{}).value || 2),
+    modal_ok: readLocBox("confirm_pay.modal_ok", {}),
+    pages: collectPages("pay"),
+    success_arrived: collectArrived("pay_ok"),
+  });
+  delete d.confirm_pay.arrived;
+  delete d.confirm_pay.button;
+  delete d.confirm_pay.next_button;
+  delete d.confirm_pay.checkboxes;
+  d.complete = Object.assign({}, d.complete||{}, {
+    allow_item_id_fallback: boolish($("#f_allow_item_fallback").value),
+    extract: {
+      purchase_no: readLocBox("complete.extract.purchase_no", {}),
+      purchase_url: readLocBox("complete.extract.purchase_url", (d.complete&&d.complete.extract&&d.complete.extract.purchase_url) || {source:"href"}),
+    },
+  });
+  const pu = d.complete.extract.purchase_url || {};
+  if (!pu.source) pu.source = "href";
+  d.complete.extract.purchase_url = pu;
+  delete d.checkout;
+  delete d.pages;
+  delete d.callbacks;
+  delete d.screenshots;
+  return d;
+}
+async function save() {
+  try {
+    const d = collect();
+    await persistSite(d, "已保存", "tip_save_all");
+  } catch (e) { setTip("tip_save_all", String(e.message||e), false); }
+}
+async function newSite() {
+  const id = prompt("新站点 id（字母开头）"); if (!id) return;
+  const name = prompt("显示名", id) || id;
+  try {
+    const r = await api("/api/sites", {method:"POST", body: JSON.stringify({id, display_name:name})});
+    await refreshList(r.id); await loadSite(r.id);
+    setStatus("已创建。把底部片段写入 config.yaml 的 sites[] 后重启 GUI。", true);
+  } catch (e) { setStatus(String(e.message||e), false); }
+}
+async function shutdown() {
+  try { await api("/api/shutdown", {method:"POST"}); setStatus("正在关闭…", true); }
+  catch (e) { setStatus(String(e.message||e), false); }
+}
+refreshList().then(async () => {
+  const first = document.querySelector("aside li");
+  if (first) await loadSite(first.dataset.id);
+}).catch(e => setStatus(String(e.message||e), false));
+</script>
+</body>
+</html>
