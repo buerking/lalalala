@@ -235,7 +235,20 @@ class YahooBargainService(LoggerMixin):
         self.store.consume(oid, status, note=note)
         self.logger.info("雅虎闲置议价：已消费 order=%s status=%s %s", oid, status, note)
         if status in ("time_out", "lost") and messages:
-            self._notify(rec, messages, "雅虎闲置议价 %s" % status)
+            extra = "雅虎闲置议价 %s" % status
+            if status == "lost" and any("不支持议价" in str(m) for m in messages):
+                extra = "商品不支持议价，已停止，不再重试"
+            self._notify(rec, messages, extra)
+
+    @staticmethod
+    def _should_drop_unsupported_bargain(msg: str) -> bool:
+        text = str(msg or "")
+        hints = (
+            "不支持议价",
+            "未找到议价窗口",
+            "未找到价格相談",
+        )
+        return any(h in text for h in hints)
 
     def _dev_accept_unverified_submit(self, rec: Dict[str, Any]) -> bool:
         """本地测试：未登录也可把 pending_submit 当成已提交，进入盯价。"""
@@ -624,8 +637,16 @@ class YahooBargainService(LoggerMixin):
             except Exception:
                 pass
         if not ok:
-            if "未找到价格相談" in msg or "未找到议价窗口" in msg:
-                self._consume(rec, "lost", msg, [msg, "item=%s url=%s" % (item_id, url)])
+            if self._should_drop_unsupported_bargain(msg):
+                self.logger.warning(
+                    "雅虎闲置议价：商品不支持议价，不再重试 order=%s %s", oid, msg
+                )
+                self._consume(
+                    rec,
+                    "lost",
+                    msg,
+                    [msg, "item=%s url=%s" % (item_id, url)],
+                )
                 return
             self.logger.warning("雅虎闲置议价：提交未完成，留待下轮重试 order=%s %s", oid, msg)
             rec["note"] = msg

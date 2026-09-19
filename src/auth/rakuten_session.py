@@ -474,10 +474,18 @@ class RakutenSessionGuard(LoggerMixin):
                 time.sleep(0.8)
 
             if not round_ok:
-                raise RakutenLoginError(
-                    "乐天自动登录失败（upgrade 第 %s 轮，已尝试 %s 次）: %s"
-                    % (upgrade_round, self.max_login_attempts, last_err)
+                if upgrade_round >= self.max_upgrade_rounds:
+                    raise RakutenLoginError(
+                        "乐天自动登录失败（upgrade 第 %s 轮，已尝试 %s 次）: %s"
+                        % (upgrade_round, self.max_login_attempts, last_err)
+                    )
+                self.logger.warning(
+                    "乐天登录第 %s 轮未成功（%s），同一登录页继续下一轮（不刷新）",
+                    upgrade_round,
+                    last_err,
                 )
+                time.sleep(1.0)
+                continue
 
             # 登录后若立刻又进 upgrade，继续；否则结束（不再固定空等）
             time.sleep(0.6)
@@ -541,18 +549,43 @@ class RakutenSessionGuard(LoggerMixin):
         try:
             snap = driver.execute_script(
                 """
+                function walkPwd(root) {
+                  if (!root) return false;
+                  try {
+                    if (root.querySelector && root.querySelector('#password_current, input[type=password]'))
+                      return true;
+                  } catch (e) {}
+                  var nodes;
+                  try { nodes = root.querySelectorAll('*'); } catch (e) { return false; }
+                  for (var i = 0; i < nodes.length; i++) {
+                    if (nodes[i].shadowRoot && walkPwd(nodes[i].shadowRoot)) return true;
+                  }
+                  return false;
+                }
                 var pwd = document.getElementById('password_current');
                 var ce = window.customElements;
+                var hosts = [];
+                try {
+                  var all = document.getElementsByTagName('*');
+                  for (var i = 0; i < all.length && hosts.length < 12; i++) {
+                    var t = (all[i].tagName || '').toLowerCase();
+                    if (t.indexOf('-') >= 0 && hosts.indexOf(t) < 0) hosts.push(t);
+                  }
+                } catch (e) {}
                 return {
                   hash: String(location.hash || ''),
                   pwd: !!pwd,
+                  shadowPwd: walkPwd(document),
                   h4k5: !!document.getElementById('h4k5-container'),
+                  preview: !!document.getElementById('h4k5-preview'),
+                  omniErr: !!document.getElementById('omni-error'),
                   cta: !!document.getElementById('cta011'),
                   anim: !!document.querySelector('.omni-main-view-animating'),
                   elm: (typeof Elm !== 'undefined'),
                   omni: !!(window.Rakuten && Rakuten.Omni),
                   challenger: !!(ce && ce.get && ce.get('r10-challenger')),
                   iframe: document.querySelectorAll('iframe,frame').length,
+                  hosts: hosts,
                   bodyLen: document.body ? (document.body.innerHTML || '').length : -1
                 };
                 """
@@ -578,20 +611,33 @@ class RakutenSessionGuard(LoggerMixin):
             time.sleep(0.2)
         self.logger.info("登录页仍带 omni-main-view-animating，继续填密")
 
+    @staticmethod
+    def _widget_ui_missing(snap: Dict[str, Any]) -> bool:
+        if snap.get("pwd") or snap.get("h4k5") or snap.get("cta") or snap.get("shadowPwd"):
+            return False
+        return bool(snap.get("elm") or snap.get("omni") or snap.get("challenger"))
+
     def _wait_form_ready(self, driver) -> str:
-        """等到 Elm 注入 #password_current / 账号框（含 visibility:hidden）。"""
+        """等到能取到 #password_current / 账号框（含 visibility:hidden）。同一页继续轮询，不提前刷新。"""
         deadline = time.time() + max(3.0, self.form_ready_seconds)
         last_stage = STAGE_LOGIN_UNKNOWN
         logged_shell = False
+        last_miss_log = 0.0
         while time.time() < deadline:
             last_stage = self.detect_stage(driver)
             if last_stage == STAGE_PROFILE:
                 return last_stage
-            if not logged_shell:
-                snap = self._widget_snapshot(driver)
-                if snap.get("h4k5") or snap.get("pwd") or snap.get("elm"):
-                    self.logger.info("乐天登录 widget 快照 %s", snap)
-                    logged_shell = True
+            snap = self._widget_snapshot(driver)
+            if not logged_shell and (
+                snap.get("h4k5") or snap.get("pwd") or snap.get("elm") or snap.get("omni")
+            ):
+                self.logger.info("乐天登录 widget 快照 %s", snap)
+                logged_shell = True
+            if self._widget_ui_missing(snap) and (time.time() - last_miss_log) >= 8.0:
+                self.logger.info(
+                    "登录页脚本已加载但尚未取到密码框，继续等 snap=%s", snap
+                )
+                last_miss_log = time.time()
             if last_stage in (STAGE_PASSWORD, STAGE_USERNAME, STAGE_TWO_FACTOR):
                 if last_stage == STAGE_PASSWORD and not self._password_present(driver):
                     time.sleep(0.3)

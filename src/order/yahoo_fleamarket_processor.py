@@ -1211,6 +1211,35 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             update_errors=update_errors,
         )
 
+    def _has_bargain_widget(self, driver) -> bool:
+        try:
+            if driver.find_elements(By.CSS_SELECTOR, "#fltdscnt"):
+                return True
+        except Exception:
+            pass
+        try:
+            if driver.find_elements(
+                By.CSS_SELECTOR, 'input[placeholder="購入したい金額を入力"]'
+            ):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _page_says_no_bargain(self, driver) -> bool:
+        src = ""
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            src = ""
+        hints = (
+            "価格の相談を受け付けていません",
+            "値下げ交渉を受け付けていません",
+            "この商品は価格の相談対象外",
+            "相談を受け付けていません",
+        )
+        return any(h in src for h in hints)
+
     def submit_price_consultation(
         self, product_url: str, bargain_yen: int, item_id: str
     ) -> Tuple[bool, str]:
@@ -1233,9 +1262,9 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception as e:
             return False, "打开商品页失败: %s" % e
 
-        widget = None
+        page_ready = False
         try:
-            widget = WebDriverWait(driver, wait_sec).until(
+            WebDriverWait(driver, wait_sec).until(
                 lambda d: (
                     d.find_elements(By.CSS_SELECTOR, "#fltdscnt")
                     or d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
@@ -1244,8 +1273,9 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                     )
                 )
             )
+            page_ready = True
         except TimeoutException:
-            widget = None
+            page_ready = False
         time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
         page_state = self.read_bargain_page_state(driver)
         if page_state.get("accepted"):
@@ -1256,19 +1286,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             )
             return True, "卖家已同意议价"
 
-        if widget is None:
-            try:
-                widget = driver.find_element(By.CSS_SELECTOR, "#fltdscnt")
-            except Exception:
-                try:
-                    widget = driver.find_element(
-                        By.CSS_SELECTOR,
-                        'input[placeholder="購入したい金額を入力"]',
-                    )
-                except Exception:
-                    widget = None
-        if widget is None:
-            return False, "商品页未找到议价窗口 #fltdscnt（価格の相談）"
+        has_widget = self._has_bargain_widget(driver)
+        if self._page_says_no_bargain(driver) or (
+            not has_widget and (page_ready or page_state.get("buy_kind") != "none")
+        ):
+            self.logger.info(
+                "雅虎闲置议价：商品不支持议价 item=%s buy=%s widget=%s",
+                item_id,
+                page_state.get("buy_text") or page_state.get("buy_kind"),
+                has_widget,
+            )
+            return False, "商品不支持议价（无価格の相談窗口）"
+        if not has_widget:
+            return False, "打开商品页后未出现购买按钮/议价窗口"
 
         inp = None
         try:
