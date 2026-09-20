@@ -328,9 +328,16 @@ class YahooBargainService(LoggerMixin):
             len(watching),
             hours,
         )
-        for rec in watching:
+        total = len(watching)
+        for i, rec in enumerate(watching, 1):
             oid = str(rec.get("order_id") or "")
             try:
+                self.logger.info(
+                    "雅虎闲置议价：盯价 %s/%s 打开商品页 order=%s",
+                    i,
+                    total,
+                    oid,
+                )
                 self._monitor_one(rec)
             except Exception as e:
                 self.logger.error(

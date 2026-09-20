@@ -48,14 +48,27 @@ class FeishuNotifier(LoggerMixin):
         self.webhook_url = self.webhook_config.get('url', '')
         # PayPay 扫码专用群（可选）：用于发送扫码准备/二维码，未配置时回退默认 webhook
         self.paypay_scan_webhook_url = self.webhook_config.get('paypay_scan_url', '')
+        # 自动处理后仅记录、无需人工的群（可选）
+        self.record_webhook_url = self.webhook_config.get('record_url', '')
         self.enabled = self.webhook_config.get('enabled', True)
 
-    def _resolve_webhook_url(self, use_paypay_scan_webhook: bool = False) -> str:
+    def _resolve_webhook_url(
+        self,
+        use_paypay_scan_webhook: bool = False,
+        use_record_webhook: bool = False,
+    ) -> str:
+        if use_record_webhook:
+            return (self.record_webhook_url or "").strip()
         if use_paypay_scan_webhook and self.paypay_scan_webhook_url:
             return self.paypay_scan_webhook_url
         return self.webhook_url
 
-    def _post_webhook(self, body: Dict[str, Any], use_paypay_scan_webhook: bool = False) -> None:
+    def _post_webhook(
+        self,
+        body: Dict[str, Any],
+        use_paypay_scan_webhook: bool = False,
+        use_record_webhook: bool = False,
+    ) -> None:
         """统一 POST 到 webhook，校验 v2 要求的 msg_type / content。"""
         if not self.enabled:
             return
@@ -64,7 +77,10 @@ class FeishuNotifier(LoggerMixin):
         if _dev_skip_feishu(self.config):
             self.logger.info("本地测试：跳过飞书 Webhook")
             return
-        webhook_url = self._resolve_webhook_url(use_paypay_scan_webhook=use_paypay_scan_webhook)
+        webhook_url = self._resolve_webhook_url(
+            use_paypay_scan_webhook=use_paypay_scan_webhook,
+            use_record_webhook=use_record_webhook,
+        )
         if not webhook_url:
             self.logger.warning("飞书Webhook URL未配置")
             return
@@ -81,6 +97,7 @@ class FeishuNotifier(LoggerMixin):
         content: str,
         use_paypay_scan_webhook: bool = False,
         header_template: str = "red",
+        use_record_webhook: bool = False,
     ):
         """
         发送文本/卡片消息到飞书（v2：msg_type + content）
@@ -89,6 +106,7 @@ class FeishuNotifier(LoggerMixin):
             title: 消息标题
             content: 消息内容（支持 markdown 式排版）
             header_template: 卡片标题色，如 red / orange / yellow
+            use_record_webhook: 发往记录群（自动处理后无需人工）
         """
         if not self.enabled:
             self.logger.debug("飞书通知已禁用")
@@ -98,7 +116,10 @@ class FeishuNotifier(LoggerMixin):
         if _dev_skip_feishu(self.config):
             self.logger.info("本地测试：跳过飞书 Webhook")
             return
-        webhook_url = self._resolve_webhook_url(use_paypay_scan_webhook=use_paypay_scan_webhook)
+        webhook_url = self._resolve_webhook_url(
+            use_paypay_scan_webhook=use_paypay_scan_webhook,
+            use_record_webhook=use_record_webhook,
+        )
         if not webhook_url:
             self.logger.warning("飞书Webhook URL未配置")
             return
@@ -117,11 +138,19 @@ class FeishuNotifier(LoggerMixin):
             }
             message = {"msg_type": "interactive", "card": card}
             try:
-                self._post_webhook(message, use_paypay_scan_webhook=use_paypay_scan_webhook)
+                self._post_webhook(
+                    message,
+                    use_paypay_scan_webhook=use_paypay_scan_webhook,
+                    use_record_webhook=use_record_webhook,
+                )
             except Exception as card_err:
                 # 若卡片格式不被接受，用纯文本（v2 必选格式之一）
                 text_body = {"msg_type": "text", "content": {"text": f"{title}\n\n{content}"}}
-                self._post_webhook(text_body, use_paypay_scan_webhook=use_paypay_scan_webhook)
+                self._post_webhook(
+                    text_body,
+                    use_paypay_scan_webhook=use_paypay_scan_webhook,
+                    use_record_webhook=use_record_webhook,
+                )
                 self.logger.debug("已降级为文本消息: %s", card_err)
             self.logger.info(f"飞书消息发送成功: {title}")
         except Exception as e:
@@ -135,25 +164,39 @@ class FeishuNotifier(LoggerMixin):
         messages: List[str],
         user_id: Optional[str] = None,
         extra: Optional[str] = None,
+        use_record_webhook: bool = False,
     ):
         """
-        自动下单流程出现问题时的飞书群提醒，用于通知人工处理。
+        自动下单流程出现问题时的飞书群提醒。
+        默认发往需人工处理的群；use_record_webhook=True 时发往记录群，不打扰人工。
         
         Args:
             order_id: 订单ID
             messages: 问题列表（如库存不足、价格变动、页面超时等）
             user_id: 用户ID（若有，来自订单接口）
             extra: 额外说明（如「已创建工单」）
+            use_record_webhook: 发往记录群（自动删单等已处理完的场景）
         """
         if not self.enabled:
             self.logger.debug("飞书通知已禁用，跳过订单异常提醒")
             return
-        if not self.webhook_url:
+        if use_record_webhook:
+            if not self.record_webhook_url:
+                self.logger.warning("飞书记录群 Webhook 未配置，跳过已处理记录提醒")
+                return
+        elif not self.webhook_url:
             self.logger.warning("飞书Webhook URL未配置，跳过订单异常提醒")
             return
         try:
             stage = classify_purchase_stage(messages, extra)
-            if stage == "after":
+            if use_record_webhook:
+                title = "【已自动删单】商品已售出，无需人工"
+                header_template = "blue"
+                banner = (
+                    "<font color='blue'>**■■■ 售罄已自动删单退款 · 仅记录 · "
+                    "无需人工 ■■■**</font>"
+                )
+            elif stage == "after":
                 title = "【购买后】已点确认/付款，请核对是否已出单"
                 header_template = "red"
                 banner = (
@@ -167,10 +210,13 @@ class FeishuNotifier(LoggerMixin):
                     "<font color='orange'>**■■■ 购买前报错 · 尚未付款 · "
                     "登录/加购/议价/限购/结算校验 ■■■**</font>"
                 )
+            stage_label = "已自动处理" if use_record_webhook else (
+                "购买后" if stage == "after" else "购买前"
+            )
             lines = [
                 banner,
                 "",
-                f"**阶段**: {'购买后' if stage == 'after' else '购买前'}",
+                f"**阶段**: {stage_label}",
                 f"**订单ID**: {order_id}",
                 "",
             ]
@@ -188,12 +234,20 @@ class FeishuNotifier(LoggerMixin):
                 lines.append("")
                 lines.append(extra)
             content = "\n".join(lines)
-            self.send_message(title, content, header_template=header_template)
-            self.logger.info(
-                "已发送飞书提醒: 订单 %s 需人工处理 stage=%s",
-                order_id,
-                "购买后" if stage == "after" else "购买前",
+            self.send_message(
+                title,
+                content,
+                header_template=header_template,
+                use_record_webhook=use_record_webhook,
             )
+            if use_record_webhook:
+                self.logger.info("已发送飞书记录群提醒: 订单 %s 已自动删单", order_id)
+            else:
+                self.logger.info(
+                    "已发送飞书提醒: 订单 %s 需人工处理 stage=%s",
+                    order_id,
+                    "购买后" if stage == "after" else "购买前",
+                )
         except Exception as e:
             self.logger.error(f"发送飞书订单异常提醒失败: {e}")
             raise

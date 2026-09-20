@@ -24,6 +24,7 @@ from src.browser.browser_manager import BrowserManager
 from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
+from src.order.cancel_order import send_cancel_order_simple
 from src.order.added_cart_callback import send_added_cart_callback
 from src.order.update_goods_no_callback import send_update_goods_no_callback
 from src.payment.confirm_page_verifier import (
@@ -320,11 +321,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         """打开商品页（需已登录会话）读取专属议价/标价。"""
         driver = self.browser_manager.get_driver()
+        wait_sec = int(
+            self.y_cfg.get("bargain_watch_page_wait_seconds")
+            or min(15, int(self.y_cfg.get("product_page_buy_button_wait_seconds", 45)))
+        )
+        self.logger.info(
+            "雅虎闲置议价：打开商品页盯价 wait=%ss url=%s",
+            wait_sec,
+            product_url,
+        )
         try:
             self.browser_manager.navigate(product_url)
         except Exception as e:
             return None, "打开商品页失败: %s" % e
-        wait_sec = int(self.y_cfg.get("product_page_buy_button_wait_seconds", 45))
         try:
             WebDriverWait(driver, wait_sec).until(
                 lambda d: bool(
@@ -333,7 +342,10 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 )
             )
         except TimeoutException:
-            pass
+            self.logger.info(
+                "雅虎闲置议价：商品页 %ss 内未出现购买按钮/议价窗，本轮先读现有 DOM",
+                wait_sec,
+            )
         time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
         state = self.read_bargain_page_state(driver)
         self.logger.info(
@@ -720,7 +732,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         if data and str(data.get("status", "")).upper() == "SOLD":
             msg = "商品已售出（API status=SOLD） item=%s url=%s" % (item_id, product_url)
             self.logger.warning(msg)
-            self._handle_order_issue(order, [msg], reason="雅虎闲置库存")
+            self._handle_sold_cancel(order, msg)
             return False, self._make_summary(order, failure_reason=msg)
         if err:
             self.logger.warning("雅虎闲置：商品 API 请求失败（将尝试页面兜底）: %s", err)
@@ -1419,6 +1431,37 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             driver.current_url or "",
         )
         return True, ""
+
+    def _handle_sold_cancel(self, order: Dict[str, Any], sold_msg: str) -> None:
+        """API 售罄：调用 cancelOrderSimple；成功则只发记录群，失败仍走人工飞书。"""
+        order_id = order.get("order_id", "未知")
+        user_id = order.get("user_id")
+        use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
+        try:
+            ok, err, raw = send_cancel_order_simple(
+                order, self.config, use_curl=bool(use_curl)
+            )
+        except Exception as e:
+            ok, err, raw = False, "调用异常: %s" % e, ""
+        if ok:
+            self.logger.info("雅虎闲置：售罄已自动删单退款 order=%s", order_id)
+            record_msgs = [sold_msg, "已调用 cancelOrderSimple 自动删单退款"]
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    order_id,
+                    record_msgs,
+                    user_id=user_id,
+                    extra="已自动删单退款，无需人工；本消息仅作记录，供后期反向查询。",
+                    use_record_webhook=True,
+                )
+            except Exception as e:
+                self.logger.warning("飞书记录群提醒失败: %s", e)
+            return
+        fail_msgs = [sold_msg, "cancelOrderSimple 失败: %s" % (err or "未知")]
+        if raw:
+            fail_msgs.append("响应: %s" % str(raw)[:300])
+        self.logger.warning("雅虎闲置：售罄删单失败，仍通知人工 order=%s err=%s", order_id, err)
+        self._handle_order_issue(order, fail_msgs, reason="雅虎闲置库存")
 
     def _handle_order_issue(self, order: Dict[str, Any], messages: List[str], reason: str = "") -> None:
         order_id = order.get("order_id", "未知")

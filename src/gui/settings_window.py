@@ -74,7 +74,13 @@ class SettingsWindow:
         # 飞书
         f_feishu = ttk.Frame(nb, padding=10)
         nb.add(f_feishu, text="飞书通知")
-        self._add_row(f_feishu, "Webhook URL:", "feishu_webhook.url", width=55)
+        self._add_row(f_feishu, "Webhook URL（需人工）:", "feishu_webhook.url", width=55)
+        self._add_row(
+            f_feishu,
+            "记录群 Webhook URL（自动处理后仅记录）:",
+            "feishu_webhook.record_url",
+            width=55,
+        )
         self._add_row(
             f_feishu,
             "PayPay扫码群 Webhook URL:",
