@@ -168,10 +168,15 @@ def send_added_cart_callback(
     order_sec = str(order.get("secret") or "").strip()
     global_sec = str(api_config.get("secret") or "").strip()
 
-    if not goods_id or not goods_no:
-        msg = "addedCart 缺少 GoodsId/GoodsNo（须来自 getOrderListSimple List）"
+    if not goods_id:
+        msg = "addedCart 缺少 GoodsId（须来自 getOrderListSimple List）"
         log("%s goods_id=%r goods_no=%r", msg, goods_id, goods_no)
         return False, msg
+    if not goods_no:
+        log(
+            "GoodsNo 为空，仍提交 addedCart（omit_empty 不签该字段）goods_id=%s",
+            goods_id,
+        )
 
     base = {
         "OrderId": order_id,

@@ -16,7 +16,11 @@ from src.browser.browser_manager import BrowserManager
 from src.config.site_merge import merge_site_config
 from src.order.order_fetcher import OrderFetcher
 from src.order.order_processor import OrderProcessor
-from src.scheduler.task_scheduler import TaskScheduler
+from src.scheduler.task_scheduler import (
+    TaskScheduler,
+    format_interval_label,
+    resolve_interval_seconds,
+)
 from src.utils.site_logging import attach_site_file_logger, detach_site_handlers
 
 
@@ -515,11 +519,11 @@ class SiteRunner:
             finally:
                 self._end_batch()
 
-        sched_cfg = self.merged_config.get("scheduler", {})
-        interval = int(sched_cfg.get("interval_minutes", 15) or 15)
+        sched_cfg = self.merged_config.get("scheduler", {}) or {}
+        interval_seconds = resolve_interval_seconds(sched_cfg)
         delay = int(sched_cfg.get("start_delay_seconds", 5) or 5)
         self.scheduler = TaskScheduler(
-            interval_minutes=interval,
+            interval_seconds=interval_seconds,
             start_delay_seconds=delay,
             config=self.merged_config,
         )
@@ -527,8 +531,8 @@ class SiteRunner:
         self.scheduler.start()
         self.is_running = True
         self._logger().info(
-            "已启动定时拉单：每 %s 分钟一轮（启动延迟 %s 秒）；无单时也会按该间隔继续轮询",
-            interval,
+            "已启动定时拉单：每 %s 一轮（启动延迟 %s 秒）；无单时也会按该间隔继续轮询",
+            format_interval_label(interval_seconds),
             delay,
         )
 

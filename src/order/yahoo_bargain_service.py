@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 雅虎闲置议价：
-- 每轮定时任务开头盯本地队列（72h / 在售 / 价格 / 商品信息）
+- 每轮定时任务开头盯本地队列（默认 24h 开商品页，之后改商品 API，满 72h 超时）
 - 普通拉单结束后拉 getBargainOrderListSimple，提交「価格の相談」
+- 提交时找不到议价窗口：飞书提醒后改为 API 盯价，不再反复打开商品页
 """
 
 from __future__ import annotations
@@ -206,17 +207,65 @@ class YahooBargainService(LoggerMixin):
                 pass
         return 72.0
 
-    def _is_timeout(self, rec: Dict[str, Any]) -> bool:
-        hours = self._timeout_hours()
+    def _page_watch_hours(self) -> float:
+        """开商品页盯价时长，默认 24 小时；超时后改走商品 API。"""
+        hours = self.y_cfg.get("bargain_page_watch_hours", 24)
+        try:
+            return max(0.0, float(hours))
+        except (TypeError, ValueError):
+            return 24.0
+
+    def _watch_start(self, rec: Dict[str, Any]) -> Optional[datetime]:
         start = _parse_iso(rec.get("bargain_submitted_at")) or _parse_iso(
             rec.get("fetched_at")
         )
         if start is None:
-            return False
+            return None
         now = datetime.now().astimezone()
         if start.tzinfo is None:
             start = start.replace(tzinfo=now.tzinfo)
+        return start
+
+    def _is_timeout(self, rec: Dict[str, Any]) -> bool:
+        hours = self._timeout_hours()
+        start = self._watch_start(rec)
+        if start is None:
+            return False
+        now = datetime.now().astimezone()
         return now - start >= timedelta(hours=hours)
+
+    def _use_page_watch(self, rec: Dict[str, Any]) -> bool:
+        mode = str(rec.get("watch_mode") or "").strip().lower()
+        if mode == "api":
+            return False
+        start = self._watch_start(rec)
+        if start is None:
+            return True
+        now = datetime.now().astimezone()
+        return (now - start) < timedelta(hours=self._page_watch_hours())
+
+    def _switch_to_api_watch(
+        self, rec: Dict[str, Any], note: str, messages: List[str]
+    ) -> None:
+        """找不到议价窗口：飞书一次，转入 API 盯价，不再打开商品页提交。"""
+        oid = str(rec.get("order_id") or "")
+        rec["status"] = "watching"
+        rec["watch_mode"] = "api"
+        rec["bargain_submitted_at"] = rec.get("bargain_submitted_at") or _now_iso()
+        rec["note"] = note
+        already = bool(rec.get("api_watch_notified"))
+        rec["api_watch_notified"] = True
+        self.store.upsert(rec)
+        self.logger.warning(
+            "雅虎闲置议价：未找到议价窗口，改为 API 盯价 order=%s %s", oid, note
+        )
+        if already:
+            return
+        extra = (
+            "未找到议价操作窗口，已改为商品 API 盯价（不再打开商品页提交）；"
+            "标价降到议价金额及以下时再自动购买"
+        )
+        self._notify(rec, messages, extra)
 
     def _notify(self, rec: Dict[str, Any], messages: List[str], reason: str) -> None:
         order = record_to_order(rec)
@@ -247,6 +296,9 @@ class YahooBargainService(LoggerMixin):
             "不支持议价",
             "未找到议价窗口",
             "未找到价格相談",
+            "无価格の相談",
+            "议价窗口内未找到金额输入框",
+            "议价窗口内未找到提交按钮",
         )
         return any(h in text for h in hints)
 
@@ -259,6 +311,7 @@ class YahooBargainService(LoggerMixin):
         if str(rec.get("status") or "") != "pending_submit":
             return False
         rec["status"] = "watching"
+        rec["watch_mode"] = rec.get("watch_mode") or "page"
         rec["bargain_submitted_at"] = rec.get("bargain_submitted_at") or _now_iso()
         rec["note"] = "本地测试：不验证议价提交成功，直接进入盯价"
         self.store.upsert(rec)
@@ -323,19 +376,23 @@ class YahooBargainService(LoggerMixin):
             else:
                 self.logger.info("雅虎闲置议价：本地队列无待盯价记录")
             return
+        page_h = self._page_watch_hours()
         self.logger.info(
-            "雅虎闲置议价：开始盯价，watching %s 条（超时 %s 小时）",
+            "雅虎闲置议价：开始盯价，watching %s 条（页面盯价 %s 小时 / 超时 %s 小时）",
             len(watching),
+            page_h,
             hours,
         )
         total = len(watching)
         for i, rec in enumerate(watching, 1):
             oid = str(rec.get("order_id") or "")
             try:
+                use_page = self._use_page_watch(rec)
                 self.logger.info(
-                    "雅虎闲置议价：盯价 %s/%s 打开商品页 order=%s",
+                    "雅虎闲置议价：盯价 %s/%s %s order=%s",
                     i,
                     total,
+                    "打开商品页" if use_page else "商品API",
                     oid,
                 )
                 self._monitor_one(rec)
@@ -345,6 +402,12 @@ class YahooBargainService(LoggerMixin):
                 )
 
     def _monitor_one(self, rec: Dict[str, Any]) -> None:
+        if self._use_page_watch(rec):
+            self._monitor_one_page(rec)
+        else:
+            self._monitor_one_api(rec)
+
+    def _monitor_one_page(self, rec: Dict[str, Any]) -> None:
         products = rec.get("products") or []
         product = products[0] if products else {}
         url = str(product.get("url") or "").strip()
@@ -459,6 +522,105 @@ class YahooBargainService(LoggerMixin):
                 bargain_yen,
                 oid,
             )
+        self._try_auto_buy(rec, item_id, url, listed, bargain_yen, oid)
+
+    def _monitor_one_api(self, rec: Dict[str, Any]) -> None:
+        """超过页面盯价时长、或提交时无议价窗口：只请求商品 API，不打开页面。"""
+        products = rec.get("products") or []
+        product = products[0] if products else {}
+        url = str(product.get("url") or "").strip()
+        item_id = extract_yahoo_item_id(url)
+        bargain_yen = _yen_int(rec.get("bargain_price") or product.get("bargain_price"))
+        oid = str(rec.get("order_id") or "")
+        if not item_id or not bargain_yen:
+            self._consume(
+                rec,
+                "lost",
+                "记录缺少 item_id 或议价金额",
+                ["议价记录数据不完整，无法盯价 order=%s" % oid],
+            )
+            return
+
+        data, err = self.yp._fetch_item_status(item_id)
+        if err and not data:
+            self.logger.warning(
+                "雅虎闲置议价：商品 API 失败，本轮跳过 order=%s item=%s err=%s",
+                oid,
+                item_id,
+                err,
+            )
+            return
+        listed = item_listed_price(data)
+        rec["last_check_at"] = _now_iso()
+        rec["last_seen_price"] = listed
+        rec["watch_mode"] = "api"
+        if data:
+            current_snap = build_item_snapshot(data, item_id)
+            saved = dict(rec.get("item_snapshot") or {})
+            api_title = _norm_text(current_snap.get("title"))
+            if not saved.get("title"):
+                rec["item_snapshot"] = current_snap
+            elif api_title:
+                saved_title = _norm_text(saved.get("title"))
+                if saved_title and saved_title != api_title:
+                    self._consume(
+                        rec,
+                        "lost",
+                        "商品信息与议价时不一致: 标题不一致",
+                        [
+                            "议价后卖家可能改了商品（标题不一致），已停止自动购买",
+                            "item=%s API价=%s 议价=%s" % (item_id, listed, bargain_yen),
+                            url,
+                        ],
+                    )
+                    return
+        self.store.upsert(rec)
+
+        if data and not item_is_on_sale(data):
+            self._consume(
+                rec,
+                "lost",
+                "商品 API 显示已售出/不可售",
+                [
+                    "议价商品已不可售/已售出 item=%s status=%s"
+                    % (item_id, _dig(data, "status")),
+                    url,
+                ],
+            )
+            return
+        if listed is None:
+            self.logger.warning(
+                "雅虎闲置议价：商品 API 无价格，本轮跳过 order=%s item=%s",
+                oid,
+                item_id,
+            )
+            return
+        if listed > bargain_yen:
+            self.logger.info(
+                "雅虎闲置议价：API 标价 %s > 议价 %s，继续等待 order=%s item=%s",
+                listed,
+                bargain_yen,
+                oid,
+                item_id,
+            )
+            return
+        self.logger.info(
+            "雅虎闲置议价：API 标价 %s <= 议价 %s，开始自动购买 order=%s",
+            listed,
+            bargain_yen,
+            oid,
+        )
+        self._try_auto_buy(rec, item_id, url, listed, bargain_yen, oid)
+
+    def _try_auto_buy(
+        self,
+        rec: Dict[str, Any],
+        item_id: str,
+        url: str,
+        listed: int,
+        bargain_yen: int,
+        oid: str,
+    ) -> None:
         from src.utils.dev_test import stop_before_purchase as _dev_stop_buy
 
         if _dev_stop_buy(self.config):
@@ -586,6 +748,12 @@ class YahooBargainService(LoggerMixin):
 
     def _submit_one(self, rec: Dict[str, Any]) -> None:
         oid = str(rec.get("order_id") or "")
+        if str(rec.get("watch_mode") or "").strip().lower() == "api":
+            if str(rec.get("status") or "") != "watching":
+                rec["status"] = "watching"
+                self.store.upsert(rec)
+            self.logger.info("雅虎闲置议价：已改 API 盯价，跳过页面提交 order=%s", oid)
+            return
         products = rec.get("products") or []
         if not products:
             self._consume(rec, "lost", "议价单无商品", ["议价订单无商品 order=%s" % oid])
@@ -645,14 +813,10 @@ class YahooBargainService(LoggerMixin):
                 pass
         if not ok:
             if self._should_drop_unsupported_bargain(msg):
-                self.logger.warning(
-                    "雅虎闲置议价：商品不支持议价，不再重试 order=%s %s", oid, msg
-                )
-                self._consume(
+                self._switch_to_api_watch(
                     rec,
-                    "lost",
                     msg,
-                    [msg, "item=%s url=%s" % (item_id, url)],
+                    [msg, "item=%s url=%s 议价金额=%s" % (item_id, url, bargain_yen)],
                 )
                 return
             self.logger.warning("雅虎闲置议价：提交未完成，留待下轮重试 order=%s %s", oid, msg)
@@ -670,6 +834,7 @@ class YahooBargainService(LoggerMixin):
             return
 
         rec["status"] = "watching"
+        rec["watch_mode"] = "page"
         rec["bargain_submitted_at"] = _now_iso()
         rec["note"] = "已提交価格の相談 %s円" % bargain_yen
         self.store.upsert(rec)

@@ -4867,6 +4867,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
 
         verified_products: List[Dict[str, Any]] = []
+        missing_gno_notified = False
         # 先按 URL+规格合并，详情页一次写入总数量再加购（25 行重复可降到约 6 次）。
         add_groups = self._merge_duplicate_products(cart_products)
         for idx, product in enumerate(add_groups, 1):
@@ -4877,9 +4878,9 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             )
             for line in source_lines:
                 gid, gno = self._api_goods_id_and_no(line)
-                if not gid or not gno:
+                if not gid:
                     msg = (
-                        "订单商品缺少 GoodsId/GoodsNo（getOrderListSimple List） "
+                        "订单商品缺少 GoodsId（getOrderListSimple List） "
                         "goods_id=%r goods_no=%r"
                         % (gid, gno)
                     )
@@ -4889,11 +4890,29 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                             str(order_id),
                             [msg],
                             user_id=order.get("user_id"),
-                            extra="乐天市场：接口 List 缺 GoodsNo，已跳过本单。",
+                            extra="乐天市场：接口 List 缺 GoodsId，已跳过本单。",
                         )
                     except Exception:
                         pass
                     return False, self._make_summary(order, failure_reason=msg)
+                if not gno:
+                    msg = (
+                        "订单商品缺少 GoodsNo（getOrderListSimple List），"
+                        "已忽略并继续下单。goods_id=%r"
+                        % gid
+                    )
+                    self.logger.warning("乐天市场：%s order=%s", msg, order_id)
+                    if not missing_gno_notified:
+                        missing_gno_notified = True
+                        try:
+                            self.feishu_notifier.notify_order_issue(
+                                str(order_id),
+                                [msg],
+                                user_id=order.get("user_id"),
+                                extra="乐天市场：接口 List 缺 GoodsNo，已忽略并继续尝试下单。",
+                            )
+                        except Exception:
+                            pass
 
             try:
                 self.logger.info(
@@ -4981,6 +5000,13 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         "乐天市场：addedCartCallbackSimple 未成功（GoodsNo=%s Message=%s）"
                         % (gno, cb_msg or "-")
                     ]
+                    if not gno:
+                        self.logger.warning(
+                            "%s order=%s（缺 GoodsNo，忽略回调失败并继续下单）",
+                            msgs[0],
+                            order_id,
+                        )
+                        continue
                     self.logger.error("%s order=%s", msgs[0], order_id)
                     try:
                         self.ticket_creator.create_ticket(

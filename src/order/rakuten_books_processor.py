@@ -1098,6 +1098,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             for line in lines:
                 _gid, no = self._api_goods_id_and_no(line)
                 if not no:
+                    no = _gid
+                if not no:
                     continue
                 try:
                     price = int(round(float(line.get("price") or 0)))
@@ -1297,6 +1299,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             self.logger.error("乐天书店：%s order=%s", msg, order_id)
             return False, self._make_summary(order, failure_reason=msg)
 
+        missing_gno_notified = False
         for idx, product in enumerate(products, 1):
             purl = normalize_rakuten_books_product_url(
                 str(product.get("url") or "").strip()
@@ -1306,7 +1309,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             source_lines: List[Dict[str, Any]] = list(
                 product.get("_source_lines") or [product]
             )
-            # 与乐天市场一致：先校验 List 行齐全，再浏览器加购，再按行逐条 addedCart
+            # GoodsId 仍必填；缺 GoodsNo 只通知并继续尝试下单
             for line in source_lines:
                 gid, gno = self._api_goods_id_and_no(line)
                 if not gid:
@@ -1329,11 +1332,21 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 if not gno:
                     msg = (
                         "订单商品缺少 GoodsNo（getOrderListSimple List），"
-                        "不可用 URL 书号顶替。goods_id=%r url=%s"
+                        "已忽略并继续下单。goods_id=%r url=%s"
                         % (gid, str(line.get("url") or purl))
                     )
-                    self.logger.error("乐天书店：%s order=%s", msg, order_id)
-                    return False, self._make_summary(order, failure_reason=msg)
+                    self.logger.warning("乐天书店：%s order=%s", msg, order_id)
+                    if not missing_gno_notified:
+                        missing_gno_notified = True
+                        try:
+                            self.feishu_notifier.notify_order_issue(
+                                str(order_id),
+                                [msg],
+                                user_id=order.get("user_id"),
+                                extra="乐天书店：接口 List 缺 GoodsNo，已忽略并继续尝试下单。",
+                            )
+                        except Exception:
+                            pass
 
             # 浏览器：按接口行加购（每行用该行数量；不跨行合并）
             try:
@@ -1361,16 +1374,16 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     pass
                 return False, self._make_summary(order, failure_reason=msg)
 
-            # 后端：List 每一行单独 addedCartCallbackSimple（与乐天市场相同字段，不用 URL 书号顶替 GoodsNo）
+            # 后端：List 每一行单独 addedCartCallbackSimple；缺 GoodsNo 仍尝试提交
             for line in source_lines:
                 line_url = normalize_rakuten_books_product_url(
                     str(line.get("url") or purl)
                 )
                 gid, gno = self._api_goods_id_and_no(line)
-                if not gid or not gno:
+                if not gid:
                     msg = (
-                        "订单商品缺少 GoodsId/GoodsNo（getOrderListSimple List），"
-                        "拒绝用 URL 书号顶替。goods_id=%r goods_no=%r url=%s"
+                        "订单商品缺少 GoodsId（getOrderListSimple List），"
+                        "goods_id=%r goods_no=%r url=%s"
                         % (gid, gno, line_url or purl)
                     )
                     self.logger.error("乐天书店：%s order=%s", msg, order_id)
@@ -1419,6 +1432,13 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         "（GoodsId=%s GoodsNo=%s Message=%s）"
                         % (gid, gno, tip or "-")
                     ]
+                    if not gno:
+                        self.logger.warning(
+                            "%s order=%s（缺 GoodsNo，忽略回调失败并继续下单）",
+                            msgs[0],
+                            order_id,
+                        )
+                        continue
                     self.logger.error("%s order=%s", msgs[0], order_id)
                     try:
                         self.ticket_creator.create_ticket(

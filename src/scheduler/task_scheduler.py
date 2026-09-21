@@ -11,6 +11,30 @@ from typing import Any, Callable, Dict, Optional
 from src.utils.logger import LoggerMixin
 
 
+def resolve_interval_seconds(sched_cfg: Optional[Dict[str, Any]] = None) -> int:
+    """优先 scheduler.interval_seconds；否则用 interval_minutes（默认 15 分钟）。最少 1 秒。"""
+    cfg = sched_cfg or {}
+    raw_sec = cfg.get("interval_seconds")
+    if raw_sec is not None and str(raw_sec).strip() != "":
+        try:
+            return max(1, int(float(raw_sec)))
+        except (TypeError, ValueError):
+            pass
+    minutes = cfg.get("interval_minutes", 15)
+    try:
+        return max(1, int(float(minutes) * 60))
+    except (TypeError, ValueError):
+        return 15 * 60
+
+
+def format_interval_label(seconds: int) -> str:
+    sec = max(1, int(seconds))
+    if sec % 60 == 0:
+        mins = sec // 60
+        return "%s 分钟" % mins
+    return "%s 秒" % sec
+
+
 class TaskScheduler(LoggerMixin):
     """定时任务调度器"""
 
@@ -19,18 +43,31 @@ class TaskScheduler(LoggerMixin):
         interval_minutes: int = 15,
         start_delay_seconds: int = 5,
         config: Optional[Dict[str, Any]] = None,
+        interval_seconds: Optional[int] = None,
     ):
         """
         初始化调度器
 
         Args:
-            interval_minutes: 任务执行间隔（分钟）
+            interval_minutes: 任务执行间隔（分钟）；若传入 interval_seconds 则以秒为准
             start_delay_seconds: 启动延迟（秒）
             config: 站点合并配置（含 _log_namespace 时日志写入 site.*）
+            interval_seconds: 任务执行间隔（秒），雅虎闲置可配 10
         """
-        self.interval_minutes = max(1, int(interval_minutes or 15))
-        self.start_delay_seconds = max(0, int(start_delay_seconds or 0))
         self.config = config or {}
+        if interval_seconds is not None:
+            self.interval_seconds = max(1, int(interval_seconds))
+        else:
+            sched = self.config.get("scheduler") if isinstance(self.config, dict) else {}
+            if isinstance(sched, dict) and sched.get("interval_seconds") not in (None, ""):
+                self.interval_seconds = resolve_interval_seconds(sched)
+            else:
+                try:
+                    self.interval_seconds = max(1, int(float(interval_minutes or 15) * 60))
+                except (TypeError, ValueError):
+                    self.interval_seconds = 15 * 60
+        self.interval_minutes = max(1, int((self.interval_seconds + 59) // 60))
+        self.start_delay_seconds = max(0, int(start_delay_seconds or 0))
         self.last_success_time: Optional[datetime] = None
         self.last_finish_time: Optional[datetime] = None
         self.is_running = False
@@ -56,8 +93,8 @@ class TaskScheduler(LoggerMixin):
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self.logger.info(
-            "定时任务调度器已启动：间隔 %s 分钟，启动延迟 %s 秒",
-            self.interval_minutes,
+            "定时任务调度器已启动：间隔 %s，启动延迟 %s 秒",
+            format_interval_label(self.interval_seconds),
             self.start_delay_seconds,
         )
 
@@ -107,15 +144,16 @@ class TaskScheduler(LoggerMixin):
                     self.logger.warning("任务执行失败，耗时: %.2f秒", duration)
 
                 # 无论成败，均从本轮结束起等待固定间隔
-                wait_seconds = float(self.interval_minutes) * 60.0
+                wait_seconds = float(self.interval_seconds)
                 next_time = end_time + timedelta(seconds=wait_seconds)
                 self.logger.info(
-                    "本轮结束，等待 %s 分钟后再次拉单（预计 %s）",
-                    self.interval_minutes,
+                    "本轮结束，等待 %s 后再次拉单（预计 %s）",
+                    format_interval_label(self.interval_seconds),
                     next_time.strftime("%Y-%m-%d %H:%M:%S"),
                 )
+                chunk = 1 if self.interval_seconds < 10 else 10
                 while wait_seconds > 0 and self.is_running:
-                    sleep_time = min(wait_seconds, 10)
+                    sleep_time = min(wait_seconds, chunk)
                     time.sleep(sleep_time)
                     wait_seconds -= sleep_time
 
@@ -128,7 +166,7 @@ class TaskScheduler(LoggerMixin):
         """获取下次执行时间。"""
         base = self.last_finish_time or self.last_success_time
         if base:
-            return base + timedelta(minutes=self.interval_minutes)
+            return base + timedelta(seconds=self.interval_seconds)
         return None
 
     def get_status(self) -> dict:
@@ -137,6 +175,7 @@ class TaskScheduler(LoggerMixin):
         return {
             "is_running": self.is_running,
             "interval_minutes": self.interval_minutes,
+            "interval_seconds": self.interval_seconds,
             "last_success_time": (
                 self.last_success_time.isoformat() if self.last_success_time else None
             ),
