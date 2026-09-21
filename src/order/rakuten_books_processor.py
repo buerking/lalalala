@@ -164,8 +164,10 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if not self.session_guard:
             return
         target = self._sanitize_books_resume_url(resume_url or "")
+        # 与市场购物车「購入手続き」一致：session/upgrade 可能异步跳转，最多等 8 秒
+        wait = min(max(float(wait_seconds), 0.2), 8.0)
         self.session_guard.ensure_after_possible_redirect(
-            resume_url=target or None, wait_seconds=min(float(wait_seconds), 1.5)
+            resume_url=target or None, wait_seconds=wait
         )
 
     @staticmethod
@@ -618,7 +620,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
             # 给跳转一点时间；确定后常出现 session/upgrade
             time.sleep(1.2)
-            self._ensure_session_after_action(wait_seconds=1.0)
+            self._ensure_session_after_action(wait_seconds=8.0)
             if self._is_books_success_page(driver):
                 return
             if self._is_books_cookie_invalid_page(driver):
@@ -947,7 +949,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
         driver.execute_script("arguments[0].click();", ck)
         time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
-        self._ensure_session_after_nav(driver)
+        self._ensure_session_after_action(wait_seconds=8.0)
 
     def _recover_from_cookie_error_via_cart(self, driver) -> bool:
         """
@@ -1050,7 +1052,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 next_btn.click()
             time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
             # 中间页跳转后可能被踢到统一登录 / session/upgrade
-            self._ensure_session_after_action(wait_seconds=1.0)
+            self._ensure_session_after_action(wait_seconds=8.0)
             round_idx += 1
 
         if self._recover_from_cookie_error_via_cart(driver):

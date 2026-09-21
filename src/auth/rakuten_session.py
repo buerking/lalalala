@@ -7,15 +7,16 @@
 策略偏「宽」：
   - 只认登录域名，绝不扫业务页 DOM
   - 按页面阶段信号推进：账号页 → 密码页 →（可选）2FA → 离开登录域
-  - 找控件用多选择器 + 文案 + JS；DOM 已有但不 is_displayed 时仍可填
-  - SPA（#/sign_in/password）给足渲染时间，避免误报「找不到 #password_current」
+  - 找控件：顶层 + 嵌套 iframe（按下标切）+ open/closed Shadow DOM
+  - SPA（#/sign_in/password）给足渲染时间；omni-21 壳层冻结则刷新再等 omni-11
+  - 已出现 iframe 时先搜框，避免把藏在 frame 里的表当冻壳刷掉
 """
 
 from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from selenium.webdriver.common.by import By
@@ -331,6 +332,45 @@ class RakutenSessionGuard(LoggerMixin):
         except Exception:
             return None
 
+    def _find_in_shadow_hosts(self, driver, selectors: Tuple[str, ...]):
+        """open shadow 用 JS；closed shadow 走 Selenium shadow_root（市场 login widget 同类）。"""
+        el = self._js_deep_find(driver, selectors)
+        if el is not None:
+            return el
+        hosts = []
+        try:
+            hosts = (
+                driver.execute_script(
+                    """
+                    var out = [];
+                    var all = document.getElementsByTagName('*');
+                    for (var i = 0; i < all.length && out.length < 48; i++) {
+                      var t = (all[i].tagName || '');
+                      if (t.indexOf('-') >= 0) out.push(all[i]);
+                    }
+                    return out;
+                    """
+                )
+                or []
+            )
+        except Exception:
+            hosts = []
+        for host in hosts:
+            try:
+                root = host.shadow_root
+            except Exception:
+                continue
+            if root is None:
+                continue
+            for sel in selectors:
+                try:
+                    found = root.find_element(By.CSS_SELECTOR, sel)
+                except Exception:
+                    found = None
+                if found is not None:
+                    return found
+        return None
+
     def _find_in_current_document(self, driver, selectors: Tuple[str, ...]):
         try:
             if "#password_current" in selectors or any(
@@ -350,15 +390,15 @@ class RakutenSessionGuard(LoggerMixin):
             el = self._first_present(driver, selectors)
             if el is not None:
                 return el
-        return self._js_deep_find(driver, selectors)
+        return self._find_in_shadow_hosts(driver, selectors)
 
     def _find_across_frames(self, driver, selectors: Tuple[str, ...], stay: bool = False):
-        """顶层 document → 嵌套 iframe。找到后 stay=True 则留在该 frame 以便填表。"""
+        """顶层 document → 嵌套 iframe（按下标切，避免 stale WebElement）。找到后 stay=True 则留在该 frame。"""
         self._reset_frame(driver)
         el = self._find_in_current_document(driver, selectors)
         if el is not None:
             return el
-        el = self._search_iframes(driver, selectors, stay=stay, depth=2, path="")
+        el = self._search_iframes(driver, selectors, stay=stay, depth=3, path="")
         if el is not None:
             return el
         self._reset_frame(driver)
@@ -367,18 +407,18 @@ class RakutenSessionGuard(LoggerMixin):
     def _search_iframes(self, driver, selectors: Tuple[str, ...], stay: bool, depth: int, path: str):
         if depth <= 0:
             return None
-        frames = []
+        n = 0
         try:
             with self._no_implicit_wait(driver):
-                frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+                n = len(driver.find_elements(By.CSS_SELECTOR, "iframe, frame"))
         except Exception:
-            frames = []
-        for i, fr in enumerate(frames):
+            n = 0
+        for i in range(n):
+            here = ("%s/%s" % (path, i)) if path else str(i)
             try:
-                driver.switch_to.frame(fr)
+                driver.switch_to.frame(i)
             except Exception:
                 continue
-            here = ("%s/%s" % (path, i)) if path else str(i)
             el = self._find_in_current_document(driver, selectors)
             if el is None:
                 el = self._search_iframes(driver, selectors, stay, depth - 1, here)
@@ -471,7 +511,13 @@ class RakutenSessionGuard(LoggerMixin):
                     attempt,
                     last_err,
                 )
-                time.sleep(0.8)
+                snap = self._widget_snapshot(driver)
+                if self._widget_looks_shell_only(snap):
+                    self._kick_stuck_login_widget(
+                        driver, "第 %s 轮第 %s 次仍无密码框" % (upgrade_round, attempt)
+                    )
+                else:
+                    time.sleep(0.8)
 
             if not round_ok:
                 if upgrade_round >= self.max_upgrade_rounds:
@@ -479,12 +525,23 @@ class RakutenSessionGuard(LoggerMixin):
                         "乐天自动登录失败（upgrade 第 %s 轮，已尝试 %s 次）: %s"
                         % (upgrade_round, self.max_login_attempts, last_err)
                     )
-                self.logger.warning(
-                    "乐天登录第 %s 轮未成功（%s），同一登录页继续下一轮（不刷新）",
-                    upgrade_round,
-                    last_err,
-                )
-                time.sleep(1.0)
+                snap = self._widget_snapshot(driver)
+                if self._widget_looks_shell_only(snap) or self._widget_ui_missing(snap):
+                    self.logger.warning(
+                        "乐天登录第 %s 轮未成功（%s），刷新卡住的 Omni 壳后再试",
+                        upgrade_round,
+                        last_err,
+                    )
+                    self._kick_stuck_login_widget(
+                        driver, "第 %s 轮结束后仍无表单" % upgrade_round
+                    )
+                else:
+                    self.logger.warning(
+                        "乐天登录第 %s 轮未成功（%s），同一登录页继续下一轮",
+                        upgrade_round,
+                        last_err,
+                    )
+                    time.sleep(1.0)
                 continue
 
             # 登录后若立刻又进 upgrade，继续；否则结束（不再固定空等）
@@ -562,35 +619,66 @@ class RakutenSessionGuard(LoggerMixin):
                   }
                   return false;
                 }
+                function hostsOf(doc) {
+                  var hosts = [];
+                  try {
+                    var all = doc.getElementsByTagName('*');
+                    for (var i = 0; i < all.length && hosts.length < 12; i++) {
+                      var t = (all[i].tagName || '').toLowerCase();
+                      if (t.indexOf('-') >= 0 && hosts.indexOf(t) < 0) hosts.push(t);
+                    }
+                  } catch (e) {}
+                  return hosts;
+                }
                 var pwd = document.getElementById('password_current');
                 var ce = window.customElements;
-                var hosts = [];
-                try {
-                  var all = document.getElementsByTagName('*');
-                  for (var i = 0; i < all.length && hosts.length < 12; i++) {
-                    var t = (all[i].tagName || '').toLowerCase();
-                    if (t.indexOf('-') >= 0 && hosts.indexOf(t) < 0) hosts.push(t);
-                  }
-                } catch (e) {}
+                var ifrs = document.querySelectorAll('iframe,frame');
+                var iframePwd = false, iframeH4k5 = false, iframeCta = false, iframeXo = 0;
+                for (var i = 0; i < ifrs.length; i++) {
+                  try {
+                    var d = ifrs[i].contentDocument;
+                    if (!d) { iframeXo++; continue; }
+                    if (d.getElementById('password_current')) iframePwd = true;
+                    if (d.getElementById('h4k5-container')) iframeH4k5 = true;
+                    if (d.getElementById('cta011') || d.getElementById('cta')) iframeCta = true;
+                    if (walkPwd(d)) iframePwd = true;
+                  } catch (e) { iframeXo++; }
+                }
                 return {
                   hash: String(location.hash || ''),
-                  pwd: !!pwd,
+                  pwd: !!pwd || iframePwd,
                   shadowPwd: walkPwd(document),
-                  h4k5: !!document.getElementById('h4k5-container'),
+                  h4k5: !!document.getElementById('h4k5-container') || iframeH4k5,
                   preview: !!document.getElementById('h4k5-preview'),
                   omniErr: !!document.getElementById('omni-error'),
-                  cta: !!document.getElementById('cta011'),
+                  cta: !!document.getElementById('cta011') || iframeCta,
                   anim: !!document.querySelector('.omni-main-view-animating'),
                   elm: (typeof Elm !== 'undefined'),
                   omni: !!(window.Rakuten && Rakuten.Omni),
                   challenger: !!(ce && ce.get && ce.get('r10-challenger')),
-                  iframe: document.querySelectorAll('iframe,frame').length,
-                  hosts: hosts,
+                  iframe: ifrs.length,
+                  iframePwd: iframePwd,
+                  iframeH4k5: iframeH4k5,
+                  iframeCta: iframeCta,
+                  iframeXo: iframeXo,
+                  hosts: hostsOf(document),
                   bodyLen: document.body ? (document.body.innerHTML || '').length : -1
                 };
                 """
             )
-            return snap if isinstance(snap, dict) else {}
+            snap = snap if isinstance(snap, dict) else {}
+            try:
+                xo = int(snap.get("iframeXo") or 0)
+            except Exception:
+                xo = 0
+            if xo > 0 and not snap.get("pwd"):
+                # JS 读不到跨域 iframe，Selenium switch_to.frame 可以
+                if self._find_across_frames(
+                    driver, self.PASSWORD_SELECTORS, stay=False
+                ):
+                    snap["pwd"] = True
+                    snap["iframePwd"] = True
+            return snap
         except Exception as e:
             return {"err": str(e)[:120]}
 
@@ -613,26 +701,118 @@ class RakutenSessionGuard(LoggerMixin):
 
     @staticmethod
     def _widget_ui_missing(snap: Dict[str, Any]) -> bool:
-        if snap.get("pwd") or snap.get("h4k5") or snap.get("cta") or snap.get("shadowPwd"):
+        if (
+            snap.get("pwd")
+            or snap.get("h4k5")
+            or snap.get("cta")
+            or snap.get("shadowPwd")
+            or snap.get("iframePwd")
+            or snap.get("iframeH4k5")
+            or snap.get("iframeCta")
+        ):
             return False
         return bool(snap.get("elm") or snap.get("omni") or snap.get("challenger"))
 
+    @staticmethod
+    def _widget_host_names(snap: Dict[str, Any]) -> List[str]:
+        hosts = snap.get("hosts") or []
+        if not isinstance(hosts, list):
+            return []
+        return [str(h or "").lower() for h in hosts]
+
+    def _widget_looks_shell_only(self, snap: Dict[str, Any]) -> bool:
+        """hash 已是密码步，但只有 omni-21/Elm 壳，没有 omni-11 和密码框（1061053）。"""
+        if not self._widget_ui_missing(snap):
+            return False
+        if snap.get("anim"):
+            return False
+        # 表单可能在 iframe / 跨域 frame 里，先搜框再刷新（市场结算曾踩过）
+        try:
+            if int(snap.get("iframe") or 0) > 0 or int(snap.get("iframeXo") or 0) > 0:
+                return False
+        except Exception:
+            pass
+        hosts = self._widget_host_names(snap)
+        has_omni21 = any(h.startswith("omni-21") for h in hosts)
+        has_omni11 = any(h.startswith("omni-11") for h in hosts)
+        if has_omni21 and not has_omni11:
+            return True
+        if snap.get("omniErr"):
+            return True
+        hash_v = str(snap.get("hash") or "").lower()
+        if "sign_in/password" in hash_v and not has_omni11:
+            return True
+        return False
+
+    def _kick_stuck_login_widget(self, driver, reason: str) -> None:
+        """Omni 壳卡住时刷新当前登录 URL，让 omni-11 重新注入（勿在已出表单时调用）。"""
+        if not self.is_login_page(driver):
+            return
+        snap = self._widget_snapshot(driver)
+        url = ""
+        try:
+            url = (driver.current_url or "").strip()
+        except Exception:
+            url = ""
+        self.logger.warning(
+            "乐天登录 widget 卡住（%s），刷新登录页以重新注入 Omni snap=%s",
+            reason,
+            snap,
+        )
+        try:
+            driver.refresh()
+        except Exception as e:
+            self.logger.warning("登录页 refresh 失败: %s，改 GET 当前 URL", e)
+            if url:
+                try:
+                    driver.get(url)
+                except Exception as e2:
+                    self.logger.warning("登录页 GET 重开失败: %s", e2)
+                    return
+        time.sleep(1.5)
+
     def _wait_form_ready(self, driver) -> str:
-        """等到能取到 #password_current / 账号框（含 visibility:hidden）。同一页继续轮询，不提前刷新。"""
+        """等到能取到 #password_current / 账号框。壳层冻结则刷新一次再等。"""
         deadline = time.time() + max(3.0, self.form_ready_seconds)
         last_stage = STAGE_LOGIN_UNKNOWN
         logged_shell = False
         last_miss_log = 0.0
+        last_body = None
+        stagnant_since = time.time()
+        kicked = False
         while time.time() < deadline:
             last_stage = self.detect_stage(driver)
             if last_stage == STAGE_PROFILE:
                 return last_stage
             snap = self._widget_snapshot(driver)
             if not logged_shell and (
-                snap.get("h4k5") or snap.get("pwd") or snap.get("elm") or snap.get("omni")
+                snap.get("h4k5")
+                or snap.get("pwd")
+                or snap.get("elm")
+                or snap.get("omni")
+                or int(snap.get("iframe") or 0) > 0
             ):
                 self.logger.info("乐天登录 widget 快照 %s", snap)
                 logged_shell = True
+            body = snap.get("bodyLen")
+            if body != last_body:
+                last_body = body
+                stagnant_since = time.time()
+            if (
+                not kicked
+                and self._widget_looks_shell_only(snap)
+                and (time.time() - stagnant_since) >= 10.0
+            ):
+                self._kick_stuck_login_widget(driver, "密码步壳层超过 10 秒未注入表单")
+                kicked = True
+                logged_shell = False
+                last_body = None
+                stagnant_since = time.time()
+                last_miss_log = 0.0
+                deadline = max(
+                    deadline, time.time() + max(10.0, self.form_ready_seconds * 0.7)
+                )
+                continue
             if self._widget_ui_missing(snap) and (time.time() - last_miss_log) >= 8.0:
                 self.logger.info(
                     "登录页脚本已加载但尚未取到密码框，继续等 snap=%s", snap
@@ -801,6 +981,8 @@ class RakutenSessionGuard(LoggerMixin):
     def _click_next(self, driver) -> None:
         with self._no_implicit_wait(driver):
             btn = self._find_next_button(driver)
+        if btn is None:
+            btn = self._find_in_shadow_hosts(driver, self.CTA_SELECTORS)
         if btn is None:
             btn = self._js_deep_find(driver, self.CTA_SELECTORS)
         if btn is None:
