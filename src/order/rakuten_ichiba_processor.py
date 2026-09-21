@@ -270,10 +270,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
 
     @staticmethod
     def _line_no_for_check_cart(product: Dict[str, Any]) -> str:
-        return (
-            str(product.get("goods_no") or "").strip()
-            or str(product.get("goods_id") or "").strip()
-        )
+        """checkCart 对账键必须是 List.GoodsNo；空时不要用 GoodsId 顶替。"""
+        return str(product.get("goods_no") or "").strip()
 
     @staticmethod
     def _api_goods_id_and_no(product: Dict[str, Any]) -> Tuple[str, str]:
@@ -5092,52 +5090,76 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
 
         if not goods_list:
-            return False, self._make_summary(
-                order,
-                failure_reason="无法组装结算校验商品列表（请确认接口 List 含 goods_no）",
-            )
-
-        shot_path = None
-        try:
-            shot_path = take_full_page_screenshot(driver)
-            screen_url = upload_screenshot_get_url(shot_path, self.config)
-            if not screen_url:
-                return False, self._make_summary(order, failure_reason="截图上传失败")
-            ok_chk, chk_err, chk_raw = check_cart_goods_simple(
-                order,
-                total=total,
-                goods_fee=goods_fee,
-                operate_fee=operate_fee,
-                screenshot_url=screen_url,
-                config=self.config,
-                goods_list_override=goods_list,
-                use_curl=use_curl,
-            )
-        finally:
-            if shot_path:
-                try:
-                    import os
-
-                    os.remove(shot_path)
-                except Exception:
-                    pass
-
-        if not ok_chk:
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [chk_err or "checkCartGoodsSimple 失败"],
-                    user_id=order.get("user_id"),
-                    extra="乐天市场结算校验失败（购物车金额）",
+            if missing_gno_notified:
+                self.logger.warning(
+                    "乐天市场：缺 GoodsNo，无法按接口 No 组装 checkCart，跳过校验并继续结算 "
+                    "Total=%s GoodsFee=%s OperateFee=%s",
+                    total,
+                    goods_fee,
+                    operate_fee,
                 )
-            except Exception:
-                pass
-            return False, self._make_summary(
-                order,
-                failure_reason=chk_err or "checkCartGoodsSimple 失败",
-                check_cart_requested=True,
-                check_cart_response=(chk_raw or "")[:500],
-            )
+                ok_chk, chk_err, chk_raw = True, "", "skip_empty_goods_no"
+            else:
+                return False, self._make_summary(
+                    order,
+                    failure_reason="无法组装结算校验商品列表（请确认接口 List 含 goods_no）",
+                )
+        else:
+            ok_chk, chk_err, chk_raw = False, "", ""
+            shot_path = None
+            try:
+                shot_path = take_full_page_screenshot(driver)
+                screen_url = upload_screenshot_get_url(shot_path, self.config)
+                if not screen_url:
+                    return False, self._make_summary(order, failure_reason="截图上传失败")
+                ok_chk, chk_err, chk_raw = check_cart_goods_simple(
+                    order,
+                    total=total,
+                    goods_fee=goods_fee,
+                    operate_fee=operate_fee,
+                    screenshot_url=screen_url,
+                    config=self.config,
+                    goods_list_override=goods_list,
+                    use_curl=use_curl,
+                )
+                self.logger.info(
+                    "乐天市场：checkCart 结果 ok=%s err=%s GoodsList=%s raw=%s",
+                    ok_chk,
+                    chk_err or "",
+                    goods_list,
+                    (chk_raw or "")[:400],
+                )
+            finally:
+                if shot_path:
+                    try:
+                        import os
+
+                        os.remove(shot_path)
+                    except Exception:
+                        pass
+
+            if not ok_chk:
+                if missing_gno_notified:
+                    self.logger.warning(
+                        "乐天市场：checkCart 失败但本单缺 GoodsNo，忽略并继续结算 err=%s",
+                        chk_err,
+                    )
+                else:
+                    try:
+                        self.feishu_notifier.notify_order_issue(
+                            str(order_id),
+                            [chk_err or "checkCartGoodsSimple 失败"],
+                            user_id=order.get("user_id"),
+                            extra="乐天市场结算校验失败（购物车金额）",
+                        )
+                    except Exception:
+                        pass
+                    return False, self._make_summary(
+                        order,
+                        failure_reason=chk_err or "checkCartGoodsSimple 失败",
+                        check_cart_requested=True,
+                        check_cart_response=(chk_raw or "")[:500],
+                    )
 
         try:
             self._shop_checkout(driver)
