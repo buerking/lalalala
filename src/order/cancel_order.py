@@ -5,13 +5,14 @@
 
 import json
 import subprocess
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 from urllib.parse import urlencode
 
 from src.utils.sign_generator import SignGenerator
 from src.utils.retry import call_api_with_retries, is_transient_http_error
 
 DEFAULT_CANCEL_REASON = "整单商品均已售出"
+LIMIT_CANCEL_REASON = "限购商品已达上限"
 
 
 def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30) -> Tuple[int, str]:
@@ -155,3 +156,86 @@ def send_cancel_order_simple(
     if isinstance(result, tuple) and len(result) == 3:
         return result  # type: ignore[return-value]
     return False, "请求异常: %s" % result, ""
+
+
+def looks_like_purchase_limit(text: str) -> bool:
+    blob = str(text or "")
+    keys = (
+        "限购商品已达上限",
+        "购物车限购",
+        "enablePurchase=false",
+        "購入可能",
+        "注文個数",
+        "個数に制限",
+        "個数を超えて",
+        "購入手続き」不可点击",
+    )
+    return any(k in blob for k in keys)
+
+
+def auto_cancel_and_notify(
+    order: Dict[str, Any],
+    config: Dict[str, Any],
+    messages: List[str],
+    *,
+    reason: str = LIMIT_CANCEL_REASON,
+    feishu_notifier: Any,
+    logger: Any,
+    ticket_creator: Any = None,
+    human_reason: str = "",
+) -> bool:
+    """
+    调用 cancelOrderSimple。
+    成功：只发记录群（无需人工）。失败：工单 + 人工飞书。
+    """
+    order_id = str((order or {}).get("order_id") or "未知")
+    user_id = (order or {}).get("user_id")
+    use_curl = (config.get("order_api") or {}).get("use_curl_for_order_api", True)
+    msgs = [str(m) for m in (messages or []) if str(m).strip()]
+    if not msgs:
+        msgs = [reason]
+    try:
+        ok, err, raw = send_cancel_order_simple(
+            order, config, reason=reason, use_curl=bool(use_curl)
+        )
+    except Exception as e:
+        ok, err, raw = False, "调用异常: %s" % e, ""
+    if ok:
+        if logger:
+            logger.info("售罄/限购已自动删单退款 order=%s reason=%s", order_id, reason)
+        record_msgs = list(msgs) + ["已调用 cancelOrderSimple 自动删单退款"]
+        try:
+            feishu_notifier.notify_order_issue(
+                order_id,
+                record_msgs,
+                user_id=user_id,
+                extra="已自动删单退款，无需人工；本消息仅作记录，供后期反向查询。",
+                use_record_webhook=True,
+            )
+        except Exception as e:
+            if logger:
+                logger.warning("飞书记录群提醒失败: %s", e)
+        return True
+    fail_msgs = list(msgs) + ["cancelOrderSimple 失败: %s" % (err or "未知")]
+    if raw:
+        fail_msgs.append("响应: %s" % str(raw)[:300])
+    if logger:
+        logger.warning("自动删单失败，仍通知人工 order=%s err=%s", order_id, err)
+    extra = (human_reason or "自动删单失败，请人工处理。")
+    if ticket_creator is not None:
+        try:
+            ticket_creator.create_ticket(order_id, fail_msgs, user_id=user_id)
+        except Exception as e:
+            if logger:
+                logger.error("创建工单失败: %s", e)
+    try:
+        feishu_notifier.notify_order_issue(
+            order_id,
+            fail_msgs,
+            user_id=user_id,
+            extra=extra,
+        )
+    except Exception as e:
+        if logger:
+            logger.warning("飞书提醒失败: %s", e)
+    return False

@@ -28,6 +28,11 @@ from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
 from src.order.added_cart_callback import send_added_cart_callback
+from src.order.cancel_order import (
+    LIMIT_CANCEL_REASON,
+    auto_cancel_and_notify,
+    looks_like_purchase_limit,
+)
 from src.order.update_goods_no_callback import send_update_goods_no_callback
 from src.payment.confirm_page_verifier import (
     take_full_page_screenshot,
@@ -437,6 +442,82 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             pass
         return None
 
+    def _books_commit_button_disabled(self, driver, btn=None) -> bool:
+        el = btn if btn is not None else self._find_books_commit_button(driver)
+        if el is None:
+            return False
+        try:
+            if bool(el.get_attribute("disabled")):
+                return True
+            aria = (el.get_attribute("aria-disabled") or "").strip().lower()
+            if aria in ("true", "1"):
+                return True
+            cls = (el.get_attribute("class") or "").lower()
+            if "disabled" in cls.split() or "btn-red disabled" in cls:
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _books_purchase_limit_reason(self, driver) -> str:
+        """
+        确认页限购：警告文案 + 「注文を確定する」禁用。
+        例：ご注文可能な個数に制限のある商品がございました。
+        """
+        src = ""
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            src = ""
+        hints: List[str] = []
+        page_keys = (
+            "ご注文可能な個数に制限",
+            "購入可能な個数を超えて",
+            "購入可能な数量に限り",
+            "個数に制限のある商品",
+        )
+        for k in page_keys:
+            if k in src:
+                hints.append(k)
+        try:
+            for el in driver.find_elements(
+                By.CSS_SELECTOR,
+                ".alert, .txt-red, .information, [class*='warning'], [class*='caution']",
+            ):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    t = " ".join((el.text or "").split())
+                except Exception:
+                    continue
+                if t and any(
+                    x in t
+                    for x in ("個数に制限", "購入可能な個数", "購入可能な数量", "ご購入いただけません")
+                ):
+                    if t not in hints:
+                        hints.append(t[:200])
+        except Exception:
+            pass
+        disabled = self._books_commit_button_disabled(driver)
+        if not hints:
+            return ""
+        msg = "限购商品已达上限: " + "；".join(hints[:3])
+        if disabled:
+            msg += "；注文を確定する已禁用"
+        return msg
+
+    def _handle_purchase_limit_cancel(self, order: Dict[str, Any], messages: List[str]) -> None:
+        auto_cancel_and_notify(
+            order,
+            self.config,
+            messages,
+            reason=LIMIT_CANCEL_REASON,
+            feishu_notifier=self.feishu_notifier,
+            logger=self.logger,
+            ticket_creator=self.ticket_creator,
+            human_reason="乐天书店限购自动删单失败，请人工处理。",
+        )
+
     def _click_books_commit_order(self, driver, commit_sel: str = "") -> None:
         """
         点击书店确认页「注文を確定する」。
@@ -461,6 +542,17 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             btn = self._find_books_commit_button(driver, commit_sel)
             if btn is None:
                 last_err = "未找到「注文を確定する」按钮"
+                self.logger.warning("乐天书店：%s（第 %s 次）", last_err, attempt)
+                time.sleep(1.5)
+                continue
+
+            limit = self._books_purchase_limit_reason(driver)
+            if limit or self._books_commit_button_disabled(driver, btn):
+                if not limit:
+                    limit = self._books_purchase_limit_reason(driver)
+                if limit:
+                    raise RuntimeError(limit)
+                last_err = "注文を確定する已禁用"
                 self.logger.warning("乐天书店：%s（第 %s 次）", last_err, attempt)
                 time.sleep(1.5)
                 continue
@@ -1098,8 +1190,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             for line in lines:
                 _gid, no = self._api_goods_id_and_no(line)
                 if not no:
-                    no = _gid
-                if not no:
                     continue
                 try:
                     price = int(round(float(line.get("price") or 0)))
@@ -1512,7 +1602,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             if total > 0 and goods_fee + operate_fee != total:
                 operate_fee = total - goods_fee
 
-        # checkCart 优先用接口 GoodsNo（市场转书店时确认页 DOM 常对不上）
+        # 仅当接口真有 GoodsNo 时，才用它对账；空 GoodsNo 不要用 GoodsId 顶替
         order_goods = self._goods_list_from_order_products(products, order)
         if order_goods:
             # 页面有单价时覆写价格，数量以订单为准（合并后更稳）
@@ -1578,6 +1668,13 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 goods_list_override=goods_list,
                 use_curl=use_curl,
             )
+            self.logger.info(
+                "乐天书店：checkCart 结果 ok=%s err=%s GoodsList=%s raw=%s",
+                ok_chk,
+                chk_err or "",
+                goods_list,
+                (chk_raw or "")[:400],
+            )
             # 与乐天市场一致：不调 getOrderSimple 刷 Mark 重试
         finally:
             if shot_path:
@@ -1592,7 +1689,12 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             allow_continue = bool(
                 self.rb_cfg.get("commit_even_if_check_cart_fails", False)
             )
-            if allow_continue:
+            if missing_gno_notified:
+                self.logger.warning(
+                    "乐天书店：checkCart 失败但本单缺 GoodsNo，忽略并对确认页点确定 err=%s",
+                    chk_err,
+                )
+            elif allow_continue:
                 # 市场→书店转交常见 Mark/状态不一致；继续下单，勿发「需人工」以免误判整单失败
                 self.logger.warning(
                     "乐天书店：checkCart 失败仍继续点「注文を確定する」 err=%s",
@@ -1629,6 +1731,16 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 pass
             if not self._is_books_confirm_page(driver):
                 self._pass_books_checkout_intermediates(driver)
+            limit = self._books_purchase_limit_reason(driver)
+            if limit:
+                self.logger.warning("乐天书店：%s order=%s", limit, order_id)
+                self._handle_purchase_limit_cancel(order, [limit])
+                return False, self._make_summary(
+                    order,
+                    failure_reason=limit,
+                    check_cart_requested=True,
+                    check_cart_response="ok" if ok_chk else (chk_err or "checkCart失败"),
+                )
             self._click_books_commit_order(driver, commit_sel)
         except Exception as e:
             from src.utils.dev_test import DevTestStopBeforePurchase
@@ -1642,9 +1754,20 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     check_cart_requested=True,
                     check_cart_response="ok",
                 )
+            msg = "点击注文確定失败: %s" % e
+            if looks_like_purchase_limit(msg) or self._books_purchase_limit_reason(driver):
+                limit = self._books_purchase_limit_reason(driver) or msg
+                self.logger.warning("乐天书店：%s order=%s", limit, order_id)
+                self._handle_purchase_limit_cancel(order, [limit])
+                return False, self._make_summary(
+                    order,
+                    failure_reason=limit,
+                    check_cart_requested=True,
+                    check_cart_response="ok",
+                )
             return False, self._make_summary(
                 order,
-                failure_reason="点击注文確定失败: %s" % e,
+                failure_reason=msg,
                 check_cart_requested=True,
                 check_cart_response="ok",
             )
@@ -1672,16 +1795,50 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     self.logger.warning("乐天书店：Cookie 无效页恢复失败: %s", e)
                 time.sleep(1.5)
                 continue
-            # 仍停在确认页：再点一次确定（偶发第一次未真正提交）
+            # 仍停在确认页：限购则删单；否则再点一次确定
             if self._is_books_confirm_page(driver) and (deadline - time.time()) > 30:
+                limit = self._books_purchase_limit_reason(driver)
+                if limit:
+                    self.logger.warning("乐天书店：等待完了页期间确认限购 order=%s %s", order_id, limit)
+                    self._handle_purchase_limit_cancel(order, [limit])
+                    return False, self._make_summary(
+                        order,
+                        failure_reason=limit,
+                        check_cart_requested=True,
+                        check_cart_response="ok" if ok_chk else (chk_err or "checkCart失败"),
+                    )
                 try:
                     self.logger.warning("乐天书店：等待完了页期间仍在确认页，再次点击确定")
                     self._click_books_commit_order(driver, commit_sel)
                 except Exception as e:
+                    if looks_like_purchase_limit(str(e)):
+                        limit = str(e)
+                        self._handle_purchase_limit_cancel(order, [limit])
+                        return False, self._make_summary(
+                            order,
+                            failure_reason=limit,
+                            check_cart_requested=True,
+                            check_cart_response="ok",
+                        )
                     self.logger.warning("乐天书店：再次点击确定失败: %s", e)
             time.sleep(1.5)
 
         if not ok_page:
+            limit = ""
+            try:
+                if self._is_books_confirm_page(driver):
+                    limit = self._books_purchase_limit_reason(driver)
+            except Exception:
+                limit = ""
+            if limit:
+                self.logger.warning("乐天书店：完了页超时且确认为限购 order=%s %s", order_id, limit)
+                self._handle_purchase_limit_cancel(order, [limit, driver.current_url or ""])
+                return False, self._make_summary(
+                    order,
+                    failure_reason=limit,
+                    check_cart_requested=True,
+                    check_cart_response="ok" if ok_chk else (chk_err or "checkCart失败"),
+                )
             msg = "乐天书店：超时未检测到注文完了页"
             self.logger.error("%s URL=%s", msg, getattr(driver, "current_url", ""))
             try:

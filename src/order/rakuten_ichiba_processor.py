@@ -23,6 +23,11 @@ from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
 from src.order.added_cart_callback import send_added_cart_callback
+from src.order.cancel_order import (
+    LIMIT_CANCEL_REASON,
+    auto_cancel_and_notify,
+    looks_like_purchase_limit,
+)
 from src.order.update_goods_no_callback import send_update_goods_no_callback
 from src.order.rakuten_spec_check import (
     compare_order_and_cart_specs,
@@ -4430,6 +4435,36 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             return "购物车「購入手続き」不可点击: " + "；".join(hints[:3])
         return ""
 
+    def _ichiba_confirm_limit_reason(self, driver) -> str:
+        src = ""
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            src = ""
+        keys = (
+            "ご注文可能な個数に制限",
+            "購入可能な個数を超えて",
+            "注文個数が購入可能数を超えております",
+            "個数に制限のある商品",
+            "購入可能な数量に限り",
+        )
+        hits = [k for k in keys if k in src]
+        if not hits:
+            return ""
+        return "限购商品已达上限: " + "；".join(hits[:3])
+
+    def _handle_purchase_limit_cancel(self, order: Dict[str, Any], messages: List[str]) -> None:
+        auto_cancel_and_notify(
+            order,
+            self.config,
+            messages,
+            reason=LIMIT_CANCEL_REASON,
+            feishu_notifier=self.feishu_notifier,
+            logger=self.logger,
+            ticket_creator=self.ticket_creator,
+            human_reason="乐天市场限购自动删单失败，请人工处理。",
+        )
+
     def _shop_checkout(self, driver) -> None:
         self._ensure_cart_page(driver, quick=False)
         self._dismiss_interruptions(driver)
@@ -5109,15 +5144,18 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         except Exception as e:
             msg = "进入店铺结算失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [msg],
-                    user_id=order.get("user_id"),
-                    extra="乐天市场：购物车无法进入購入手続き（常见：限购导致按钮禁用）。",
-                )
-            except Exception:
-                pass
+            if looks_like_purchase_limit(msg):
+                self._handle_purchase_limit_cancel(order, [msg])
+            else:
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [msg],
+                        user_id=order.get("user_id"),
+                        extra="乐天市场：购物车无法进入購入手続き。",
+                    )
+                except Exception:
+                    pass
             return False, self._make_summary(
                 order,
                 failure_reason=msg,
@@ -5141,6 +5179,16 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             or '.commit-order-button button[aria-label="注文を確定する"]'
         ).strip()
         try:
+            confirm_limit = self._ichiba_confirm_limit_reason(driver)
+            if confirm_limit:
+                self.logger.warning("乐天市场：%s order=%s", confirm_limit, order_id)
+                self._handle_purchase_limit_cancel(order, [confirm_limit])
+                return False, self._make_summary(
+                    order,
+                    failure_reason=confirm_limit,
+                    check_cart_requested=True,
+                    check_cart_response="ok",
+                )
             # 点注文確定；若之后才弹出お届け日時，选最短お届け日→決定する，必要时再点一次確定
             self._commit_order_with_delivery_modal_gate(driver, commit_sel)
         except Exception as e:
@@ -5157,15 +5205,25 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 )
             msg = "点击注文確定失败: %s" % e
             self.logger.error("乐天市场：%s order=%s", msg, order_id)
+            confirm_limit = ""
             try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [msg],
-                    user_id=order.get("user_id"),
-                    extra="乐天市场：确认页无法完成注文確定（含お届け日時弹窗）。",
-                )
+                confirm_limit = self._ichiba_confirm_limit_reason(driver)
             except Exception:
-                pass
+                confirm_limit = ""
+            if looks_like_purchase_limit(msg) or confirm_limit:
+                self._handle_purchase_limit_cancel(
+                    order, [confirm_limit or msg]
+                )
+            else:
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [msg],
+                        user_id=order.get("user_id"),
+                        extra="乐天市场：确认页无法完成注文確定（含お届け日時弹窗）。",
+                    )
+                except Exception:
+                    pass
             return False, self._make_summary(
                 order,
                 failure_reason=msg,
