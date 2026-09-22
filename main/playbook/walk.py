@@ -139,5 +139,30 @@ def page_label(page: Dict[str, Any], index: int) -> str:
     return str(page.get("title") or page.get("id") or "第%s页" % (index + 1))
 
 
+def purchase_page_index(pages: List[Dict[str, Any]], stage: Dict[str, Any] = None) -> int:
+    """付款/下单关键页下标：显式 is_purchase，否则 purchase_page_id，否则最后一页带按钮的。"""
+    if not pages:
+        return 0
+    marked = [
+        i
+        for i, p in enumerate(pages)
+        if isinstance(p, dict) and (p.get("is_purchase") is True or p.get("dry_run_stop") is True)
+    ]
+    if marked:
+        return marked[-1]
+    pid = str((stage or {}).get("purchase_page_id") or "").strip()
+    if pid:
+        for i, p in enumerate(pages):
+            if str((p or {}).get("id") or "").strip() == pid:
+                return i
+    last_btn = None
+    for i, p in enumerate(pages):
+        if has_action((p or {}).get("next_button") or (p or {}).get("button")):
+            last_btn = i
+    if last_btn is not None:
+        return last_btn
+    return len(pages) - 1
+
+
 def need_arrived(page: Dict[str, Any]) -> bool:
     return has_configured_arrived(page.get("arrived"))

@@ -155,6 +155,7 @@ confirm_pay:
       checkboxes: []
       next_button:
         primary: [{by: text, value: "注文を確定する"}]
+      is_purchase: true   # 试运行停在点这个按钮之前
   success_arrived:            # 点完最后一页后，必须到达的成功页
     wait_seconds: 90
     url_contains: []          # 成功页 URL
@@ -172,6 +173,15 @@ complete:
     purchase_url:
       primary: []
       source: href
+
+# ⑥ 浏览器试运行（dry-run）：每个站点一条测试商品，真开 Chrome 跑到付款按钮前。
+dry_run:
+  order:
+    url: ""
+    goods_id: "1"
+    goods_no: ""
+    quantity: 1
+    price: 0
 
 threeds:
   detect_texts: []

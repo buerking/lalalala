@@ -240,8 +240,8 @@ class OrderFetcher(LoggerMixin):
         _print_debug("secret 长度 (固定全局密钥，用于 getOrderListSimple 验签):", len(self.secret))
         _print_debug("use_curl_for_order_api:", self.use_curl_for_order_api)
 
-        self.logger.info("[订单接口] 请求 URL: %s, PcMark: %s, verify_ssl: %s, use_tls12: %s",
-                         url, self.pc_mark, self.verify_ssl, self.use_tls12)
+        self.logger.info("[订单接口] 请求 URL: %s, PcMark: %s, verify_ssl: %s, use_tls12: %s, timeout=%ss",
+                         url, self.pc_mark, self.verify_ssl, self.use_tls12, self.timeout)
 
         sign_generator = SignGenerator(self.secret)
 

@@ -321,6 +321,11 @@ const SIMPLE_FIELDS = {
   f_pay_after: {path:"confirm_pay.wait_after_click_seconds", kind:"num", label:"确认支付点击后等待秒"},
   f_allow_item_fallback: {path:"complete.allow_item_id_fallback", kind:"bool", label:"注文号回退 item_id"},
   f_purchase_url_template: {path:"identity.purchase_url_template", kind:"str", label:"订单详情 URL 模板"},
+  f_dry_url: {path:"dry_run.order.url", kind:"str", label:"测试商品 URL"},
+  f_dry_gid: {path:"dry_run.order.goods_id", kind:"str", label:"测试 GoodsId"},
+  f_dry_gno: {path:"dry_run.order.goods_no", kind:"str", label:"测试 GoodsNo"},
+  f_dry_qty: {path:"dry_run.order.quantity", kind:"num", label:"测试数量"},
+  f_dry_price: {path:"dry_run.order.price", kind:"num", label:"测试单价"},
 };
 function coerceValue(kind, raw) {
   const s = String(raw ?? "");
@@ -445,6 +450,10 @@ function pagesBox(prefix, pages, extraHint) {
       </div>
       ${arrivedBox(prefix+"_p"+i, p.arrived, "确认已经到这一页。本页没特征可留空，靠上一页点完自然进入。")}
       ${locBox(nextPath, p.next_button || p.button, "本页下一步按钮（checkCart 最后一页留空；确认支付最后一页是「确定下单」）")}
+      ${prefix === "pay" ? `<label class="hint" style="display:flex;align-items:center;gap:8px;margin:8px 0 0">
+        <input type="radio" name="pay_is_purchase" id="pay_p${i}_is_purchase" ${p.is_purchase ? "checked" : ""} onchange="markPurchase(${i})" />
+        这是付款/下单关键按钮（试运行会点到这里停下，不点确定）
+      </label>` : ""}
       ${locBox(boxPath, locSpecOf(p.checkboxes), "本页勾选（没有就全留空）")}
       <button type="button" class="ghost" onclick="removePage('${prefix}', ${i})">删掉本页</button>
     </div>`;
@@ -471,6 +480,10 @@ function collectPages(prefix) {
       checkboxes: readLocBox(stage+".pages."+i+".checkboxes", []),
     };
     if (waitRaw) row.wait_after_load_seconds = Number(waitRaw);
+    if (prefix === "pay") {
+      const mark = $("#pay_p"+i+"_is_purchase");
+      row.is_purchase = !!(mark && mark.checked);
+    }
     if (Array.isArray(row.checkboxes) && row.checkboxes[0] && !locItems(row.checkboxes[0].locators || {}).length) {
       row.checkboxes = [];
     }
@@ -594,6 +607,22 @@ function renderEditor(d) {
       ${locBox("complete.extract.purchase_url", (done.extract||{}).purchase_url, "订单详情链接（找到元素后读 href）")}
     </div>
 
+    <div class="card step">
+      <h2>⑥ 浏览器试运行（dry-run）</h2>
+      <p class="api">每个站点一条测试商品。真开 Chrome 走 ①～④，在「付款关键按钮」前停下：不点确定、不打生产 EDI。请先停止 GUI 里该站 Tab，避免抢同一用户目录。</p>
+      ${field("测试商品 URL", "f_dry_url", ((d.dry_run||{}).order||{}).url || "")}
+      ${field("测试 GoodsId", "f_dry_gid", ((d.dry_run||{}).order||{}).goods_id || "1")}
+      ${field("测试 GoodsNo（可空）", "f_dry_gno", ((d.dry_run||{}).order||{}).goods_no || "")}
+      ${field("测试数量", "f_dry_qty", ((d.dry_run||{}).order||{}).quantity || 1)}
+      ${field("测试单价（可 0，以页面为准）", "f_dry_price", ((d.dry_run||{}).order||{}).price || 0)}
+      <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap">
+        <button type="button" onclick="runDryRun()">保存并试运行到付款前</button>
+        <button type="button" class="ghost" onclick="stopDryRun()">关闭试运行浏览器</button>
+      </div>
+      <div class="ok-tip" id="tip_dry_run" style="text-align:left; margin-top:8px"></div>
+      <pre id="dry_run_log" style="max-height:240px; margin-top:8px"></pre>
+    </div>
+
     <div class="card">
       <div class="ok-col" style="flex:0 0 auto; width:auto; align-items:flex-start">
         <button onclick="save()">保存本页全部</button>
@@ -712,6 +741,15 @@ function collect() {
   const pu = d.complete.extract.purchase_url || {};
   if (!pu.source) pu.source = "href";
   d.complete.extract.purchase_url = pu;
+  d.dry_run = Object.assign({}, d.dry_run||{}, {
+    order: Object.assign({}, (d.dry_run||{}).order||{}, {
+      url: ($("#f_dry_url")||{}).value || "",
+      goods_id: ($("#f_dry_gid")||{}).value || "1",
+      goods_no: ($("#f_dry_gno")||{}).value || "",
+      quantity: Number(($("#f_dry_qty")||{}).value || 1),
+      price: Number(($("#f_dry_price")||{}).value || 0),
+    }),
+  });
   delete d.checkout;
   delete d.pages;
   delete d.callbacks;
@@ -736,6 +774,39 @@ async function newSite() {
 async function shutdown() {
   try { await api("/api/shutdown", {method:"POST"}); setStatus("正在关闭…", true); }
   catch (e) { setStatus(String(e.message||e), false); }
+}
+async function markPurchase(idx) {
+  try {
+    const d = collect();
+    (d.confirm_pay.pages || []).forEach((p, i) => { p.is_purchase = i === idx; });
+    await persistSite(d, "已标记付款关键步", "tip_dry_run");
+  } catch (e) { setTip("tip_dry_run", String(e.message||e), false); }
+}
+async function runDryRun() {
+  try {
+    if (!currentId) throw new Error("请先选站点");
+    const d = collect();
+    await persistSite(d, "已保存测试订单", "tip_dry_run");
+    setTip("tip_dry_run", "浏览器试运行中，请看弹出的 Chrome…", true);
+    $("#dry_run_log").textContent = "";
+    const r = await fetch("/api/sites/"+encodeURIComponent(currentId)+"/dry-run", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({order: (d.dry_run||{}).order || {}}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || j.message || r.statusText);
+    const lines = (j.logs || []).join("\n");
+    $("#dry_run_log").textContent = lines || JSON.stringify(j.summary || {}, null, 2);
+    setTip("tip_dry_run", (j.ok ? "试运行完成：" : "试运行失败：") + (j.message || "") + (j.url ? "\n当前 URL: "+j.url : ""), !!j.ok);
+  } catch (e) { setTip("tip_dry_run", String(e.message||e), false); }
+}
+async function stopDryRun() {
+  try {
+    if (!currentId) throw new Error("请先选站点");
+    const j = await api("/api/sites/"+encodeURIComponent(currentId)+"/dry-run/stop", {method:"POST"});
+    setTip("tip_dry_run", j.message || "已关闭", true);
+  } catch (e) { setTip("tip_dry_run", String(e.message||e), false); }
 }
 refreshList().then(async () => {
   const first = document.querySelector("aside li");

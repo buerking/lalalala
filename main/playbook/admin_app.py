@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,6 +30,10 @@ class SitePayload(BaseModel):
 class NewSitePayload(BaseModel):
     id: str
     display_name: str = ""
+
+
+class DryRunPayload(BaseModel):
+    order: Dict[str, Any] = Field(default_factory=dict)
 
 
 def create_app() -> FastAPI:
@@ -114,6 +118,31 @@ def create_app() -> FastAPI:
 
         request_stop()
         return JSONResponse({"ok": True, "message": "正在关闭配置后台"})
+
+    @app.post("/api/sites/{site_id}/dry-run")
+    def api_dry_run(site_id: str, body: Optional[DryRunPayload] = None):
+        if not is_valid_site_id(site_id):
+            raise HTTPException(400, "非法站点 id")
+        from playbook.dry_run import run_playbook_dry_run
+
+        try:
+            result = run_playbook_dry_run(
+                site_id, (body.order if body else None) or {}
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(500, str(e))
+        return result
+
+    @app.post("/api/sites/{site_id}/dry-run/stop")
+    def api_dry_run_stop(site_id: str):
+        if not is_valid_site_id(site_id):
+            raise HTTPException(400, "非法站点 id")
+        from playbook.dry_run import stop_dry_run_browser
+
+        msg = stop_dry_run_browser(site_id)
+        return {"ok": True, "message": msg}
 
     return app
 

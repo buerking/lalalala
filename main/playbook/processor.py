@@ -42,6 +42,7 @@ from playbook.walk import (
     need_arrived,
     normalize_pages,
     page_label,
+    purchase_page_index,
 )
 
 
@@ -56,6 +57,13 @@ class PlaybookOrderProcessor(LoggerMixin):
     def _stage(self, name: str) -> Dict[str, Any]:
         raw = self.pb.get(name)
         return raw if isinstance(raw, dict) else {}
+
+    def _is_dry_run(self) -> bool:
+        if self.config.get("_playbook_dry_run"):
+            return True
+        from src.utils.dev_test import stop_before_purchase
+
+        return bool(stop_before_purchase(self.config))
 
     def process_order(self, order: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         order_id = order.get("order_id", "未知")
@@ -144,12 +152,6 @@ class PlaybookOrderProcessor(LoggerMixin):
                     msg = "无法填写数量 qty=%s item=%s" % (qty, item_id)
                     self._fail(order, [msg], "价格库存")
                     return False, self._summary(order, failure_reason=msg)
-
-            from src.utils.dev_test import stop_before_purchase as _dev_stop_buy
-
-            if _dev_stop_buy(self.config):
-                self.logger.warning("本地测试：价格库存已过，停在加购前 item=%s", item_id)
-                return True, self._summary(order, success=True, failure_reason="本地测试：停在购买前")
 
             btn = add_cart.get("button") or inspect.get("buy_button") or inspect.get("add_to_cart_button")
             wait_btn = float(add_cart.get("button_wait_seconds") or 20)
@@ -244,7 +246,10 @@ class PlaybookOrderProcessor(LoggerMixin):
                 return False, self._summary(order, failure_reason=msg)
         shot_url = chk_bag.get("_shot_url") or self._take_shot_upload(driver, order, "checkCart 截图")
         if not shot_url:
-            return False, self._summary(order, failure_reason="checkCart 截图上传失败")
+            if self._is_dry_run():
+                shot_url = "https://example.local/playbook/dryrun.png"
+            else:
+                return False, self._summary(order, failure_reason="checkCart 截图上传失败")
         goods_list = [
             {
                 "No": g.get("goods_no"),
@@ -287,6 +292,11 @@ class PlaybookOrderProcessor(LoggerMixin):
         after_ok = confirm_cfg.get("success_arrived") or complete_cfg.get("arrived")
         if not confirm_cfg.get("pages"):
             after_ok = after_ok or confirm_cfg.get("arrived")
+        dry = self._is_dry_run()
+        pay_pages = normalize_pages(
+            confirm_cfg, treat_top_arrived_as_success=not bool(confirm_cfg.get("pages"))
+        )
+        stop_idx = purchase_page_index(pay_pages, confirm_cfg) if dry else None
         walk_err, pay_bag = self._walk_pages(
             driver,
             confirm_cfg,
@@ -294,13 +304,39 @@ class PlaybookOrderProcessor(LoggerMixin):
             collect_specs=pay_collect,
             skip_texts=list(self._stage("threeds").get("detect_texts") or []),
             stage_name="确认支付",
-            click_last_next=True,
+            click_last_next=not dry,
             after_last_arrived=after_ok,
             treat_top_arrived_as_success=not bool(confirm_cfg.get("pages")),
             order=order,
             shot_keys=("purchase_no",),
             shot_reason="成功页截图",
+            stop_before_click_index=stop_idx,
         )
+        if dry:
+            if walk_err:
+                self._fail(order, [walk_err, "当前 URL: %s" % (driver.current_url or "")], "确认支付")
+                return False, self._summary(
+                    order,
+                    failure_reason=walk_err,
+                    check_cart_requested=True,
+                    check_cart_response="ok",
+                )
+            msg = (
+                "dry-run：已停在付款按钮前 page=%s found=%s URL=%s"
+                % (
+                    pay_bag.get("_dry_run_stop_page") or "-",
+                    pay_bag.get("_dry_run_button_found"),
+                    pay_bag.get("_dry_run_stop_url") or (driver.current_url or ""),
+                )
+            )
+            self.logger.info("playbook：%s", msg)
+            return True, self._summary(
+                order,
+                success=True,
+                failure_reason=msg,
+                check_cart_requested=True,
+                check_cart_response="ok",
+            )
         if walk_err:
             self._fail(order, [walk_err, "当前 URL: %s" % (driver.current_url or "")], "确认支付")
             return False, self._summary(
@@ -463,6 +499,7 @@ class PlaybookOrderProcessor(LoggerMixin):
         order: Optional[Dict[str, Any]] = None,
         shot_keys: Tuple[str, ...] = (),
         shot_reason: str = "",
+        stop_before_click_index: Optional[int] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """走完一个接口下的全部确认页。字段在每一页都试抓，后非空覆盖先前。"""
         pages = normalize_pages(stage, treat_top_arrived_as_success=treat_top_arrived_as_success)
@@ -523,6 +560,26 @@ class PlaybookOrderProcessor(LoggerMixin):
             if shot_err:
                 return shot_err, bag
             nxt = page.get("next_button") or page.get("button")
+            if stop_before_click_index is not None and i == int(stop_before_click_index):
+                bag["_dry_run_stop_page"] = name
+                bag["_dry_run_stop_url"] = getattr(driver, "current_url", "") or ""
+                if not has_action(nxt):
+                    return "dry-run：付款页「%s」未配置下一步按钮" % name, bag
+                el = find_first(driver, nxt, timeout=8, logger=self.logger)
+                bag["_dry_run_button_found"] = el is not None
+                if el is None:
+                    return (
+                        "dry-run：已到付款页「%s」但未找到下单按钮 URL=%s"
+                        % (name, bag["_dry_run_stop_url"]),
+                        bag,
+                    )
+                self.logger.info(
+                    "playbook：dry-run 已探测到付款按钮（未点击）page=%s URL=%s",
+                    name,
+                    bag["_dry_run_stop_url"],
+                )
+                bag["_dry_run_stopped"] = True
+                return "", bag
             should_click = has_action(nxt) and (not is_last or click_last_next)
             if not is_last and not has_action(nxt):
                 return "「%s/%s」没有下一步按钮，无法进入后续页" % (stage_name, name), bag
@@ -584,6 +641,8 @@ class PlaybookOrderProcessor(LoggerMixin):
         self._handle_order_issue(order, messages, reason=reason)
 
     def _take_shot_upload(self, driver, order: Dict[str, Any], reason: str, *, notify: bool = True) -> Optional[str]:
+        if self._is_dry_run():
+            return "https://example.local/playbook/dryrun.png"
         path = None
         try:
             path = take_full_page_screenshot(driver)

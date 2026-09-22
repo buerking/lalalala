@@ -508,6 +508,13 @@ class SiteRunner:
         if self.scheduler is not None:
             self._logger().warning("调度器已在运行，忽略重复启动")
             return
+        if self._processing_lock.locked():
+            owner = self._get_busy_owner() or "auto"
+            self._logger().warning(
+                "启动调度时上一轮仍占着处理锁（owner=%s），新轮次会跳过直到那一轮结束。"
+                "若日志停在「[订单接口] 请求 URL」且长时间无响应，请退出 GUI 重开。",
+                owner,
+            )
 
         def run_batch() -> bool:
             if not self._begin_auto_batch():
@@ -737,6 +744,14 @@ class SiteRunner:
         if self.scheduler:
             self.scheduler.stop()
             self.scheduler = None
+        if self._processing_lock.locked():
+            owner = self._get_busy_owner() or "auto"
+            self._logger().warning(
+                "停止调度时上一轮仍在执行（owner=%s）。点停止不会中断卡住的拉单/下单线程；"
+                "若立刻再启动，会一直提示「上一轮自动订单处理尚未结束」。"
+                "请完全退出本程序后再开，或等该轮超时返回。",
+                owner,
+            )
         if self.browser_manager:
             if self._keep_browser_open_on_stop():
                 self._logger().info("按配置保留浏览器会话：停止系统时不关闭浏览器")
