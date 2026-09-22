@@ -180,6 +180,11 @@ def take_full_page_screenshot(driver, save_path: Optional[str] = None) -> str:
             pass
 
 
+DEFAULT_COMMON_UPLOAD_URL = (
+    "https://softbank.jpgoodbuy.com/common_upload.php?act=post_document_flow"
+)
+
+
 def upload_screenshot_get_url(
     image_path: str,
     config: Dict[str, Any],
@@ -200,7 +205,7 @@ def upload_screenshot_get_url(
         上传成功时返回 Data URL，失败返回 None
     """
     api_config = config.get("order_api") or {}
-    url = (api_config.get("common_upload_url") or "").strip()
+    url = (api_config.get("common_upload_url") or DEFAULT_COMMON_UPLOAD_URL).strip()
     if not url:
         print("[结算校验] 未配置 order_api.common_upload_url，无法上传截图")
         return None
