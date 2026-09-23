@@ -1,0 +1,92 @@
+{
+  "_comment": "复制到 data/rakuten_ichiba_checkout_rules.json 后填写 rules。url_contains 只填店铺 ID，例如 renet3，会同时命中 item.rakuten.co.jp/renet3/ 与 www.rakuten.co.jp/renet3/。",
+  "enabled": true,
+  "restore_on_normal_order": true,
+  "defaults": {
+    "address_id": "honda",
+    "card_last4": "8828"
+  },
+  "addresses": {
+    "honda": {
+      "id": "honda",
+      "label": "本田（默认收货地址）",
+      "postal_code": "550-0022",
+      "match_texts": [
+        "本田4-1-7",
+        "大阪市西区本田",
+        "550-0022"
+      ]
+    },
+    "nihonbashi": {
+      "id": "nihonbashi",
+      "label": "日本桥（特殊订单收货地址）",
+      "postal_code": "542-0073",
+      "match_texts": [
+        "日本橋1-17-18",
+        "大阪市中央区日本橋",
+        "542-0073"
+      ]
+    }
+  },
+  "cards": {
+    "8828": { "last4": "8828", "label": "默认信用卡 8828" },
+    "6667": { "last4": "6667", "label": "特殊信用卡 6667" },
+    "3636": { "last4": "3636", "label": "特殊信用卡 3636" },
+    "3646": { "last4": "3646", "label": "特殊信用卡 3646" }
+  },
+  "rules": [],
+  "_examples": [
+    {
+      "id": "example-address-only",
+      "enabled": true,
+      "action": "address",
+      "address_id": "nihonbashi",
+      "url_contains": [
+        "shop-id"
+      ],
+      "url_regex": [],
+      "note": "仅改地址。url_contains 填店铺 ID（如 renet3），不必写完整商品链接。"
+    },
+    {
+      "id": "example-card-6667",
+      "enabled": true,
+      "action": "card",
+      "card_last4": "6667",
+      "url_contains": [
+        "shop-id"
+      ],
+      "note": "仅改信用卡：弹窗里按尾号选卡（Mastercard **** 6667）。card_last4 只能是 6667 / 3636 / 3646。"
+    },
+    {
+      "id": "example-card-3636",
+      "enabled": true,
+      "action": "card",
+      "card_last4": "3636",
+      "url_contains": [
+        "shop-id"
+      ],
+      "note": "仅改信用卡，尾号 3636。"
+    },
+    {
+      "id": "example-card-3646",
+      "enabled": true,
+      "action": "card",
+      "card_last4": "3646",
+      "url_contains": [
+        "shop-id"
+      ],
+      "note": "仅改信用卡，尾号 3646。"
+    },
+    {
+      "id": "example-both",
+      "enabled": true,
+      "action": "both",
+      "address_id": "nihonbashi",
+      "card_last4": "6667",
+      "url_contains": [
+        "shop-id"
+      ],
+      "note": "全改：日本桥地址 + 指定尾号信用卡。下单成功后 addNoCallbackSimple 的 CreditCard 会改成实际尾号。"
+    }
+  ]
+}

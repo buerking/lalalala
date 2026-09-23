@@ -22,6 +22,10 @@ from src.browser.browser_manager import BrowserManager
 from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
+from src.order.rakuten_ichiba_seller_rules import (
+    extract_card_last4_from_text,
+    load_seller_rules,
+)
 from src.order.added_cart_callback import send_added_cart_callback
 from src.order.cancel_order import (
     LIMIT_CANCEL_REASON,
@@ -241,6 +245,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         )
         # 独立店（楽天ビック等）加购后进自家 /step/ 购物车，记住以免核验时跳去空的 cart.step
         self._last_shop_cart_url = ""
+        # 确认页实际选用的信用卡尾号，供 addNoCallbackSimple.CreditCard
+        self._checkout_credit_last4 = ""
 
     def _random_pre_click_wait(self, action: str) -> None:
         pay_cfg = self.config.get("payment") or {}
@@ -260,7 +266,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         return _cfg_text(self.ri_cfg.get("store_name"), default="乐天市场")
 
     def _credit_card_label(self) -> str:
-        """addNoCallbackSimple 回传的 CreditCard（与后端约定标识，默认 8828；非浏览器选卡）。"""
+        """addNoCallbackSimple 回传的 CreditCard：确认页实际尾号优先，否则默认 8828。"""
+        used = str(getattr(self, "_checkout_credit_last4", "") or "").strip()
+        if used:
+            return used
         pay = self.config.get("payment") or {}
         return _cfg_text(
             self.ri_cfg.get("add_no_credit_card"),
@@ -1187,6 +1196,8 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             idle_rounds = 0
             progressed = False
             for modal in modals:
+                if self._is_ichiba_seller_settings_modal(driver, modal):
+                    continue
                 confirm_btn = self._find_modal_confirm_button(driver, modal)
                 if confirm_btn is None:
                     if not warned_no_btn:
@@ -1322,6 +1333,948 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 "乐天市场：お届け日時弹窗已关，再次点击注文を確定する"
             )
             self._click_commit_order_button(driver, commit_sel)
+
+    def _is_ichiba_seller_settings_modal(self, driver, modal) -> bool:
+        """お届け先选址 / 支払い方法选卡弹窗，不要当お届け日時选项窗去点「変更する」。"""
+        try:
+            if self._find_elements_in(
+                driver,
+                modal,
+                By.CSS_SELECTOR,
+                '[data-testid="pc-single-shipping-address-card-clickable-area"],'
+                '[data-testid="multi-shipping-address-card-clickable-area"],'
+                "#shopPaymentSelectFormList,"
+                'input[name="address-selected"],'
+                'input[name="selectedContact"],'
+                "#modal09-3,"
+                "#shippingFromSelect,"
+                "#select_credit_select",
+            ):
+                return True
+        except Exception:
+            pass
+        blob = self._modal_text_blob(modal)
+        if "支払い方法" in blob and "クレジットカード" in blob:
+            return True
+        if "お届け先の選択" in blob:
+            return True
+        if "お届け先" in blob and ("別のお届け先" in blob or "デフォルトお届け先" in blob):
+            return True
+        return False
+
+    def _first_displayed(self, driver, css: str):
+        for el in self._find_elements_now(driver, By.CSS_SELECTOR, css):
+            try:
+                if el.is_displayed():
+                    return el
+            except Exception:
+                continue
+        return None
+
+    def _detect_ichiba_confirm_layout(self, driver) -> str:
+        """
+        spa: cart.step / 楽天24 注文内容の確認（弹窗改地址/卡）
+        shop_step: 楽天ビック等独立店 /step/confirm（#order_confirm / #sender_address）
+        """
+        if self._first_displayed(
+            driver, "#confirm-shipping-address-card, #confirm-payment-method-card"
+        ) or self._first_displayed(driver, ".commit-order-button"):
+            return "spa"
+        try:
+            url = (driver.current_url or "").lower()
+        except Exception:
+            url = ""
+        if (
+            self._first_displayed(driver, "#order_confirm")
+            or self._first_displayed(
+                driver, "#confirm_total_amount, #confirm_sub_total, #confirm_address"
+            )
+            or self._first_displayed(
+                driver, "#sender_address, #change_sender, #select_credit_select"
+            )
+            or "/step/confirm" in url
+        ):
+            return "shop_step"
+        if "cart.step.rakuten.co.jp" in url:
+            return "spa"
+        return "unknown"
+
+    def _confirm_block_by_titles(self, driver, titles: Tuple[str, ...]):
+        """用可见标题「お届け先 / 支払い方法」定位卡片（不依赖 hashed class）。"""
+        for title in titles:
+            if not title:
+                continue
+            xpath = (
+                "//*[self::span or self::h1 or self::h2 or self::h3 or self::dt or self::legend]"
+                "[normalize-space()='%s']" % title
+            )
+            for el in self._find_elements_now(driver, By.XPATH, xpath):
+                try:
+                    if not el.is_displayed():
+                        continue
+                except Exception:
+                    continue
+                node = el
+                for _ in range(8):
+                    try:
+                        node = node.find_element(By.XPATH, "..")
+                    except Exception:
+                        break
+                    try:
+                        text = node.text or ""
+                    except Exception:
+                        continue
+                    if "変更" in text and 8 < len(text) < 900:
+                        return node
+        return None
+
+    def _confirm_section_text(
+        self, driver, section_id: str, titles: Tuple[str, ...] = ()
+    ) -> str:
+        for el in self._find_elements_now(driver, By.ID, section_id):
+            try:
+                if el.is_displayed():
+                    return (el.text or "").replace("\n", " ").strip()
+            except Exception:
+                continue
+        if titles:
+            block = self._confirm_block_by_titles(driver, titles)
+            if block is not None:
+                try:
+                    return (block.text or "").replace("\n", " ").strip()
+                except Exception:
+                    pass
+        return ""
+
+    def _confirm_address_matches(self, driver, spec) -> bool:
+        text = self._confirm_section_text(
+            driver, "confirm-shipping-address-card", ("お届け先",)
+        )
+        if not text or not spec:
+            return False
+        return any(t and t in text for t in (spec.match_texts or []))
+
+    def _confirm_card_matches(self, driver, last4: str) -> bool:
+        last4 = str(last4 or "").strip()
+        if not last4:
+            return False
+        text = self._confirm_section_text(
+            driver, "confirm-payment-method-card", ("支払い方法", "お支払い方法")
+        )
+        got = extract_card_last4_from_text(text)
+        return got == last4 or last4 in text
+
+    def _wait_visible_css(self, driver, css: str, timeout: float = 10.0):
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            found = []
+            for el in self._find_elements_now(driver, By.CSS_SELECTOR, css):
+                try:
+                    if el.is_displayed():
+                        found.append(el)
+                except Exception:
+                    continue
+            if found:
+                return found
+            time.sleep(0.2)
+        return []
+
+    def _click_confirm_section_change(self, driver, section_id: str, title: str) -> None:
+        roots = [
+            el
+            for el in self._find_elements_now(driver, By.ID, section_id)
+            if self._el_displayed(el)
+        ]
+        if not roots:
+            titles = (
+                ("お届け先",)
+                if "届け" in (title or "")
+                else ("支払い方法", "お支払い方法")
+            )
+            block = self._confirm_block_by_titles(driver, titles)
+            if block is not None:
+                roots = [block]
+        if not roots:
+            raise RuntimeError("确认页未找到「%s」卡片 #%s" % (title, section_id))
+        root = roots[0]
+        btn = None
+        for css in (
+            'button[aria-label="変更"]',
+            'a[aria-label="変更"]',
+            'button[aria-label*="変更"]',
+        ):
+            for el in self._find_elements_in(driver, root, By.CSS_SELECTOR, css):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        aria = (el.get_attribute("aria-label") or "").strip()
+                        text = (el.text or "").strip()
+                        if "変更する" in aria or "変更する" in text:
+                            continue
+                        btn = el
+                        break
+                except Exception:
+                    continue
+            if btn is not None:
+                break
+        if btn is None:
+            raise RuntimeError("确认页「%s」未找到可点的「変更」" % title)
+        self._random_pre_click_wait("确认页%s変更" % title)
+        driver.execute_script("arguments[0].click();", btn)
+
+    @staticmethod
+    def _el_displayed(el) -> bool:
+        try:
+            return bool(el.is_displayed())
+        except Exception:
+            return False
+
+    def _click_modal_apply_if_present(self, driver) -> bool:
+        for el in self._find_elements_now(
+            driver, By.CSS_SELECTOR, 'button[aria-label="変更する"]'
+        ):
+            try:
+                if not el.is_displayed() or not el.is_enabled():
+                    continue
+                cls = el.get_attribute("class") or ""
+                if "button-disabled" in cls or "disabled" in cls:
+                    continue
+                driver.execute_script("arguments[0].click();", el)
+                time.sleep(0.6)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _close_active_checkout_modal(self, driver) -> None:
+        for el in self._find_elements_now(
+            driver, By.CSS_SELECTOR, 'button[aria-label="モーダルを閉じる"]'
+        ):
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.4)
+                    return
+            except Exception:
+                continue
+
+    def _select_shipping_address_in_modal(self, driver, match_texts: List[str]) -> bool:
+        needles = [t for t in (match_texts or []) if str(t).strip()]
+        if not needles:
+            return False
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    const needles = arguments[0];
+                    const sel = [
+                      '[data-testid="pc-single-shipping-address-card-clickable-area"]',
+                      '[data-testid="multi-shipping-address-card-clickable-area"]'
+                    ].join(',');
+                    const cards = Array.from(document.querySelectorAll(sel));
+                    const vis = cards.filter(c => c.getClientRects().length > 0);
+                    const pool = vis.length ? vis : cards;
+                    for (const c of pool) {
+                      const t = (c.innerText || c.textContent || '');
+                      if (!needles.some(n => t.indexOf(n) >= 0)) continue;
+                      const radio = c.querySelector('input[name="address-selected"]');
+                      const readonly = !!(radio && (
+                        radio.readOnly
+                        || radio.getAttribute('aria-readonly') === 'true'
+                      ));
+                      if (radio && !readonly) { radio.click(); return true; }
+                      c.click();
+                      return true;
+                    }
+                    const radios = Array.from(document.querySelectorAll(
+                      'input[name="address-selected"], input[name*="address"][type="radio"]'
+                    ));
+                    for (const r of radios) {
+                      let node = r;
+                      for (let i = 0; i < 10 && node; i++) {
+                        const t = node.innerText || '';
+                        if (needles.some(n => t.indexOf(n) >= 0)) {
+                          r.click();
+                          return true;
+                        }
+                        node = node.parentElement;
+                      }
+                    }
+                    return false;
+                    """,
+                    needles,
+                )
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：点选お届け先脚本失败: %s", e)
+            return False
+
+    def _select_payment_card_in_modal(self, driver, last4: str) -> bool:
+        last4 = str(last4 or "").strip()
+        if not last4:
+            return False
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    const last4 = arguments[0];
+                    const form = document.getElementById('shopPaymentSelectFormList')
+                      || document.body;
+                    const labels = Array.from(form.querySelectorAll('label'));
+                    for (const lab of labels) {
+                      if (lab.getClientRects().length === 0) continue;
+                      const t = lab.innerText || '';
+                      if (t.indexOf(last4) < 0) continue;
+                      if (t.indexOf('****') < 0 && t.indexOf('下4桁') < 0
+                          && t.indexOf('Mastercard') < 0 && t.indexOf('MASTER') < 0
+                          && t.indexOf('Visa') < 0 && t.indexOf('VISA') < 0
+                          && t.indexOf('JCB') < 0) continue;
+                      const radio = lab.querySelector('input[type=radio]');
+                      if (radio) { radio.click(); return true; }
+                      lab.click();
+                      return true;
+                    }
+                    const spans = Array.from(form.querySelectorAll('span'));
+                    for (const s of spans) {
+                      if (s.getClientRects().length === 0) continue;
+                      const t = s.innerText || '';
+                      if ((t.indexOf('****') < 0 && t.indexOf('下4桁') < 0)
+                          || t.indexOf(last4) < 0) continue;
+                      const lab = s.closest('label');
+                      if (!lab) continue;
+                      const radio = lab.querySelector('input[type=radio]');
+                      if (radio) { radio.click(); return true; }
+                      lab.click();
+                      return true;
+                    }
+                    return false;
+                    """,
+                    last4,
+                )
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：点选信用卡脚本失败: %s", e)
+            return False
+
+    def _dismiss_qty_confirm_if_present(self, driver) -> None:
+        """改お届け先后偶发「数量の確認」，数量仍为 1 时点 OK。"""
+        try:
+            driver.execute_script(
+                """
+                const nodes = Array.from(document.querySelectorAll(
+                  '[role="dialog"], .modal--2uMmF, .root--2R0qP'
+                ));
+                for (const r of nodes) {
+                  if (r.getClientRects().length === 0) continue;
+                  const t = r.innerText || '';
+                  if (t.indexOf('数量の確認') < 0) continue;
+                  const btns = Array.from(r.querySelectorAll(
+                    '[role="button"], button, .footer-right-button--5Rlxk'
+                  ));
+                  for (const b of btns) {
+                    const lab = (
+                      (b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')
+                    ).trim();
+                    if (lab.indexOf('OK') >= 0 || lab.indexOf('はい') >= 0) {
+                      b.click();
+                      return true;
+                    }
+                  }
+                }
+                return false;
+                """
+            )
+        except Exception:
+            pass
+
+    def _ensure_confirm_shipping_address(self, driver, spec) -> None:
+        if spec is None:
+            return
+        if self._confirm_address_matches(driver, spec):
+            self.logger.info("乐天市场：确认页お届け先已是 %s，无需改", spec.label)
+            return
+        self._click_confirm_section_change(
+            driver, "confirm-shipping-address-card", "お届け先"
+        )
+        time.sleep(0.5)
+        cards = self._wait_visible_css(
+            driver,
+            '[data-testid="pc-single-shipping-address-card-clickable-area"],'
+            '[data-testid="multi-shipping-address-card-clickable-area"]',
+            10.0,
+        )
+        if not cards:
+            radios = self._wait_visible_css(
+                driver, 'input[name="address-selected"]', 3.0
+            )
+            if not radios:
+                raise RuntimeError("确认页お届け先弹窗未出现")
+        if not self._select_shipping_address_in_modal(driver, spec.match_texts):
+            raise RuntimeError(
+                "お届け先弹窗未找到目标地址 %s（%s）"
+                % (spec.label, " / ".join((spec.match_texts or [])[:2]))
+            )
+        time.sleep(0.35)
+        if self._click_modal_apply_if_present(driver):
+            self.logger.info("乐天市场：お届け先已点「変更する」→ %s", spec.label)
+        else:
+            self.logger.info(
+                "乐天市场：お届け先已点选 %s（弹窗无「変更する」，等待页面更新）",
+                spec.label,
+            )
+        self._dismiss_qty_confirm_if_present(driver)
+        self._ensure_session_after_action(wait_seconds=1.5)
+        deadline = time.time() + 12.0
+        while time.time() < deadline:
+            self._dismiss_qty_confirm_if_present(driver)
+            if self._confirm_address_matches(driver, spec):
+                self._close_active_checkout_modal(driver)
+                return
+            time.sleep(0.35)
+        if self._confirm_address_matches(driver, spec):
+            self._close_active_checkout_modal(driver)
+            return
+        self._close_active_checkout_modal(driver)
+        text = self._confirm_section_text(driver, "confirm-shipping-address-card")
+        raise RuntimeError(
+            "改お届け先后确认页仍不是 %s，当前：%s" % (spec.label, text[:120])
+        )
+
+    def _ensure_confirm_payment_card(self, driver, last4: str) -> None:
+        last4 = str(last4 or "").strip()
+        if not last4:
+            return
+        if self._confirm_card_matches(driver, last4):
+            self.logger.info("乐天市场：确认页信用卡已是 **** %s，无需改", last4)
+            return
+        self._click_confirm_section_change(
+            driver, "confirm-payment-method-card", "支払い方法"
+        )
+        time.sleep(0.5)
+        form = self._wait_visible_css(driver, "#shopPaymentSelectFormList", 8.0)
+        if not form:
+            # 部分弹窗没有该 id，有可见 **** 尾号即可
+            form = self._wait_visible_css(
+                driver,
+                '#shopPaymentSelectFormList, [id="new-card-registration-form"]',
+                3.0,
+            )
+        if not form and not self._select_payment_card_in_modal(driver, last4):
+            raise RuntimeError("确认页支払い方法弹窗未出现")
+        if not self._select_payment_card_in_modal(driver, last4):
+            raise RuntimeError(
+                "支払い方法弹窗未找到尾号 %s 的信用卡（请先在乐天账号绑定该卡）" % last4
+            )
+        time.sleep(0.35)
+        if not self._click_modal_apply_if_present(driver):
+            raise RuntimeError("支払い方法弹窗未找到「変更する」")
+        self.logger.info("乐天市场：信用卡已点「変更する」→ **** %s", last4)
+        self._ensure_session_after_action(wait_seconds=1.0)
+        deadline = time.time() + 12.0
+        while time.time() < deadline:
+            if self._confirm_card_matches(driver, last4):
+                return
+            time.sleep(0.35)
+        text = self._confirm_section_text(driver, "confirm-payment-method-card")
+        raise RuntimeError(
+            "改信用卡后确认页仍不是 **** %s，当前：%s" % (last4, text[:120])
+        )
+
+    def _apply_ichiba_seller_checkout(self, driver, order: Dict[str, Any]) -> None:
+        """
+        按 JSON 规则在确认页改お届け先 / クレジットカード。
+        未命中特殊 URL 时改回本田地址 + 8828。
+        """
+        bundle = load_seller_rules(logger=self.logger)
+        urls = [
+            str(p.get("url") or "").strip()
+            for p in (order.get("products") or [])
+            if str(p.get("url") or "").strip()
+        ]
+        intent = bundle.resolve(urls)
+        for w in intent.warnings or []:
+            self.logger.warning("乐天市场：卖家规则 %s", w)
+        if intent.skipped:
+            self.logger.info("乐天市场：卖家规则%s", intent.describe())
+            return
+        self._checkout_credit_last4 = intent.card_last4 or self._credit_card_label()
+        self.logger.info(
+            "乐天市场：卖家规则 %s hit_urls=%s CreditCard=%s",
+            intent.describe(),
+            intent.matched_urls[:3],
+            self._checkout_credit_last4,
+        )
+        layout = self._detect_ichiba_confirm_layout(driver)
+        try:
+            page_url = driver.current_url or ""
+        except Exception:
+            page_url = ""
+        self.logger.info("乐天市场：确认页布局 layout=%s url=%s", layout, page_url)
+        if layout != "spa":
+            self._apply_seller_checkout_non_spa(driver, intent, layout)
+            return
+        if intent.change_address and intent.address:
+            self._ensure_confirm_shipping_address(driver, intent.address)
+        if intent.change_card and intent.card_last4:
+            self._ensure_confirm_payment_card(driver, intent.card_last4)
+        self._checkout_credit_last4 = intent.card_last4 or self._checkout_credit_last4
+
+    def _legacy_visible_blob(self, driver, css_list: List[str]) -> str:
+        parts: List[str] = []
+        for css in css_list:
+            el = self._first_displayed(driver, css)
+            if el is None:
+                continue
+            try:
+                t = (el.text or "").replace("\n", " ").strip()
+            except Exception:
+                t = ""
+            if t:
+                parts.append(t)
+        return " ".join(parts)
+
+    def _is_bic_shop_step_confirm(self, driver) -> bool:
+        return bool(
+            self._first_displayed(driver, "#sender_address")
+            or self._first_displayed(driver, "#change_sender")
+            or self._first_displayed(driver, "#select_credit_select")
+        )
+
+    def _non_spa_address_matches(self, driver, spec) -> bool:
+        if spec is None:
+            return False
+        blob = self._legacy_visible_blob(
+            driver,
+            [
+                "#sender_address",
+                "#sender_name",
+                "#confirm_address",
+                "#confirm_address_sp",
+                "#confirm_shipping_address",
+                "#shipping_address",
+            ],
+        )
+        if not blob:
+            block = self._confirm_block_by_titles(driver, ("お届け先",))
+            if block is not None:
+                try:
+                    blob = (block.text or "").replace("\n", " ")
+                except Exception:
+                    blob = ""
+        if not blob:
+            return False
+        return any(t and t in blob for t in (spec.match_texts or []))
+
+    def _shop_step_selected_card_text(self, driver) -> str:
+        sel = self._first_displayed(driver, "#select_credit_select")
+        if sel is None:
+            return ""
+        try:
+            return (Select(sel).first_selected_option.text or "").strip()
+        except Exception:
+            try:
+                return (sel.text or "").strip()
+            except Exception:
+                return ""
+
+    def _non_spa_card_matches(self, driver, last4: str) -> bool:
+        last4 = str(last4 or "").strip()
+        if not last4:
+            return False
+        blob = self._shop_step_selected_card_text(driver)
+        blob = (
+            blob
+            + " "
+            + self._legacy_visible_blob(
+                driver,
+                [
+                    "#confirm_payment",
+                    "#confirm_payment_sp",
+                    "#confirm_settlement",
+                    "#payment_method",
+                    "#confirm_pay_method",
+                    ".c-payment__num",
+                ],
+            )
+        )
+        if not blob.strip():
+            block = self._confirm_block_by_titles(
+                driver, ("支払い方法", "お支払い方法", "お支払方法")
+            )
+            if block is not None:
+                try:
+                    blob = (block.text or "").replace("\n", " ")
+                except Exception:
+                    blob = ""
+        if not blob.strip():
+            return False
+        got = extract_card_last4_from_text(blob)
+        return got == last4 or last4 in blob
+
+    def _select_shop_step_shipping_radio(self, driver, match_texts: List[str]) -> bool:
+        needles = [t for t in (match_texts or []) if str(t).strip()]
+        if not needles:
+            return False
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    const needles = arguments[0];
+                    function shown(el) {
+                      if (!el || !el.getClientRects) return false;
+                      return el.getClientRects().length > 0;
+                    }
+                    const radios = Array.from(
+                      document.querySelectorAll('input[name="selectedContact"]')
+                    );
+                    const pool = radios.filter(shown);
+                    const use = pool.length ? pool : radios;
+                    for (const r of use) {
+                      let node = r.closest(
+                        '.c-senderInfo__box, .l-grid__colL-3, .l-grid__box'
+                      ) || r.parentElement;
+                      for (let i = 0; i < 8 && node; i++) {
+                        const t = node.innerText || '';
+                        if (needles.some(n => t.indexOf(n) >= 0)) {
+                          const box = r.closest('.c-senderInfo__box')
+                            || r.closest('.l-grid__box');
+                          if (box) box.click();
+                          r.checked = true;
+                          r.click();
+                          r.dispatchEvent(new Event('change', {bubbles: true}));
+                          r.dispatchEvent(new Event('input', {bubbles: true}));
+                          return true;
+                        }
+                        node = node.parentElement;
+                      }
+                    }
+                    return false;
+                    """,
+                    needles,
+                )
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：Bic お届け先单选脚本失败: %s", e)
+            return False
+
+    def _submit_shop_step_shipping_form(self, driver) -> bool:
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    const checked = document.querySelector(
+                      'input[name="selectedContact"]:checked'
+                    );
+                    const form = (checked && checked.form)
+                      || document.getElementById('shippingFromSelect');
+                    if (!form) return false;
+                    if (checked) {
+                      const hiddens = form.querySelectorAll(
+                        'input[name="selectedContactId"]'
+                      );
+                      if (hiddens.length === 1) {
+                        hiddens[0].value = checked.value;
+                      }
+                    }
+                    if (typeof form.requestSubmit === 'function') {
+                      form.requestSubmit();
+                    } else {
+                      form.submit();
+                    }
+                    return true;
+                    """
+                )
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：提交 Bic お届け先表单失败: %s", e)
+            return False
+
+    def _close_shop_step_shipping_modal(self, driver) -> None:
+        for css in (
+            "#modal09-3 .js-modalClose",
+            ".mfp-content .js-modalClose",
+            ".mfp-close",
+        ):
+            btn = self._first_displayed(driver, css)
+            if btn is None:
+                continue
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(0.3)
+                return
+            except Exception:
+                continue
+
+    def _wait_non_spa_address(self, driver, spec, timeout: float = 12.0) -> bool:
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            try:
+                if self._non_spa_address_matches(driver, spec):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.35)
+        try:
+            return self._non_spa_address_matches(driver, spec)
+        except Exception:
+            return False
+
+    def _wait_non_spa_card(self, driver, last4: str, timeout: float = 12.0) -> bool:
+        deadline = time.time() + max(0.5, float(timeout))
+        while time.time() < deadline:
+            try:
+                if self._non_spa_card_matches(driver, last4):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.35)
+        try:
+            return self._non_spa_card_matches(driver, last4)
+        except Exception:
+            return False
+
+    def _ensure_shop_step_shipping_address(self, driver, spec) -> None:
+        if spec is None:
+            return
+        if self._non_spa_address_matches(driver, spec):
+            self.logger.info("乐天市场：Bic 确认页お届け先已是 %s，无需改", spec.label)
+            return
+        btn = self._first_displayed(driver, "#change_sender")
+        if btn is None:
+            raise RuntimeError("Bic 确认页未找到お届け先「変更」#change_sender")
+        self._random_pre_click_wait("Bicお届け先変更")
+        driver.execute_script("arguments[0].click();", btn)
+        radios = self._wait_visible_css(
+            driver, 'input[name="selectedContact"]', 10.0
+        )
+        if not radios:
+            raise RuntimeError("Bic お届け先弹窗未出现（#modal09-3 selectedContact）")
+        if not self._select_shop_step_shipping_radio(driver, spec.match_texts):
+            raise RuntimeError(
+                "Bic お届け先弹窗未找到目标地址 %s（%s）"
+                % (spec.label, " / ".join((spec.match_texts or [])[:2]))
+            )
+        time.sleep(0.8)
+        if self._wait_non_spa_address(driver, spec, 4.0):
+            self._close_shop_step_shipping_modal(driver)
+            self.logger.info("乐天市场：Bic お届け先已改为 %s", spec.label)
+            return
+        if self._first_displayed(driver, 'input[name="selectedContact"]'):
+            self._submit_shop_step_shipping_form(driver)
+        self._ensure_session_after_action(wait_seconds=1.5)
+        if self._wait_non_spa_address(driver, spec, 12.0):
+            self._close_shop_step_shipping_modal(driver)
+            self.logger.info("乐天市场：Bic お届け先已提交为 %s", spec.label)
+            return
+        blob = self._legacy_visible_blob(driver, ["#sender_address"])
+        raise RuntimeError(
+            "Bic 改お届け先后确认页仍不是 %s，当前：%s" % (spec.label, blob[:120])
+        )
+
+    def _select_shop_step_card_dropdown(self, driver, last4: str) -> bool:
+        last4 = str(last4 or "").strip()
+        sel = self._first_displayed(driver, "#select_credit_select")
+        if sel is None or not last4:
+            return False
+        try:
+            options = list(Select(sel).options)
+        except Exception:
+            options = []
+        target = None
+        for opt in options:
+            try:
+                text = (opt.text or "").strip()
+                val = (opt.get_attribute("value") or "").strip()
+            except Exception:
+                continue
+            blob = text + " " + val
+            if last4 in blob or extract_card_last4_from_text(blob) == last4:
+                target = opt
+                break
+        if target is None:
+            return False
+        try:
+            Select(sel).select_by_value(target.get_attribute("value"))
+        except Exception:
+            try:
+                driver.execute_script(
+                    """
+                    const sel = arguments[0];
+                    const val = arguments[1];
+                    sel.value = val;
+                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                    """,
+                    sel,
+                    target.get_attribute("value"),
+                )
+            except Exception as e:
+                self.logger.warning("乐天市场：Bic 信用卡下拉选择失败: %s", e)
+                return False
+        try:
+            driver.execute_script(
+                """
+                const sel = arguments[0];
+                sel.dispatchEvent(new Event('change', {bubbles: true}));
+                """,
+                sel,
+            )
+        except Exception:
+            pass
+        return True
+
+    def _select_shop_step_change_page_card(self, driver, last4: str) -> bool:
+        last4 = str(last4 or "").strip()
+        if not last4:
+            return False
+        try:
+            return bool(
+                driver.execute_script(
+                    """
+                    const last4 = arguments[0];
+                    const pay = document.querySelector(
+                      'input[name="selectPayment"][value="1"]'
+                    );
+                    if (pay && !pay.checked) pay.click();
+                    const radios = Array.from(
+                      document.querySelectorAll('input[name="setCard"]')
+                    );
+                    for (const r of radios) {
+                      if ((r.value || '') === '9999') continue;
+                      const wrap = r.closest('li, .c-formv2__listItem, label')
+                        || r.parentElement;
+                      const t = (wrap && wrap.innerText) || '';
+                      if (t.indexOf(last4) < 0) continue;
+                      if (t.indexOf('追加') >= 0) continue;
+                      r.click();
+                      return true;
+                    }
+                    return false;
+                    """,
+                    last4,
+                )
+            )
+        except Exception as e:
+            self.logger.warning("乐天市场：Bic 支払い变更页选卡失败: %s", e)
+            return False
+
+    def _ensure_shop_step_payment_card(self, driver, last4: str, restore: bool) -> None:
+        last4 = str(last4 or "").strip()
+        if not last4:
+            return
+        if self._non_spa_card_matches(driver, last4):
+            self.logger.info("乐天市场：Bic 确认页信用卡已是 **** %s，无需改", last4)
+            return
+        if self._select_shop_step_card_dropdown(driver, last4):
+            self._ensure_session_after_action(wait_seconds=1.5)
+            if self._wait_non_spa_card(driver, last4, 8.0):
+                self.logger.info("乐天市场：Bic 已用下拉切换信用卡 **** %s", last4)
+                return
+            try:
+                driver.execute_script(
+                    """
+                    const form = document.getElementById('select_credit');
+                    if (!form) return false;
+                    if (typeof form.requestSubmit === 'function') form.requestSubmit();
+                    else form.submit();
+                    return true;
+                    """
+                )
+            except Exception:
+                pass
+            self._ensure_session_after_action(wait_seconds=1.5)
+            if self._wait_non_spa_card(driver, last4, 10.0):
+                self.logger.info("乐天市场：Bic 已提交信用卡下拉 **** %s", last4)
+                return
+        page_btn = self._first_displayed(driver, "#show_payment_way_page")
+        if page_btn is None:
+            msg = (
+                "Bic 确认页信用卡下拉里没有尾号 %s，且没有「变更支払い」按钮。"
+                "请先在乐天账号绑定该卡。" % last4
+            )
+            if restore:
+                self.logger.warning("乐天市场：%s（普通单继续）", msg)
+                return
+            raise RuntimeError(msg)
+        self.logger.info(
+            "乐天市场：Bic 下拉无 **** %s，进入支払い变更页", last4
+        )
+        self._random_pre_click_wait("Bic支払い方法変更")
+        driver.execute_script("arguments[0].click();", page_btn)
+        cards = self._wait_visible_css(driver, 'input[name="setCard"]', 12.0)
+        if not cards:
+            nxt = self._wait_visible_css(driver, "#confirmBtn", 4.0)
+            if not nxt:
+                raise RuntimeError("Bic 支払い变更页未出现")
+        if not self._select_shop_step_change_page_card(driver, last4):
+            msg = "Bic 支払い变更页未找到尾号 %s 的信用卡（请先绑定，勿点カードを追加）" % last4
+            if restore:
+                back = self._first_displayed(driver, "#confirmBtn")
+                if back is not None:
+                    driver.execute_script("arguments[0].click();", back)
+                    self._ensure_session_after_action(wait_seconds=1.5)
+                self.logger.warning("乐天市场：%s（普通单返回确认页继续）", msg)
+                return
+            raise RuntimeError(msg)
+        nxt = self._first_displayed(driver, "#confirmBtn")
+        if nxt is None:
+            raise RuntimeError("Bic 支払い变更页未找到「次へ」#confirmBtn")
+        driver.execute_script("arguments[0].click();", nxt)
+        self._ensure_session_after_action(wait_seconds=1.5)
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            if self._is_bic_shop_step_confirm(driver) and self._non_spa_card_matches(
+                driver, last4
+            ):
+                self.logger.info("乐天市场：Bic 变更页已切信用卡 **** %s", last4)
+                return
+            time.sleep(0.4)
+        if self._non_spa_card_matches(driver, last4):
+            return
+        blob = self._shop_step_selected_card_text(driver)
+        raise RuntimeError(
+            "Bic 改信用卡后确认页仍不是 **** %s，当前：%s" % (last4, blob[:80])
+        )
+
+    def _apply_seller_checkout_non_spa(
+        self, driver, intent, layout: str
+    ) -> None:
+        """Bic /step/confirm：弹窗改地址，确认页下拉换卡。"""
+        if self._is_bic_shop_step_confirm(driver):
+            if intent.change_address and intent.address:
+                self._ensure_shop_step_shipping_address(driver, intent.address)
+            if intent.change_card and intent.card_last4:
+                self._ensure_shop_step_payment_card(
+                    driver, intent.card_last4, bool(intent.restore)
+                )
+            return
+        addr_ok = True
+        card_ok = True
+        if intent.change_address and intent.address:
+            addr_ok = self._non_spa_address_matches(driver, intent.address)
+        if intent.change_card and intent.card_last4:
+            card_ok = self._non_spa_card_matches(driver, intent.card_last4)
+        if addr_ok and card_ok:
+            self.logger.info(
+                "乐天市场：%s 确认页已是目标地址/卡，无需改 UI", layout
+            )
+            return
+        missing: List[str] = []
+        if intent.change_address and not addr_ok:
+            missing.append("お届け先")
+        if intent.change_card and not card_ok:
+            missing.append("信用卡")
+        try:
+            page_url = driver.current_url or ""
+        except Exception:
+            page_url = ""
+        msg = (
+            "确认页布局=%s，当前无法按规则改%s。"
+            "请打开该页点「変更」后把 HTML/截图发来补选择器。URL=%s"
+            % (layout, "+".join(missing) or "地址/卡", page_url)
+        )
+        if intent.restore:
+            self.logger.warning("乐天市场：%s（普通单先继续下单，避免卡住）", msg)
+            return
+        raise RuntimeError(msg)
 
     @staticmethod
     def _is_window_dead_error(err: Exception) -> bool:
@@ -4788,6 +5741,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
     def process_order(self, order: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         order_id = order.get("order_id", "未知")
         products: List[Dict[str, Any]] = order.get("products") or []
+        self._checkout_credit_last4 = ""
         self.logger.info("乐天市场：开始处理订单 %s，商品数 %s", order_id, len(products))
         if not products:
             return False, self._make_summary(order, failure_reason="订单无商品")
@@ -5208,6 +6162,26 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 return False, self._make_summary(
                     order,
                     failure_reason=confirm_limit,
+                    check_cart_requested=True,
+                    check_cart_response="ok",
+                )
+            try:
+                self._apply_ichiba_seller_checkout(driver, order)
+            except Exception as e:
+                msg = "确认页按卖家规则改地址/信用卡失败: %s" % e
+                self.logger.error("乐天市场：%s order=%s", msg, order_id)
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [msg],
+                        user_id=order.get("user_id"),
+                        extra="乐天市场：请检查 data/rakuten_ichiba_checkout_rules.json 与账号里是否已绑定目标卡/地址。",
+                    )
+                except Exception:
+                    pass
+                return False, self._make_summary(
+                    order,
+                    failure_reason=msg,
                     check_cart_requested=True,
                     check_cart_response="ok",
                 )
