@@ -26,7 +26,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from src.browser.browser_manager import BrowserManager
 from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
-from src.order.add_no_callback import send_add_no_callback
+from src.order.add_no_callback import format_add_no_feishu_extra, send_add_no_callback
 from src.order.added_cart_callback import send_added_cart_callback
 from src.order.cancel_order import (
     LIMIT_CANCEL_REASON,
@@ -1912,8 +1912,13 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     str(order_id),
                     [add_err or "addNoCallbackSimple 失败"],
                     user_id=order.get("user_id"),
-                    extra="乐天书店：页面已下单成功但完成回调失败，请人工核对后台。purchase_no=%s"
-                    % purchase_no,
+                    extra=format_add_no_feishu_extra(
+                        "乐天书店",
+                        str(order_id),
+                        purchase_no,
+                        add_err or "",
+                        add_raw or "",
+                    ),
                 )
             except Exception:
                 pass

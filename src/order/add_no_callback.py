@@ -3,12 +3,56 @@
 """
 
 import json
+import logging
 import subprocess
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from src.utils.sign_generator import SignGenerator
 from src.utils.retry import call_api_with_retries, is_transient_http_error
+
+
+def _make_cb_log(config: Optional[Dict[str, Any]] = None) -> Callable[..., None]:
+    ns = ""
+    if isinstance(config, dict):
+        ns = str(config.get("_log_namespace") or "").strip()
+    lg = logging.getLogger("site.%s" % ns if ns else "site.add_no")
+
+    def _log(msg: str, *args) -> None:
+        try:
+            lg.info("[完成回调] " + msg, *args)
+        except Exception:
+            pass
+        try:
+            if args:
+                print("[完成回调]", msg % args)
+            else:
+                print("[完成回调]", msg)
+        except Exception:
+            print("[完成回调]", msg)
+
+    return _log
+
+
+def format_add_no_feishu_extra(
+    store: str,
+    order_id: str,
+    purchase_no: str,
+    err: str = "",
+    raw: str = "",
+) -> str:
+    """飞书购买后文案：注文番号 + 订单ID + 后端原文。"""
+    return (
+        "%s：页面已下单成功，但 addNoCallbackSimple 未更新代购订单状态，请人工核对。"
+        "订单ID=%s 注文番号=%s 后端=%s body=%s"
+        % (
+            store or "站点",
+            str(order_id or "").strip() or "—",
+            str(purchase_no or "").strip() or "—",
+            (err or "").strip() or "—",
+            (raw or "").strip()[:300] or "—",
+        )
+    )
 
 
 def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30) -> Tuple[int, str]:
@@ -68,6 +112,8 @@ def send_add_no_callback(
     """
     from src.utils.dev_test import skip_side_effects
 
+    _log = _make_cb_log(config)
+
     if skip_side_effects(config):
         return True, "", "dev_test_skip"
 
@@ -108,10 +154,17 @@ def send_add_no_callback(
     sign_gen = SignGenerator(secret)
     params["Sign"] = sign_gen.generate_sign(params)
 
-    # 控制台打印，方便跟进确认
-    print("[完成回调] 请求 URL:", url)
-    print("[完成回调] 参数: OrderId=%s CreditCard=%s PurchaseNos=%s" % (order_id, credit_card, purchase_json))
-    print("[完成回调] Sign:", params["Sign"])
+    _log("========== addNoCallbackSimple 开始 ==========")
+    _log("URL=%s", url)
+    _log(
+        "参数 OrderId=%s CreditCard=%s PcMark=%s Mark_len=%s PurchaseNos=%s Sign=%s",
+        order_id,
+        credit_card,
+        pc_mark,
+        len(mark_str),
+        purchase_json,
+        params["Sign"],
+    )
 
     def _once(attempt_no: int):
         _ = attempt_no
@@ -127,28 +180,46 @@ def send_add_no_callback(
             err = "请求异常: %s" % e
             return False, is_transient_http_error(0, err), (False, err, "")
 
-        print("[完成回调] 响应状态码:", code)
-        print("[完成回调] 响应 body 前 300 字符:", (body_text or "")[:300])
+        _log("响应状态码: %s", code)
+        _log("响应 body 全文: %s", (body_text or "")[:800])
 
         if code != 200:
             err = "HTTP %s" % code
+            _log("失败 %s", err)
             return False, is_transient_http_error(code, err), (False, err, body_text or "")
 
         try:
             data = json.loads(body_text) if body_text.strip() else {}
         except Exception:
             err = "响应非 JSON"
+            _log("失败 %s body=%s", err, (body_text or "")[:300])
             return False, True, (False, err, body_text or "")
 
         if data.get("Success") is not True:
             err = "Success=false: %s" % (data.get("Message") or "")
+            _log(
+                "失败 %s ErrorCode=%s Data=%s",
+                err,
+                data.get("ErrorCode"),
+                data.get("Data"),
+            )
             return False, False, (False, err, body_text or "")
         if data.get("Data") is not True:
             err = "Data=false: %s" % (data.get("Message") or "")
+            _log(
+                "失败 %s ErrorCode=%s Success=%s",
+                err,
+                data.get("ErrorCode"),
+                data.get("Success"),
+            )
             return False, False, (False, err, body_text or "")
+        _log("成功 Success=true Data=true ErrorCode=%s", data.get("ErrorCode"))
         return True, False, (True, "", body_text or "")
 
     result = call_api_with_retries("完成回调", _once)
     if isinstance(result, tuple) and len(result) == 3:
-        return result  # type: ignore[return-value]
+        ok, err, raw = result
+        _log("========== addNoCallbackSimple 结束 ok=%s err=%s ==========", ok, err or "")
+        return ok, err, raw  # type: ignore[return-value]
+    _log("========== addNoCallbackSimple 结束 异常 %s ==========", result)
     return False, "请求异常: %s" % result, ""

@@ -21,7 +21,7 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 from src.browser.browser_manager import BrowserManager
 from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
-from src.order.add_no_callback import send_add_no_callback
+from src.order.add_no_callback import format_add_no_feishu_extra, send_add_no_callback
 from src.order.rakuten_ichiba_seller_rules import (
     extract_card_last4_from_text,
     load_seller_rules,
@@ -6283,7 +6283,13 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             msg = "乐天市场：成功页未解析到注文番号"
             try:
                 self.feishu_notifier.notify_order_issue(
-                    str(order_id), [msg], user_id=order.get("user_id"), extra="乐天市场"
+                    str(order_id),
+                    [msg],
+                    user_id=order.get("user_id"),
+                    extra=(
+                        "乐天市场：已点注文確定但未解析到注文番号，请人工核对是否已出单。"
+                        "订单ID=%s" % order_id
+                    ),
                 )
             except Exception:
                 pass
@@ -6307,6 +6313,13 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         detail_url = tpl.format(shop_id=shop_id, purchase_no=purchase_no)
         purchase_nobs = [{"no": purchase_no, "url": detail_url}]
 
+        self.logger.info(
+            "乐天市场：调用 addNoCallbackSimple OrderId=%s PurchaseNo=%s CreditCard=%s missing_gno=%s",
+            order_id,
+            purchase_no,
+            self._credit_card_label(),
+            missing_gno_notified,
+        )
         ok_add, add_err, add_raw = send_add_no_callback(
             order,
             purchase_nobs,
@@ -6314,13 +6327,25 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             config=self.config,
             use_curl=use_curl,
         )
+        self.logger.info(
+            "乐天市场：addNoCallbackSimple ok=%s err=%s body=%s",
+            ok_add,
+            add_err or "",
+            (add_raw or "")[:500],
+        )
         if not ok_add:
             try:
                 self.feishu_notifier.notify_order_issue(
                     str(order_id),
                     [add_err or "addNoCallbackSimple 失败"],
                     user_id=order.get("user_id"),
-                    extra="乐天市场",
+                    extra=format_add_no_feishu_extra(
+                        "乐天市场",
+                        str(order_id),
+                        purchase_no,
+                        add_err or "",
+                        add_raw or "",
+                    ),
                 )
             except Exception:
                 pass
@@ -6332,6 +6357,22 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 add_no_requested=True,
                 add_no_response=(add_raw or "")[:500],
             )
+        if missing_gno_notified:
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [
+                        "本单缺 GoodsNo，页面已下单成功。addNo 返回 ok，请人工核对代购订单是否已更新。"
+                    ],
+                    user_id=order.get("user_id"),
+                    extra=(
+                        "乐天市场：已点注文確定且拿到注文番号，但接口 List 无 GoodsNo。"
+                        "订单ID=%s 注文番号=%s addNo body=%s"
+                        % (order_id, purchase_no, (add_raw or "")[:240] or "—")
+                    ),
+                )
+            except Exception:
+                pass
 
         shot2 = None
         update_errors: List[str] = []
@@ -6380,7 +6421,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                     str(order_id),
                     update_errors,
                     user_id=order.get("user_id"),
-                    extra="乐天市场分单回调异常，请核对是否已出单。",
+                    extra=(
+                        "乐天市场分单回调异常，请核对是否已出单。"
+                        "订单ID=%s 注文番号=%s" % (order_id, purchase_no)
+                    ),
                 )
             except Exception:
                 pass

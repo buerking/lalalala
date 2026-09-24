@@ -93,6 +93,23 @@ class RakutenSessionGuard(LoggerMixin):
         "続く",
         "Continue",
     )
+    SESSION_TIMEOUT_HINTS = (
+        "this session has timed out",
+        "session has timed out",
+        "timed out for security",
+        "please try again",
+        "セッションがタイムアウト",
+        "セキュリティのため",
+        "もう一度お試しください",
+        "再度お試しください",
+    )
+    PASSWORD_MISMATCH_HINTS = (
+        "incorrect password",
+        "invalid password",
+        "wrong password",
+        "パスワードが正しく",
+        "パスワードに誤り",
+    )
     TWO_FACTOR_HINTS = (
         "二段階認証",
         "2段階認証",
@@ -137,6 +154,8 @@ class RakutenSessionGuard(LoggerMixin):
         self.enabled = True if enabled is None else bool(enabled)
         self._implicit_wait_depth = 0
         self._implicit_wait_saved = 10.0
+        self._timeout_recover_count = 0
+        self._max_timeout_recovers = int(login_cfg.get("max_timeout_recovers") or 2)
 
     @staticmethod
     def _resolve_login_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -697,6 +716,25 @@ class RakutenSessionGuard(LoggerMixin):
                   h4k5: !!document.getElementById('h4k5-container') || iframeH4k5,
                   preview: !!document.getElementById('h4k5-preview'),
                   omniErr: !!document.getElementById('omni-error'),
+                  omniErrText: (function(){
+                    var el = document.getElementById('omni-error');
+                    if (!el) return '';
+                    try {
+                      return String(el.innerText || el.textContent || '').trim().slice(0, 180);
+                    } catch (e) { return ''; }
+                  })(),
+                  sessionTimeout: (function(){
+                    var t = '';
+                    try {
+                      var el = document.getElementById('omni-error');
+                      t = (el && (el.innerText || el.textContent || '')) || '';
+                    } catch (e) {}
+                    t = String(t).toLowerCase();
+                    return t.indexOf('session has timed out') >= 0
+                      || t.indexOf('timed out for security') >= 0
+                      || t.indexOf('セッションがタイムアウト') >= 0
+                      || t.indexOf('セキュリティのため') >= 0;
+                  })(),
                   cta: !!document.getElementById('cta011') || iframeCta,
                   anim: !!document.querySelector('.omni-main-view-animating'),
                   elm: (typeof Elm !== 'undefined'),
@@ -788,16 +826,127 @@ class RakutenSessionGuard(LoggerMixin):
         has_omni11 = any(h.startswith("omni-11") for h in hosts)
         if has_omni21 and not has_omni11:
             return True
-        if snap.get("omniErr"):
-            return True
+        # omni-error（会话超时红字）不是冻壳：不要去掉 hash 重开，那会留在过期 token 上
         hash_v = str(snap.get("hash") or "").lower()
         if "sign_in/password" in hash_v and not has_omni11:
             return True
         return False
 
+    def _snap_session_timeout(self, snap: Dict[str, Any]) -> bool:
+        """红字「This session has timed out… Please try again.」或 #omni-error。"""
+        blob = (
+            str(snap.get("omniErrText") or "")
+            + " "
+            + str(snap.get("err") or "")
+        ).lower()
+        if any(h in blob for h in self.PASSWORD_MISMATCH_HINTS):
+            return False
+        if snap.get("sessionTimeout"):
+            return True
+        if snap.get("omniErr"):
+            return True
+        return any(h in blob for h in self.SESSION_TIMEOUT_HINTS)
+
+    def _page_has_session_timeout(self, driver) -> bool:
+        return self._snap_session_timeout(self._widget_snapshot(driver))
+
+    def _click_session_try_again(self, driver) -> str:
+        """点 omni-error 里的 Please try again / もう一度お試しください。"""
+        try:
+            hit = driver.execute_script(
+                """
+                function textOf(el) {
+                  if (!el) return '';
+                  try { return String(el.innerText || el.textContent || '').trim(); }
+                  catch (e) { return ''; }
+                }
+                function walk(root) {
+                  if (!root) return '';
+                  var els;
+                  try { els = root.querySelectorAll('a,button,[role=button],span'); }
+                  catch (e) { els = []; }
+                  for (var i = 0; i < els.length; i++) {
+                    var t = textOf(els[i]);
+                    if (/please try again|try again|もう一度お試し|再度お試し|再試行/i.test(t)) {
+                      try { els[i].click(); } catch (e) {}
+                      return t.slice(0, 60);
+                    }
+                  }
+                  var nodes;
+                  try { nodes = root.querySelectorAll('*'); } catch (e) { return ''; }
+                  for (var i = 0; i < nodes.length; i++) {
+                    if (nodes[i].shadowRoot) {
+                      var r = walk(nodes[i].shadowRoot);
+                      if (r) return r;
+                    }
+                  }
+                  return '';
+                }
+                var err = document.getElementById('omni-error');
+                if (err) {
+                  var a = err.querySelector('a,button,[role=button]');
+                  if (a) {
+                    try { a.click(); } catch (e) {}
+                    return textOf(a).slice(0, 60) || 'omni-error-link';
+                  }
+                  var r = walk(err);
+                  if (r) return r;
+                }
+                return walk(document) || '';
+                """
+            )
+            return str(hit or "").strip()
+        except Exception as e:
+            self.logger.warning("点击 Please try again 失败: %s", e)
+            return ""
+
+    def _recover_session_timeout(self, driver, reason: str) -> bool:
+        """会话超时：先点 Please try again，不行就整页刷新，再重新填密。"""
+        if self._timeout_recover_count >= max(1, self._max_timeout_recovers):
+            self.logger.warning(
+                "乐天登录会话超时已恢复 %s 次，不再刷（%s）",
+                self._timeout_recover_count,
+                reason,
+            )
+            return False
+        self._timeout_recover_count += 1
+        snap = self._widget_snapshot(driver)
+        self.logger.warning(
+            "乐天登录会话超时（%s 第 %s/%s 次），按刷新+再填密处理 snap=%s",
+            reason,
+            self._timeout_recover_count,
+            self._max_timeout_recovers,
+            snap,
+        )
+        clicked = self._click_session_try_again(driver)
+        if clicked:
+            self.logger.info("已点击会话超时链接: %s", clicked[:80])
+            time.sleep(2.0)
+            if not self._page_has_session_timeout(driver) and (
+                self._password_present(driver) or self._username_present(driver)
+            ):
+                return True
+        try:
+            driver.refresh()
+        except Exception as e:
+            self.logger.warning("登录页 refresh 失败: %s，改 GET 当前 URL", e)
+            try:
+                url = (driver.current_url or "").strip()
+                if url:
+                    driver.get(url)
+            except Exception as e2:
+                self.logger.warning("登录页 GET 当前 URL 失败: %s", e2)
+                return False
+        time.sleep(2.5)
+        self._reset_frame(driver)
+        return True
+
     def _kick_stuck_login_widget(self, driver, reason: str) -> None:
         """Omni-21 空壳时不要 refresh（会停在 #/sign_in/password 冻壳）。去掉 hash 再 GET，让页面重走 session_upgrade → omni-11。"""
         if not self.is_login_page(driver):
+            return
+        if self._page_has_session_timeout(driver):
+            self._recover_session_timeout(driver, reason)
             return
         snap = self._widget_snapshot(driver)
         url = ""
@@ -842,6 +991,17 @@ class RakutenSessionGuard(LoggerMixin):
             if last_stage == STAGE_PROFILE:
                 return last_stage
             snap = self._widget_snapshot(driver)
+            if self._snap_session_timeout(snap):
+                if self._recover_session_timeout(driver, "等待表单时发现会话超时"):
+                    logged_shell = False
+                    last_body = None
+                    last_hosts = None
+                    stagnant_since = time.time()
+                    last_miss_log = 0.0
+                    deadline = max(
+                        deadline, time.time() + max(12.0, self.form_ready_seconds * 0.7)
+                    )
+                    continue
             if not logged_shell and (
                 snap.get("h4k5")
                 or snap.get("pwd")
@@ -903,6 +1063,7 @@ class RakutenSessionGuard(LoggerMixin):
 
     def _submit_login(self, driver) -> bool:
         self._reset_frame(driver)
+        self._timeout_recover_count = 0
         self.logger.info("乐天登录 widget 初始快照 %s", self._widget_snapshot(driver))
         stage = self._wait_form_ready(driver)
         self.logger.info(
@@ -947,6 +1108,16 @@ class RakutenSessionGuard(LoggerMixin):
                 % (stage, snap)
             )
 
+        if self._page_has_session_timeout(driver):
+            self._recover_session_timeout(driver, "填密前发现会话超时")
+            stage = self._wait_form_ready(driver)
+            password_el = self._find_password_el(driver)
+            if password_el is None:
+                snap = self._widget_snapshot(driver)
+                raise RakutenLoginError(
+                    "会话超时刷新后仍找不到密码框（stage=%s snap=%s）" % (stage, snap)
+                )
+
         # 只在当前 document 找账号框，避免再切 frame 把 password_el 弄失效
         user_el = self._find_in_current_document(driver, self.USER_SELECTORS)
         if user_el is not None and self.email:
@@ -971,12 +1142,20 @@ class RakutenSessionGuard(LoggerMixin):
                 len(got),
             )
             self._fill_input(driver, password_el, self.password, prefer_keys=True)
+        if self._page_has_session_timeout(driver):
+            if self._recover_session_timeout(driver, "填密后仍有会话超时红字（Next 会是灰的）"):
+                stage = self._wait_form_ready(driver)
+                password_el = self._find_password_el(driver)
+                if password_el is not None:
+                    self._wait_animating_done(driver)
+                    self._fill_input(driver, password_el, self.password)
         self._wait_before_cta(driver)
         self._click_next(driver)
         self._reset_frame(driver)
 
         time.sleep(self.wait_after_submit_seconds)
         deadline = time.time() + self.login_timeout_seconds
+        timeout_refilled = False
         while time.time() < deadline:
             if self.looks_like_two_factor(driver):
                 return False
@@ -984,6 +1163,19 @@ class RakutenSessionGuard(LoggerMixin):
                 return self._complete_additional_profile(driver)
             if not self.is_login_page(driver):
                 return True
+            if (not timeout_refilled) and self._page_has_session_timeout(driver):
+                if self._recover_session_timeout(driver, "点 Next 后出现会话超时"):
+                    timeout_refilled = True
+                    stage = self._wait_form_ready(driver)
+                    password_el = self._find_password_el(driver)
+                    if password_el is not None:
+                        self._wait_animating_done(driver)
+                        self._fill_input(driver, password_el, self.password)
+                        self._wait_before_cta(driver)
+                        self._click_next(driver)
+                        self._reset_frame(driver)
+                        deadline = time.time() + self.login_timeout_seconds
+                        continue
             time.sleep(0.5)
         return False
 
