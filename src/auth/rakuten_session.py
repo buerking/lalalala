@@ -8,7 +8,8 @@
   - 只认登录域名，绝不扫业务页 DOM
   - 按页面阶段信号推进：账号页 → 密码页 →（可选）2FA → 离开登录域
   - 找控件：顶层 + 嵌套 iframe（按下标切）+ open/closed Shadow DOM
-  - SPA（#/sign_in/password）给足渲染时间；omni-21 空壳则去掉 hash 再 GET，让页面重走 session_upgrade → omni-11
+  - 落到登录页先整页刷新再填密（过期 cookie 不刷新就会卡无密码框 / Next 灰色）
+  - SPA（#/sign_in/password）给足渲染时间；冻壳不要只去掉 hash 再 GET（对已打开的 SPA 常是空操作）
   - 已出现 iframe 时先搜框，避免把藏在 frame 里的表当冻壳刷掉
   - 闭包 Shadow 探测必须 implicit_wait=0，否则每个选择器空等 10 秒，踢壳永远轮不到
 """
@@ -156,6 +157,9 @@ class RakutenSessionGuard(LoggerMixin):
         self._implicit_wait_saved = 10.0
         self._timeout_recover_count = 0
         self._max_timeout_recovers = int(login_cfg.get("max_timeout_recovers") or 2)
+        self._login_reloads = 0
+        self._sso_reissue_count = 0
+        self._pending_resume_url = ""
 
     @staticmethod
     def _resolve_login_cfg(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -528,9 +532,16 @@ class RakutenSessionGuard(LoggerMixin):
             )
 
         target = self._sanitize_resume_url(resume_url)
+        self._pending_resume_url = target
+        self._login_reloads = 0
+        self._sso_reissue_count = 0
+        self._timeout_recover_count = 0
+        # 先刷新：过期 cookie 的登录页不刷新就会一直无密码框 / Next 灰色
+        self._hard_reload_login_page(driver, "检测到登录页，先刷新再填密")
         last_err = ""
         for upgrade_round in range(1, self.max_upgrade_rounds + 1):
             if not self.is_login_page(driver):
+                self.logger.info("已离开登录页（刷新或换 SSO 后会话有效）")
                 break
 
             stage = self.detect_stage(driver)
@@ -941,43 +952,78 @@ class RakutenSessionGuard(LoggerMixin):
         self._reset_frame(driver)
         return True
 
+    def _site_home_url(self) -> str:
+        adapter = str(
+            ((self.config or {}).get("_site") or {}).get("adapter") or ""
+        ).strip()
+        if adapter == "rakuten_books":
+            return "https://books.rakuten.co.jp/"
+        return "https://www.rakuten.co.jp/"
+
+    def _hard_reload_login_page(self, driver, reason: str = "") -> None:
+        """浏览器整页刷新。去掉 hash 再 GET 同一条 session/upgrade 对已打开 SPA 常是空操作。"""
+        url = ""
+        try:
+            url = (driver.current_url or "").strip()
+        except Exception:
+            url = ""
+        self.logger.warning(
+            "乐天登录页整页刷新（%s）URL=%s",
+            reason or "refresh",
+            url[:220],
+        )
+        try:
+            driver.refresh()
+        except Exception as e:
+            self.logger.warning("driver.refresh 失败: %s，改 location.reload", e)
+            try:
+                driver.execute_script("location.reload();")
+            except Exception as e2:
+                self.logger.warning("location.reload 失败: %s", e2)
+                return
+        self._login_reloads += 1
+        time.sleep(2.5)
+        self._reset_frame(driver)
+
+    def _reissue_sso_from_site(self, driver, reason: str) -> None:
+        """同一条过期 token 再刷仍无表单时，离开登录站，让业务站签发新的 session/upgrade。"""
+        if self._sso_reissue_count >= 1:
+            self.logger.warning("已换过一次 SSO token，不再重复（%s）", reason)
+            return
+        dest = self._sanitize_resume_url(self._pending_resume_url) or self._site_home_url()
+        self._sso_reissue_count += 1
+        self.logger.warning(
+            "登录冻壳未解开（%s），离开过期 session/upgrade，打开业务站换新 SSO: %s",
+            reason,
+            dest,
+        )
+        try:
+            driver.get(dest)
+        except Exception as e:
+            self.logger.warning("跳业务站失败: %s", e)
+            return
+        time.sleep(2.5)
+        self._reset_frame(driver)
+
     def _kick_stuck_login_widget(self, driver, reason: str) -> None:
-        """Omni-21 空壳时不要 refresh（会停在 #/sign_in/password 冻壳）。去掉 hash 再 GET，让页面重走 session_upgrade → omni-11。"""
+        """冻壳：先整页刷新；仍无密码框则离开过期 token 去业务站换新 SSO。"""
         if not self.is_login_page(driver):
             return
         if self._page_has_session_timeout(driver):
             self._recover_session_timeout(driver, reason)
             return
         snap = self._widget_snapshot(driver)
-        url = ""
-        try:
-            url = (driver.current_url or "").strip()
-        except Exception:
-            url = ""
-        bare = url.split("#", 1)[0].strip() if url else ""
-        self.logger.warning(
-            "乐天登录 widget 卡住（%s），去掉 hash 重开登录页以注入 Omni-11 snap=%s",
-            reason,
-            snap,
-        )
-        try:
-            if bare:
-                driver.get(bare)
-            elif url:
-                driver.get(url)
-            else:
-                driver.refresh()
-        except Exception as e:
-            self.logger.warning("登录页重开失败: %s，改 refresh", e)
-            try:
-                driver.refresh()
-            except Exception as e2:
-                self.logger.warning("登录页 refresh 失败: %s", e2)
-                return
-        time.sleep(2.0)
+        self.logger.warning("乐天登录 widget 卡住（%s）snap=%s", reason, snap)
+        if self._login_reloads <= 0:
+            self._hard_reload_login_page(driver, reason)
+            return
+        if self._sso_reissue_count <= 0:
+            self._reissue_sso_from_site(driver, reason)
+            return
+        self._hard_reload_login_page(driver, reason)
 
     def _wait_form_ready(self, driver) -> str:
-        """等到能取到 #password_current / 账号框。omni-21 空壳则去掉 hash 重开，最多踢两次。"""
+        """等到能取到 #password_current / 账号框。冻壳则整页刷新，仍无表单则离开过期 SSO。"""
         deadline = time.time() + max(3.0, self.form_ready_seconds)
         last_stage = STAGE_LOGIN_UNKNOWN
         logged_shell = False
@@ -987,9 +1033,14 @@ class RakutenSessionGuard(LoggerMixin):
         stagnant_since = time.time()
         kicks = 0
         while time.time() < deadline:
+            if not self.is_login_page(driver):
+                self.logger.info("等待登录表单时已离开登录站")
+                return STAGE_NOT_LOGIN
             last_stage = self.detect_stage(driver)
             if last_stage == STAGE_PROFILE:
                 return last_stage
+            if last_stage == STAGE_NOT_LOGIN:
+                return STAGE_NOT_LOGIN
             snap = self._widget_snapshot(driver)
             if self._snap_session_timeout(snap):
                 if self._recover_session_timeout(driver, "等待表单时发现会话超时"):
@@ -1069,8 +1120,11 @@ class RakutenSessionGuard(LoggerMixin):
         self.logger.info(
             "乐天登录适配器推进 stage=%s snap=%s",
             stage,
-            self._widget_snapshot(driver),
+            self._widget_snapshot(driver) if self.is_login_page(driver) else {},
         )
+
+        if stage == STAGE_NOT_LOGIN or not self.is_login_page(driver):
+            return True
 
         if stage == STAGE_TWO_FACTOR:
             return False
@@ -1088,6 +1142,8 @@ class RakutenSessionGuard(LoggerMixin):
                 time.sleep(0.8)
                 stage = self._wait_form_ready(driver)
                 self.logger.info("账号页提交后 stage=%s", stage)
+                if stage == STAGE_NOT_LOGIN or not self.is_login_page(driver):
+                    return True
 
         password_el = self._find_password_el(driver)
         if password_el is None and stage in (

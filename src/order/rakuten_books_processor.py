@@ -1369,7 +1369,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
 
         try:
-            self._ensure_rakuten_session()
+            self._ensure_rakuten_session(resume_url=self._books_cart_url())
         except RakutenLoginError as e:
             msg = "乐天登录失败: %s" % e
             self.logger.error("乐天书店：%s order=%s", msg, order_id)
