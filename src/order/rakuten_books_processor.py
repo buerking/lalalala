@@ -38,6 +38,7 @@ from src.payment.confirm_page_verifier import (
     take_full_page_screenshot,
     upload_screenshot_get_url,
     check_cart_goods_simple,
+    is_cart_goods_mismatch_error,
 )
 from src.auth.rakuten_session import RakutenLoginError, RakutenSessionGuard
 from src.utils.logger import LoggerMixin
@@ -61,6 +62,60 @@ _BOOK_SHOP_ID_ENCODED_RE = re.compile(
     r"item\.rakuten\.co\.jp(?:/|%2[Ff])book(?:/|%2[Ff])(?P<id>\d+)",
     re.IGNORECASE,
 )
+_PERSON_QTY_LIMIT_RE = re.compile(r"1人\s*(\d+)\s*個まで")
+_CART_ITEM_ROW_CSS = ".item-list .item.js-item, .item-list .js-item"
+_CART_UNITS_CSS = "select.js-units, select[name^='units[']"
+_PDP_UNITS_CSS = "div.new_buyButton select#units, select#units"
+
+_JS_SELECT_VALUES = """
+var sel = arguments[0];
+var vals = [];
+var seen = {};
+if (!sel || !sel.options) return vals;
+for (var i = 0; i < sel.options.length; i++) {
+  var v = parseInt(sel.options[i].value, 10);
+  if (!isNaN(v) && !seen[v]) { seen[v] = 1; vals.push(v); }
+}
+return vals;
+"""
+_JS_SELECT_VALUE = """
+var sel = arguments[0];
+if (!sel) return '';
+return String(sel.value || '');
+"""
+_JS_SET_SELECT_QTY = """
+var sel = arguments[0];
+var qty = String(arguments[1]);
+if (!sel || !sel.options) return '';
+var found = false;
+for (var i = 0; i < sel.options.length; i++) {
+  if (String(sel.options[i].value) === qty) {
+    sel.selectedIndex = i;
+    found = true;
+    break;
+  }
+}
+if (!found) return String(sel.value || '');
+sel.value = qty;
+try {
+  sel.dispatchEvent(new Event('change', {bubbles: true}));
+} catch (e1) {
+  var ev = document.createEvent('HTMLEvents');
+  ev.initEvent('change', true, true);
+  sel.dispatchEvent(ev);
+}
+try { sel.dispatchEvent(new Event('input', {bubbles: true})); } catch (e2) {}
+var jq = window.jQuery || window.$;
+if (jq) {
+  try { jq(sel).val(qty).trigger('change'); } catch (e3) {}
+}
+var wrap = sel.parentElement;
+if (wrap) {
+  var inner = wrap.querySelector('.customSelectInner');
+  if (inner) inner.textContent = qty;
+}
+return String(sel.value || '');
+"""
 
 
 def extract_rakuten_book_id(url: str) -> Optional[str]:
@@ -370,20 +425,358 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 self.logger.warning("乐天书店：清空购物车失败: %s", e)
                 raise
 
+    def _book_cart_key(self, url: str) -> str:
+        return extract_rakuten_book_id(str(url or "").strip()) or ""
+
+    def _merge_duplicate_book_products(
+        self, products: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        按 /rb/{id} 合并接口重复行，数量相加。
+        书店详情页再点一次「買い物かごに入れる」通常不会把已在车内的同一书号从 1 累加到 N，
+        必须在下拉框一次选好合计数量后加购。
+        回调仍按 _source_lines 逐行 addedCartCallbackSimple。
+        """
+        merged: List[Dict[str, Any]] = []
+        index_by_key: Dict[str, int] = {}
+        for product in products or []:
+            key = self._book_cart_key(str(product.get("url") or ""))
+            try:
+                qty = max(1, int(product.get("quantity") or 1))
+            except Exception:
+                qty = 1
+            if not key:
+                merged.append(
+                    {
+                        **product,
+                        "quantity": qty,
+                        "_source_lines": list(product.get("_source_lines") or [product]),
+                    }
+                )
+                continue
+            if key in index_by_key:
+                item = merged[index_by_key[key]]
+                item["quantity"] = int(item.get("quantity") or 0) + qty
+                item["_source_lines"].extend(
+                    list(product.get("_source_lines") or [product])
+                )
+                continue
+            index_by_key[key] = len(merged)
+            row = dict(product)
+            row["quantity"] = qty
+            row["_source_lines"] = list(product.get("_source_lines") or [product])
+            merged.append(row)
+        if len(merged) < len(products or []):
+            self.logger.info(
+                "乐天书店：接口商品行 %s 条已合并为 %s 次加购（按书号）",
+                len(products or []),
+                len(merged),
+            )
+            for item in merged:
+                self.logger.info(
+                    "乐天书店：合并项 qty=%s lines=%s url=%s",
+                    item.get("quantity"),
+                    len(item.get("_source_lines") or []),
+                    normalize_rakuten_books_product_url(str(item.get("url") or "")),
+                )
+        return merged
+
+    def _expected_book_quantities(
+        self, products: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        expected: Dict[str, int] = {}
+        for product in products or []:
+            lines = list(product.get("_source_lines") or [product])
+            for line in lines:
+                key = self._book_cart_key(
+                    str(line.get("url") or product.get("url") or "")
+                )
+                if not key:
+                    continue
+                try:
+                    qty = max(1, int(line.get("quantity") or 1))
+                except Exception:
+                    qty = 1
+                expected[key] = int(expected.get(key) or 0) + qty
+        return expected
+
+    @staticmethod
+    def _qty_maps_match(expected: Dict[str, int], actual: Dict[str, int]) -> bool:
+        if not expected:
+            return False
+        for key, qty in expected.items():
+            if int(actual.get(key) or 0) != int(qty or 0):
+                return False
+        if sum(int(v or 0) for v in expected.values()) != sum(
+            int(v or 0) for v in actual.values()
+        ):
+            return False
+        return True
+
+    def _select_option_values(self, driver, sel_el) -> List[int]:
+        try:
+            raw = driver.execute_script(_JS_SELECT_VALUES, sel_el) or []
+        except Exception:
+            raw = []
+        out: List[int] = []
+        for x in raw:
+            try:
+                n = int(x)
+            except Exception:
+                continue
+            if n > 0 and n not in out:
+                out.append(n)
+        if out:
+            return out
+        try:
+            picker = Select(sel_el)
+            for opt in picker.options:
+                n = int(re.sub(r"[^\d]", "", opt.get_attribute("value") or "") or "0")
+                if n > 0 and n not in out:
+                    out.append(n)
+        except Exception:
+            pass
+        return out
+
+    def _read_select_qty(self, driver, sel_el) -> int:
+        try:
+            raw = driver.execute_script(_JS_SELECT_VALUE, sel_el) or ""
+            n = int(re.sub(r"[^\d]", "", str(raw)) or "0")
+            if n > 0:
+                return n
+        except Exception:
+            pass
+        try:
+            picker = Select(sel_el)
+            raw = picker.first_selected_option.get_attribute("value") or ""
+            return int(re.sub(r"[^\d]", "", raw) or "0")
+        except Exception:
+            return 0
+
+    def _set_native_units_select(self, driver, sel_el, quantity: int) -> int:
+        qty = max(1, int(quantity or 1))
+        options = self._select_option_values(driver, sel_el)
+        if options and qty not in options:
+            self.logger.warning(
+                "乐天书店：数量下拉无选项 %s，可选=%s", qty, options
+            )
+            return self._read_select_qty(driver, sel_el)
+        try:
+            raw = driver.execute_script(_JS_SET_SELECT_QTY, sel_el, qty)
+            n = int(re.sub(r"[^\d]", "", str(raw or "")) or "0")
+            if n == qty:
+                return n
+        except Exception as e:
+            self.logger.warning("乐天书店：JS 设置数量失败: %s", e)
+        try:
+            Select(sel_el).select_by_value(str(qty))
+        except Exception:
+            try:
+                Select(sel_el).select_by_visible_text(str(qty))
+            except Exception:
+                pass
+        return self._read_select_qty(driver, sel_el)
+
+    def _parse_person_qty_limit(self, driver) -> Optional[int]:
+        texts: List[str] = []
+        try:
+            for el in driver.find_elements(
+                By.CSS_SELECTOR, "p.status__warning__text, .status__warning"
+            ):
+                texts.append(el.text or "")
+        except Exception:
+            pass
+        blob = "\n".join(texts)
+        m = _PERSON_QTY_LIMIT_RE.search(blob)
+        if m:
+            return int(m.group(1))
+        return None
+
+    def _cart_item_rows(self, driver):
+        css = (self.rb_cfg.get("cart_item_row_css") or _CART_ITEM_ROW_CSS).strip()
+        try:
+            return list(driver.find_elements(By.CSS_SELECTOR, css) or [])
+        except Exception:
+            return []
+
+    def _cart_row_book_id(self, row) -> str:
+        try:
+            for a in row.find_elements(By.CSS_SELECTOR, "a[href*='/rb/']"):
+                bid = extract_rakuten_book_id(a.get_attribute("href") or "") or ""
+                if bid:
+                    return bid
+        except Exception:
+            pass
+        return ""
+
+    def _cart_row_units_el(self, row):
+        css = (self.rb_cfg.get("cart_units_select_css") or _CART_UNITS_CSS).strip()
+        return row.find_element(By.CSS_SELECTOR, css)
+
+    def _cart_row_qty(self, driver, row) -> int:
+        try:
+            sel = self._cart_row_units_el(row)
+            n = self._read_select_qty(driver, sel)
+            if n > 0:
+                return n
+        except Exception:
+            pass
+        try:
+            inner = row.find_element(By.CSS_SELECTOR, ".customSelectInner")
+            return int(re.sub(r"[^\d]", "", inner.text or "0") or "0")
+        except Exception:
+            return 0
+
+    def _log_cart_already_ordered(self, driver) -> None:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, ".duplicateAlert"):
+                txt = " ".join((el.text or "").split())
+                if txt:
+                    self.logger.warning("乐天书店：购物车提示已下过单 %s", txt)
+        except Exception:
+            pass
+
+    def _parse_cart_book_quantities(self, driver) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for row in self._cart_item_rows(driver):
+            bid = self._cart_row_book_id(row)
+            if not bid:
+                continue
+            num = self._cart_row_qty(driver, row)
+            out[bid] = int(out.get(bid) or 0) + int(num or 0)
+        return out
+
+    def _try_fix_cart_quantities(
+        self, driver, expected: Dict[str, int]
+    ) -> Dict[str, int]:
+        for row in self._cart_item_rows(driver):
+            bid = self._cart_row_book_id(row)
+            want = int(expected.get(bid) or 0)
+            if not bid or want <= 0:
+                continue
+            actual = self._cart_row_qty(driver, row)
+            if actual == want:
+                continue
+            try:
+                sel = self._cart_row_units_el(row)
+                options = self._select_option_values(driver, sel)
+                if options and want not in options:
+                    self.logger.error(
+                        "乐天书店：购物车数量无法改为 %s book=%s 可选=%s",
+                        want,
+                        bid,
+                        options,
+                    )
+                    continue
+                got = self._set_native_units_select(driver, sel, want)
+                self.logger.info(
+                    "乐天书店：购物车改数量 book=%s want=%s was=%s got=%s options=%s",
+                    bid,
+                    want,
+                    actual,
+                    got,
+                    options,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    "乐天书店：购物车无法改数量 book=%s want=%s err=%s", bid, want, e
+                )
+        time.sleep(1.5)
+        return self._parse_cart_book_quantities(driver)
+
+    def _ensure_cart_quantities(
+        self, driver, products: List[Dict[str, Any]]
+    ) -> Tuple[bool, str]:
+        expected = self._expected_book_quantities(products)
+        self._log_cart_already_ordered(driver)
+        rows = self._cart_item_rows(driver)
+        actual = self._parse_cart_book_quantities(driver)
+        self.logger.info(
+            "乐天书店：加购后购物车数量 expected=%s actual=%s rows=%s",
+            expected,
+            actual,
+            len(rows),
+        )
+        if self._qty_maps_match(expected, actual):
+            return True, ""
+        if expected and not rows:
+            return False, "购物车为空 expected=%s" % expected
+        actual = self._try_fix_cart_quantities(driver, expected)
+        self.logger.info(
+            "乐天书店：购物车改数量后 expected=%s actual=%s", expected, actual
+        )
+        if self._qty_maps_match(expected, actual):
+            return True, ""
+        msg = "购物车数量与订单不符 expected=%s actual=%s" % (expected, actual)
+        return False, msg
+
+    def _confirm_page_book_quantities(
+        self, goods_list: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for g in goods_list or []:
+            no = str(g.get("No") or "").strip()
+            if not no or no.startswith("unknown_"):
+                continue
+            try:
+                num = max(1, int(g.get("Num") or 1))
+            except Exception:
+                num = 1
+            out[no] = int(out.get(no) or 0) + num
+        return out
+
     def _add_product_to_cart(self, driver, product_url: str, quantity: int) -> None:
         self._navigate(driver, product_url.split("?")[0].rstrip("/") + "/")
         time.sleep(float(self.rb_cfg.get("wait_after_pdp_load_seconds", 2)))
-        units_sel = (self.rb_cfg.get("units_select_css") or "select#units").strip()
-        add_btn = (self.rb_cfg.get("add_to_cart_button_css") or "button.new_addToCart").strip()
-        try:
-            sel_el = WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, units_sel))
+        units_css = (
+            self.rb_cfg.get("units_select_css") or _PDP_UNITS_CSS
+        ).strip() or _PDP_UNITS_CSS
+        add_btn = (
+            self.rb_cfg.get("add_to_cart_button_css") or "button.new_addToCart"
+        ).strip()
+        qty = max(1, int(quantity or 1))
+        sel_el = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, units_css))
+        )
+        options = self._select_option_values(driver, sel_el)
+        person_limit = self._parse_person_qty_limit(driver)
+        max_allowed = None
+        if options:
+            max_allowed = max(options)
+        if person_limit:
+            max_allowed = (
+                min(max_allowed, person_limit)
+                if max_allowed is not None
+                else person_limit
             )
-            Select(sel_el).select_by_value(str(max(1, min(100, int(quantity or 1)))))
-        except Exception:
-            pass
+        self.logger.info(
+            "乐天书店：详情页数量 want=%s options=%s 限购=%s %s",
+            qty,
+            options,
+            person_limit,
+            product_url,
+        )
+        if max_allowed is not None and qty > max_allowed:
+            raise RuntimeError(
+                "订单数量 %s 超过页面上限 %s（选项=%s 1人N个=%s）"
+                % (qty, max_allowed, options, person_limit)
+            )
+        selected = self._set_native_units_select(driver, sel_el, qty)
+        self.logger.info(
+            "乐天书店：详情页加购 want_qty=%s selected=%s %s",
+            qty,
+            selected,
+            product_url,
+        )
+        if selected != qty:
+            raise RuntimeError(
+                "详情页未能选择数量 want=%s selected=%s options=%s"
+                % (qty, selected, options)
+            )
         self._random_pre_click_wait("買い物かごに入れる")
-        btn = WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.CSS_SELECTOR, add_btn)))
+        btn = WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, add_btn))
+        )
         driver.execute_script("arguments[0].click();", btn)
         time.sleep(float(self.rb_cfg.get("wait_after_add_cart_seconds", 3)))
 
@@ -1368,8 +1761,16 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
     def process_order(self, order: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         order_id = order.get("order_id", "未知")
-        products: List[Dict[str, Any]] = order.get("products") or []
-        self.logger.info("乐天书店：开始处理订单 %s，商品数 %s", order_id, len(products))
+        raw_products: List[Dict[str, Any]] = order.get("products") or []
+        products: List[Dict[str, Any]] = self._merge_duplicate_book_products(
+            raw_products
+        )
+        self.logger.info(
+            "乐天书店：开始处理订单 %s，接口行 %s，加购组 %s",
+            order_id,
+            len(raw_products),
+            len(products),
+        )
         self._cookie_error_recoveries = 0
         if not products:
             return False, self._make_summary(order, failure_reason="订单无商品")
@@ -1477,21 +1878,18 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         except Exception:
                             pass
 
-            # 浏览器：按接口行加购（每行用该行数量；不跨行合并）
+            # 浏览器：同书号已合并，一次选数量后加购；回调仍按接口行
             try:
+                group_qty = max(1, int(product.get("quantity") or 1))
                 self.logger.info(
-                    "乐天书店：加购组 %s/%s 接口行=%s %s",
+                    "乐天书店：加购组 %s/%s 接口行=%s qty=%s %s",
                     idx,
                     len(products),
                     len(source_lines),
+                    group_qty,
                     purl,
                 )
-                for line in source_lines:
-                    line_qty = max(1, int(line.get("quantity") or 1))
-                    line_url = normalize_rakuten_books_product_url(
-                        str(line.get("url") or purl)
-                    )
-                    self._add_product_to_cart(driver, line_url or purl, line_qty)
+                self._add_product_to_cart(driver, purl, group_qty)
             except Exception as e:
                 msg = "加购失败: %s url=%s" % (e, purl)
                 self.logger.error(msg)
@@ -1592,6 +1990,19 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
         self._navigate(driver, self._books_cart_url().split("#")[0])
         time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+        cart_ok, cart_qty_err = self._ensure_cart_quantities(driver, products)
+        if not cart_ok:
+            self.logger.error("乐天书店：%s order=%s", cart_qty_err, order_id)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [cart_qty_err],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店：加购后购物车数量与订单不符，未点确定。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(order, failure_reason=cart_qty_err)
 
         try:
             self._click_books_go_checkout(driver)
@@ -1640,6 +2051,28 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 total = goods_fee + operate_fee
             if total > 0 and goods_fee + operate_fee != total:
                 operate_fee = total - goods_fee
+
+        expected_qty = self._expected_book_quantities(products)
+        page_qty = self._confirm_page_book_quantities(goods_list)
+        self.logger.info(
+            "乐天书店：确认页数量核对 expected=%s actual=%s", expected_qty, page_qty
+        )
+        if not self._qty_maps_match(expected_qty, page_qty):
+            msg = "确认页数量与订单不符 expected=%s actual=%s" % (
+                expected_qty,
+                page_qty,
+            )
+            self.logger.error("乐天书店：%s order=%s", msg, order_id)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [msg],
+                    user_id=order.get("user_id"),
+                    extra="乐天书店：确认页件数与订单不符，未点确定。",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(order, failure_reason=msg)
 
         # 仅当接口真有 GoodsNo 时，才用它对账；空 GoodsNo 不要用 GoodsId 顶替
         order_goods = self._goods_list_from_order_products(products, order)
@@ -1725,16 +2158,35 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     pass
 
         if not ok_chk:
+            mismatch = is_cart_goods_mismatch_error(chk_err, chk_raw)
             allow_continue = bool(
                 self.rb_cfg.get("commit_even_if_check_cart_fails", False)
             )
-            if missing_gno_notified:
-                self.logger.warning(
-                    "乐天书店：checkCart 失败但本单缺 GoodsNo，忽略并对确认页点确定 err=%s",
-                    chk_err,
+            # 商品/数量不一致：无论缺 GoodsNo、转交配置如何，禁止点确定
+            if mismatch:
+                msg = chk_err or "checkCartGoodsSimple：购物车与订单商品不一致"
+                self.logger.error(
+                    "乐天书店：禁止点击注文を確定する（商品不一致） err=%s order=%s",
+                    msg,
+                    order_id,
                 )
-            elif allow_continue:
-                # 市场→书店转交常见 Mark/状态不一致；继续下单，勿发「需人工」以免误判整单失败
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [msg],
+                        user_id=order.get("user_id"),
+                        extra="乐天书店：购物车与订单商品不一致，已停止，未点确定。",
+                    )
+                except Exception:
+                    pass
+                return False, self._make_summary(
+                    order,
+                    failure_reason=msg,
+                    check_cart_requested=True,
+                    check_cart_response=(chk_raw or "")[:500],
+                )
+            if allow_continue:
+                # 仅非「商品不一致」：如转交验签/Mark；不得覆盖上面的硬停止
                 self.logger.warning(
                     "乐天书店：checkCart 失败仍继续点「注文を確定する」 err=%s",
                     chk_err,
@@ -1745,7 +2197,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         str(order_id),
                         [chk_err or "checkCartGoodsSimple 失败"],
                         user_id=order.get("user_id"),
-                        extra="乐天书店结算校验失败",
+                        extra="乐天书店结算校验失败，未点确定。",
                     )
                 except Exception:
                     pass

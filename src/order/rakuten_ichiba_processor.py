@@ -42,6 +42,7 @@ from src.payment.confirm_page_verifier import (
     take_full_page_screenshot,
     upload_screenshot_get_url,
     check_cart_goods_simple,
+    is_cart_goods_mismatch_error,
 )
 from src.auth.rakuten_session import RakutenLoginError, RakutenSessionGuard
 from src.utils.logger import LoggerMixin
@@ -5682,7 +5683,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         rb["pull_pc_mark"] = ichiba_pc_mark
         rb["pull_store_name"] = ichiba_store
         rb["pull_credit_card"] = ichiba_card
-        # 市场转书店偶发 GoodsNo 形态不一致：校验失败仍尽量点确定，避免卡死确认页
+        # 转交时验签/Mark 失败可继续；商品信息不一致仍由书店硬停止，禁止点确定
         rb.setdefault("commit_even_if_check_cart_fails", True)
         rb.setdefault(
             "purchase_url_template",
@@ -6093,9 +6094,31 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         pass
 
             if not ok_chk:
+                if is_cart_goods_mismatch_error(chk_err, chk_raw):
+                    msg = chk_err or "checkCartGoodsSimple：购物车与订单商品不一致"
+                    self.logger.error(
+                        "乐天市场：禁止继续结算（商品不一致） err=%s order=%s",
+                        msg,
+                        order_id,
+                    )
+                    try:
+                        self.feishu_notifier.notify_order_issue(
+                            str(order_id),
+                            [msg],
+                            user_id=order.get("user_id"),
+                            extra="乐天市场：购物车与订单商品不一致，已停止，未进入结算。",
+                        )
+                    except Exception:
+                        pass
+                    return False, self._make_summary(
+                        order,
+                        failure_reason=msg,
+                        check_cart_requested=True,
+                        check_cart_response=(chk_raw or "")[:500],
+                    )
                 if missing_gno_notified:
                     self.logger.warning(
-                        "乐天市场：checkCart 失败但本单缺 GoodsNo，忽略并继续结算 err=%s",
+                        "乐天市场：checkCart 失败但本单缺 GoodsNo，且非商品不一致，继续结算 err=%s",
                         chk_err,
                     )
                 else:

@@ -428,6 +428,21 @@ def build_goods_list_from_confirm_page(driver, order: Dict[str, Any]) -> list:
     return out
 
 
+def is_cart_goods_mismatch_error(*parts: Any) -> bool:
+    """
+    后端明确返回购物车/确认页与订单商品不一致时，禁止点确定或继续结算。
+    缺 GoodsNo、验签失败等其它原因不得拿来覆盖这条硬规则。
+    """
+    text = " ".join(str(p or "") for p in parts)
+    keys = (
+        "商品信息不一致",
+        "商品信息与订单",
+        "数量不一致",
+        "件数不一致",
+    )
+    return any(k in text for k in keys)
+
+
 def check_cart_goods_simple(
     order: Dict[str, Any],
     total: int,
