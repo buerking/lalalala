@@ -164,6 +164,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if not self.session_guard:
             return
         target = self._sanitize_books_resume_url(resume_url or "")
+        if not target:
+            target = self._books_cart_url()
         # 与市场购物车「購入手続き」一致：session/upgrade 可能异步跳转，最多等 8 秒
         wait = min(max(float(wait_seconds), 0.2), 8.0)
         self.session_guard.ensure_after_possible_redirect(
@@ -909,6 +911,19 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             return False
         return "/bs/cart" in url or url.rstrip("/").endswith("/cart")
 
+    def _is_books_site_home(self, driver) -> bool:
+        try:
+            url = (driver.current_url or "").strip().lower().split("#", 1)[0]
+            url = url.split("?", 1)[0].rstrip("/")
+        except Exception:
+            return False
+        return url in (
+            "https://books.rakuten.co.jp",
+            "http://books.rakuten.co.jp",
+            "https://www.books.rakuten.co.jp",
+            "http://www.books.rakuten.co.jp",
+        )
+
     def _click_books_return_to_cart(self, driver) -> None:
         btn = self._find_books_control_by_texts(driver, ("買い物かごに戻る",))
         if btn is not None:
@@ -949,7 +964,10 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
         driver.execute_script("arguments[0].click();", ck)
         time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
-        self._ensure_session_after_action(wait_seconds=8.0)
+        self._ensure_session_after_action(
+            resume_url=self._books_cart_url(),
+            wait_seconds=8.0,
+        )
 
     def _recover_from_cookie_error_via_cart(self, driver) -> bool:
         """
@@ -983,6 +1001,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         购物车「ご購入手続き」后，可能先停在「支払いと配送」等中间页。
         自动点「次へ」类按钮直到出现注文確認页。
         """
+        self._checkout_reenter_after_login = 0
         max_rounds = int(self.rb_cfg.get("checkout_intermediate_max_rounds", 3) or 3)
         round_idx = 0
         while round_idx < max(1, max_rounds):
@@ -995,6 +1014,24 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     self.logger.info("乐天书店：已进入注文確認页")
                 return
 
+            if self._is_books_cart_page(driver) or self._is_books_site_home(driver):
+                n = int(getattr(self, "_checkout_reenter_after_login", 0) or 0)
+                if n < 2:
+                    self._checkout_reenter_after_login = n + 1
+                    where = "首页" if self._is_books_site_home(driver) else "购物车"
+                    self.logger.warning(
+                        "乐天书店：登录后落在%s，重新走ご購入手続き（%s/2） URL=%s",
+                        where,
+                        n + 1,
+                        getattr(driver, "current_url", ""),
+                    )
+                    if self._is_books_site_home(driver):
+                        self._navigate(driver, self._books_cart_url().split("#")[0])
+                        time.sleep(
+                            float(self.rb_cfg.get("wait_after_cart_load_seconds", 2))
+                        )
+                    self._click_books_go_checkout(driver)
+                    continue
             next_btn = None
             # 优先：文案为「次へ」/进入确认；勿点「買い物かごに戻る」等返回按钮
             xpaths = (

@@ -953,12 +953,17 @@ class RakutenSessionGuard(LoggerMixin):
         return True
 
     def _site_home_url(self) -> str:
+        """冻壳换 SSO 时要回业务站；书店回购物车，不要回官网首页。"""
         adapter = str(
             ((self.config or {}).get("_site") or {}).get("adapter") or ""
         ).strip()
         if adapter == "rakuten_books":
-            return "https://books.rakuten.co.jp/"
-        return "https://www.rakuten.co.jp/"
+            rb = (self.config or {}).get("rakuten_books") or {}
+            return (rb.get("cart_url") or "").strip() or (
+                "https://books.step.rakuten.co.jp/rms/mall/book/bs/Cart"
+            )
+        ri = (self.config or {}).get("rakuten_ichiba") or {}
+        return (ri.get("cart_url") or "").strip() or "https://www.rakuten.co.jp/"
 
     def _hard_reload_login_page(self, driver, reason: str = "") -> None:
         """浏览器整页刷新。去掉 hash 再 GET 同一条 session/upgrade 对已打开 SPA 常是空操作。"""
@@ -991,6 +996,14 @@ class RakutenSessionGuard(LoggerMixin):
             self.logger.warning("已换过一次 SSO token，不再重复（%s）", reason)
             return
         dest = self._sanitize_resume_url(self._pending_resume_url) or self._site_home_url()
+        dest_low = dest.lower()
+        if dest_low.rstrip("/") in (
+            "https://books.rakuten.co.jp",
+            "http://books.rakuten.co.jp",
+        ) or dest_low.startswith("https://books.rakuten.co.jp/?") or dest_low.startswith(
+            "http://books.rakuten.co.jp/?"
+        ):
+            dest = self._site_home_url()
         self._sso_reissue_count += 1
         self.logger.warning(
             "登录冻壳未解开（%s），离开过期 session/upgrade，打开业务站换新 SSO: %s",
