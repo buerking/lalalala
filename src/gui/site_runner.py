@@ -112,6 +112,29 @@ class SiteRunner:
         self._logger().info("已获得处理锁，开始执行本轮自动任务")
         return True
 
+    def _dedupe_orders_by_mark(self, orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """同一 Mark 本轮只保留第一单，其余留到下一轮拉新凭证。"""
+        seen: set = set()
+        kept: List[Dict[str, Any]] = []
+        for order in orders or []:
+            mk = str(order.get("mark") or "").strip()
+            oid = str(order.get("order_id") or order.get("order_no") or "")
+            if mk and mk in seen:
+                self._logger().warning(
+                    "订单 %s 与本轮前单共用 Mark=%s，本轮跳过（避免买下后后台不更新）；下一轮再拉",
+                    oid,
+                    mk,
+                )
+                continue
+            if mk:
+                seen.add(mk)
+            kept.append(order)
+        if len(kept) < len(orders or []):
+            self._logger().info(
+                "本轮按 Mark 去重后处理 %s/%s 单", len(kept), len(orders or [])
+            )
+        return kept
+
     def _begin_manual_batch(self) -> bool:
         """
         申请手动 PayPay 队列锁（非阻塞）。
@@ -659,6 +682,9 @@ class SiteRunner:
             return True
 
         self._logger().info("获取到 %s 个订单", len(orders))
+        # 同一轮 getOrderListSimple 常给多单相同 Mark；第一单 addNo 后 Mark 即失效，
+        # 后续单回调仍可能 Success=true，但后台订单不完结。本轮每种 Mark 只做一单。
+        orders = self._dedupe_orders_by_mark(orders)
         for order in orders:
             try:
                 ok, summary = order_processor.process_order(order)

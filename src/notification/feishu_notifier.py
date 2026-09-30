@@ -26,6 +26,15 @@ _AFTER_PURCHASE_MARKERS = (
     "已点注文確定且拿到注文番号",
 )
 
+_MISSING_GOODS_NO_MARKERS = (
+    "缺 GoodsNo",
+    "缺少 GoodsNo",
+)
+
+_MISSING_GNO_TITLE = (
+    "如果卡到下单中，需要去订单历史中查询。如订单已下单，则可忽略。"
+)
+
 
 def classify_purchase_stage(
     messages: Optional[List[str]] = None, extra: Optional[str] = None
@@ -35,6 +44,13 @@ def classify_purchase_stage(
     if any(m in blob for m in _AFTER_PURCHASE_MARKERS):
         return "after"
     return "before"
+
+
+def _is_missing_goods_no_notice(
+    messages: Optional[List[str]] = None, extra: Optional[str] = None
+) -> bool:
+    blob = "\n".join(list(messages or []) + [str(extra or "")])
+    return any(m in blob for m in _MISSING_GOODS_NO_MARKERS)
 
 
 class FeishuNotifier(LoggerMixin):
@@ -200,6 +216,14 @@ class FeishuNotifier(LoggerMixin):
                     "<font color='blue'>**■■■ 售罄已自动删单退款 · 仅记录 · "
                     "无需人工 ■■■**</font>"
                 )
+            elif _is_missing_goods_no_notice(messages, extra):
+                title = _MISSING_GNO_TITLE
+                header_template = "orange"
+                banner = (
+                    "<font color='orange'>**■■■ 接口缺 GoodsNo · 程序仍会继续下单 · "
+                    "卡在「下单中」请查订单历史；已下单可忽略 ■■■**</font>"
+                )
+                stage_label = "缺 GoodsNo（继续下单）"
             elif stage == "after":
                 title = "【购买后】已点确认/付款，请核对是否已出单"
                 header_template = "red"
@@ -207,6 +231,7 @@ class FeishuNotifier(LoggerMixin):
                     "<font color='red'>**■■■ 购买后报错 · 已点确认/付款 · "
                     "优先核对是否已扣款/已出单 ■■■**</font>"
                 )
+                stage_label = "购买后"
             else:
                 title = "【购买前】尚未付款，请人工处理"
                 header_template = "orange"
@@ -214,9 +239,9 @@ class FeishuNotifier(LoggerMixin):
                     "<font color='orange'>**■■■ 购买前报错 · 尚未付款 · "
                     "登录/加购/议价/限购/结算校验 ■■■**</font>"
                 )
-            stage_label = "已自动处理" if use_record_webhook else (
-                "购买后" if stage == "after" else "购买前"
-            )
+                stage_label = "购买前"
+            if use_record_webhook:
+                stage_label = "已自动处理"
             lines = [
                 banner,
                 "",
@@ -246,6 +271,11 @@ class FeishuNotifier(LoggerMixin):
             )
             if use_record_webhook:
                 self.logger.info("已发送飞书记录群提醒: 订单 %s 已自动删单", order_id)
+            elif _is_missing_goods_no_notice(messages, extra):
+                self.logger.info(
+                    "已发送飞书提醒: 订单 %s 缺 GoodsNo（继续下单，已下单可忽略）",
+                    order_id,
+                )
             else:
                 self.logger.info(
                     "已发送飞书提醒: 订单 %s 需人工处理 stage=%s",

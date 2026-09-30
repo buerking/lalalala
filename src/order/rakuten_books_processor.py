@@ -219,8 +219,20 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         if not self.session_guard:
             return
         target = self._sanitize_books_resume_url(resume_url or "")
+        # 空 resume 不要默认改成购物车：SSO 若已重定向到确认页，再 get Cart 会打回结算前
         if not target:
-            target = self._books_cart_url()
+            try:
+                cur = (self.browser_manager.get_driver().current_url or "").strip()
+            except Exception:
+                cur = ""
+            target = self._sanitize_books_resume_url(cur)
+            try:
+                if (not target) and self._is_books_site_home(
+                    self.browser_manager.get_driver()
+                ):
+                    target = self._books_cart_url()
+            except Exception:
+                pass
         # 与市场购物车「購入手続き」一致：session/upgrade 可能异步跳转，最多等 8 秒
         wait = min(max(float(wait_seconds), 0.2), 8.0)
         self.session_guard.ensure_after_possible_redirect(
@@ -1357,10 +1369,8 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         )
         driver.execute_script("arguments[0].click();", ck)
         time.sleep(float(self.rb_cfg.get("wait_after_checkout_seconds", 4)))
-        self._ensure_session_after_action(
-            resume_url=self._books_cart_url(),
-            wait_seconds=8.0,
-        )
+        # 不把 resume 钉死购物车：登录 SSO 常直接落到确认页，再 get Cart 会白走一圈
+        self._ensure_session_after_action(wait_seconds=8.0)
 
     def _recover_from_cookie_error_via_cart(self, driver) -> bool:
         """
@@ -1873,7 +1883,10 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                                 str(order_id),
                                 [msg],
                                 user_id=order.get("user_id"),
-                                extra="乐天书店：接口 List 缺 GoodsNo，已忽略并继续尝试下单。",
+                                extra=(
+                                    "乐天书店：接口 List 缺 GoodsNo，已忽略并继续尝试下单。"
+                                    "如果卡到下单中，需要去订单历史中查询。如订单已下单，则可忽略。"
+                                ),
                             )
                         except Exception:
                             pass
@@ -1988,8 +2001,11 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         % (tip or "-"),
                     )
 
-        self._navigate(driver, self._books_cart_url().split("#")[0])
-        time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
+        if self._is_books_cart_page(driver):
+            self.logger.info("乐天书店：加购后已在购物车，跳过再次打开 Cart")
+        else:
+            self._navigate(driver, self._books_cart_url().split("#")[0])
+            time.sleep(float(self.rb_cfg.get("wait_after_cart_load_seconds", 2)))
         cart_ok, cart_qty_err = self._ensure_cart_quantities(driver, products)
         if not cart_ok:
             self.logger.error("乐天书店：%s order=%s", cart_qty_err, order_id)

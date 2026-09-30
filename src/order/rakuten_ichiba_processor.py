@@ -5897,7 +5897,10 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                                 str(order_id),
                                 [msg],
                                 user_id=order.get("user_id"),
-                                extra="乐天市场：接口 List 缺 GoodsNo，已忽略并继续尝试下单。",
+                                extra=(
+                                    "乐天市场：接口 List 缺 GoodsNo，已忽略并继续尝试下单。"
+                                    "如果卡到下单中，需要去订单历史中查询。如订单已下单，则可忽略。"
+                                ),
                             )
                         except Exception:
                             pass

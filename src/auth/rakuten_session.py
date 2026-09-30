@@ -631,6 +631,8 @@ class RakutenSessionGuard(LoggerMixin):
                 continue
             break
 
+        # SSO 常会自己重定向到确认/结算页；等离开登录站后再决定要不要 get(resume)
+        self._wait_leave_login_host(driver, seconds=5.0)
         if target and self._should_resume(target, driver):
             self.logger.info("登录后回到目标页: %s", target)
             try:
@@ -666,6 +668,14 @@ class RakutenSessionGuard(LoggerMixin):
                 break
             time.sleep(0.2)
         return self.ensure_logged_in(resume_url=resume_url)
+
+    def _wait_leave_login_host(self, driver, seconds: float = 5.0) -> None:
+        """登录提交后等 SSO 落地；仍在登录域时不要急着 get 购物车，以免打断重定向。"""
+        deadline = time.time() + max(0.4, float(seconds))
+        while time.time() < deadline:
+            if not self.is_login_page(driver) and not self._url_is_login_host(driver):
+                return
+            time.sleep(0.25)
 
     @staticmethod
     def _sanitize_resume_url(resume_url: Optional[str]) -> str:
@@ -1518,6 +1528,45 @@ class RakutenSessionGuard(LoggerMixin):
             return False
 
     @staticmethod
+    def _url_looks_like_cart(url: str) -> bool:
+        low = (url or "").lower()
+        path = ""
+        try:
+            path = (urlparse(low).path or "").rstrip("/")
+        except Exception:
+            path = low
+        if "/bs/cart" in low:
+            return True
+        if path.endswith("/cart"):
+            return True
+        return False
+
+    @staticmethod
+    def _url_looks_like_checkout_progress(url: str) -> bool:
+        """已离开购物车、进入结算/确认链路（此时再 get 购物车会把流程打回去）。"""
+        low = (url or "").lower()
+        if not low:
+            return False
+        if any(h in low for h in RakutenSessionGuard.LOGIN_HOST_HINTS):
+            return False
+        if RakutenSessionGuard._url_looks_like_cart(low):
+            return False
+        markers = (
+            "/bs/goorder",
+            "/bs/confirm",
+            "confirmorder",
+            "orderconfirm",
+            "/bs/order",
+            "/bs/payment",
+            "commit_order",
+        )
+        if any(m in low for m in markers):
+            return True
+        if "books.step.rakuten.co.jp" in low and "/rms/mall/book/bs/" in low:
+            return True
+        return False
+
+    @staticmethod
     def _should_resume(target: str, driver) -> bool:
         try:
             cur = (driver.current_url or "").lower()
@@ -1528,6 +1577,11 @@ class RakutenSessionGuard(LoggerMixin):
             return False
         if any(h in cur for h in RakutenSessionGuard.LOGIN_HOST_HINTS):
             return True
+        # SSO 已重定向到确认/结算页：即使 resume 是购物车也不要再跳回去
+        if RakutenSessionGuard._url_looks_like_cart(
+            t
+        ) and RakutenSessionGuard._url_looks_like_checkout_progress(cur):
+            return False
         try:
             th = urlparse(t).netloc.lower()
             ch = urlparse(cur).netloc.lower()
