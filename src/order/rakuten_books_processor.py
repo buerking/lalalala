@@ -18,6 +18,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select
@@ -64,8 +65,20 @@ _BOOK_SHOP_ID_ENCODED_RE = re.compile(
 )
 _PERSON_QTY_LIMIT_RE = re.compile(r"1人\s*(\d+)\s*個まで")
 _CART_ITEM_ROW_CSS = ".item-list .item.js-item, .item-list .js-item"
-_CART_UNITS_CSS = "select.js-units, select[name^='units[']"
-_PDP_UNITS_CSS = "div.new_buyButton select#units, select#units"
+_CART_UNITS_CSS = (
+    "select.js-units, input.js-units, "
+    "select[name^='units['], input[name^='units['], "
+    "input[type='number'][name^='units']"
+)
+# 书店详情页数量已从 <select id="units"> 改为 <input type="number" id="units">
+_PDP_UNITS_CSS = (
+    "div.new_buyButton input#units, div.new_buyButton select#units, "
+    "input#units[name='units'], select#units, input#units"
+)
+_KOBO_URL_RE = re.compile(
+    r"rakutenkobo-ebooks|books\.rakuten\.co\.jp/rk/|/rk/[0-9a-f]{16,}",
+    re.IGNORECASE,
+)
 
 _JS_SELECT_VALUES = """
 var sel = arguments[0];
@@ -115,6 +128,27 @@ if (wrap) {
   if (inner) inner.textContent = qty;
 }
 return String(sel.value || '');
+"""
+_JS_SET_INPUT_QTY = """
+var el = arguments[0];
+var qty = String(arguments[1]);
+if (!el) return '';
+try { el.focus(); } catch (e0) {}
+try {
+  var proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+  var desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+  if (desc && desc.set) desc.set.call(el, qty);
+  else el.value = qty;
+} catch (e1) {
+  el.value = qty;
+}
+try { el.dispatchEvent(new Event('input', {bubbles: true})); } catch (e2) {}
+try { el.dispatchEvent(new Event('change', {bubbles: true})); } catch (e3) {}
+var jq = window.jQuery || window.$;
+if (jq) {
+  try { jq(el).val(qty).trigger('input').trigger('change'); } catch (e4) {}
+}
+return String(el.value || '');
 """
 
 
@@ -169,6 +203,33 @@ def normalize_rakuten_books_product_url(url: str) -> str:
     if bid:
         return "https://books.rakuten.co.jp/rb/%s/" % bid
     return raw
+
+
+def _unwrap_afl_product_url(url: str) -> str:
+    """联盟跟踪链优先取 pc 参数中的真实商品地址。"""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        if "afl.rakuten.co.jp" in (parsed.netloc or "").lower():
+            pc = (parse_qs(parsed.query).get("pc") or [""])[0].strip()
+            pc = unquote(pc).strip()
+            if pc.startswith(("http://", "https://")):
+                return pc
+    except Exception:
+        pass
+    return raw
+
+
+def is_kobo_ebook_url(url: str) -> bool:
+    """Kobo 电子书：不能走书店实体「買い物かご」。"""
+    blob = " ".join(
+        [str(url or ""), _unwrap_afl_product_url(url or "")]
+    ).lower()
+    return bool(_KOBO_URL_RE.search(blob))
 
 
 def _parse_yen_int(text: str) -> int:
@@ -446,7 +507,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         """
         按 /rb/{id} 合并接口重复行，数量相加。
         书店详情页再点一次「買い物かごに入れる」通常不会把已在车内的同一书号从 1 累加到 N，
-        必须在下拉框一次选好合计数量后加购。
+        必须在数量框一次选好合计数量后加购。
         回调仍按 _source_lines 逐行 addedCartCallbackSimple。
         """
         merged: List[Dict[str, Any]] = []
@@ -525,7 +586,25 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             return False
         return True
 
+    def _units_tag(self, el) -> str:
+        try:
+            return (el.tag_name or "").strip().lower()
+        except Exception:
+            return ""
+
     def _select_option_values(self, driver, sel_el) -> List[int]:
+        if self._units_tag(sel_el) == "input":
+            try:
+                mx = str(sel_el.get_attribute("max") or "").strip()
+                mn_raw = str(sel_el.get_attribute("min") or "1").strip()
+                mn = int(re.sub(r"[^\d]", "", mn_raw) or "1")
+                if mx:
+                    hi = int(re.sub(r"[^\d]", "", mx) or "0")
+                    if hi >= mn and hi <= 200:
+                        return list(range(mn, hi + 1))
+            except Exception:
+                pass
+            return []
         try:
             raw = driver.execute_script(_JS_SELECT_VALUES, sel_el) or []
         except Exception:
@@ -567,6 +646,20 @@ class RakutenBooksOrderProcessor(LoggerMixin):
 
     def _set_native_units_select(self, driver, sel_el, quantity: int) -> int:
         qty = max(1, int(quantity or 1))
+        if self._units_tag(sel_el) == "input":
+            try:
+                raw = driver.execute_script(_JS_SET_INPUT_QTY, sel_el, qty)
+                n = int(re.sub(r"[^\d]", "", str(raw or "")) or "0")
+                if n == qty:
+                    return n
+            except Exception as e:
+                self.logger.warning("乐天书店：JS 设置数量框失败: %s", e)
+            try:
+                sel_el.clear()
+                sel_el.send_keys(str(qty))
+            except Exception:
+                pass
+            return self._read_select_qty(driver, sel_el)
         options = self._select_option_values(driver, sel_el)
         if options and qty not in options:
             self.logger.warning(
@@ -737,19 +830,80 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             out[no] = int(out.get(no) or 0) + num
         return out
 
+    def _books_pdp_url(self, product_url: str) -> str:
+        raw = (product_url or "").strip()
+        bid = extract_rakuten_book_id(raw)
+        if bid:
+            return "https://books.rakuten.co.jp/rb/%s/" % bid
+        unwrapped = _unwrap_afl_product_url(raw)
+        bid = extract_rakuten_book_id(unwrapped)
+        if bid:
+            return "https://books.rakuten.co.jp/rb/%s/" % bid
+        return (unwrapped or raw).split("#")[0]
+
+    def _find_pdp_add_button(self, driver, add_btn_css: str):
+        sels = [
+            s.strip()
+            for s in str(add_btn_css or "").split(",")
+            if s.strip()
+        ] or ["button.new_addToCart"]
+        sels.extend(
+            [
+                "div.new_buyButton button.new_addToCart",
+                "div.new_buyButton button[type='submit']",
+                "form[action*='/bs/Cart'] button[type='submit']",
+            ]
+        )
+        seen = set()
+        for sel in sels:
+            if sel in seen:
+                continue
+            seen.add(sel)
+            try:
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if el.is_displayed():
+                            return el
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
+
     def _add_product_to_cart(self, driver, product_url: str, quantity: int) -> None:
-        self._navigate(driver, product_url.split("?")[0].rstrip("/") + "/")
+        target = self._books_pdp_url(product_url)
+        if is_kobo_ebook_url(product_url) or is_kobo_ebook_url(target):
+            raise RuntimeError(
+                "该链接是乐天 Kobo 电子书，无法走书店实体购物车加购: %s"
+                % (target or product_url)
+            )
+        self._navigate(driver, target)
         time.sleep(float(self.rb_cfg.get("wait_after_pdp_load_seconds", 2)))
         units_css = (
             self.rb_cfg.get("units_select_css") or _PDP_UNITS_CSS
         ).strip() or _PDP_UNITS_CSS
-        add_btn = (
+        add_btn_css = (
             self.rb_cfg.get("add_to_cart_button_css") or "button.new_addToCart"
         ).strip()
         qty = max(1, int(quantity or 1))
-        sel_el = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, units_css))
-        )
+        try:
+            sel_el = WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, units_css))
+            )
+        except TimeoutException:
+            btn = self._find_pdp_add_button(driver, add_btn_css)
+            if btn is not None and qty == 1:
+                self.logger.warning(
+                    "乐天书店：未找到数量框，数量=1 直接点加购 %s", target
+                )
+                self._random_pre_click_wait("買い物かごに入れる")
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(float(self.rb_cfg.get("wait_after_add_cart_seconds", 3)))
+                return
+            raise RuntimeError(
+                "详情页未找到数量框（现为 input#units 数字框，旧 select#units 已失效） url=%s"
+                % (target or product_url)
+            )
         options = self._select_option_values(driver, sel_el)
         person_limit = self._parse_person_qty_limit(driver)
         max_allowed = None
@@ -762,11 +916,12 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 else person_limit
             )
         self.logger.info(
-            "乐天书店：详情页数量 want=%s options=%s 限购=%s %s",
+            "乐天书店：详情页数量 want=%s tag=%s options=%s 限购=%s %s",
             qty,
+            self._units_tag(sel_el) or "?",
             options,
             person_limit,
-            product_url,
+            target,
         )
         if max_allowed is not None and qty > max_allowed:
             raise RuntimeError(
@@ -778,7 +933,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             "乐天书店：详情页加购 want_qty=%s selected=%s %s",
             qty,
             selected,
-            product_url,
+            target,
         )
         if selected != qty:
             raise RuntimeError(
@@ -786,9 +941,16 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 % (qty, selected, options)
             )
         self._random_pre_click_wait("買い物かごに入れる")
-        btn = WebDriverWait(driver, 20).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, add_btn))
-        )
+        btn = self._find_pdp_add_button(driver, add_btn_css)
+        if btn is None:
+            try:
+                btn = WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, add_btn_css))
+                )
+            except TimeoutException:
+                raise RuntimeError(
+                    "详情页未找到「買い物かごに入れる」按钮 url=%s" % target
+                )
         driver.execute_script("arguments[0].click();", btn)
         time.sleep(float(self.rb_cfg.get("wait_after_add_cart_seconds", 3)))
 
