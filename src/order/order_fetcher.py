@@ -22,9 +22,18 @@ from src.notification.feishu_notifier import FeishuNotifier
 
 
 def _print_debug(label: str, *args) -> None:
-    """保证控制台能看到：验签参数、Sign、payload 等，便于与手动测试对比"""
+    """控制台调试输出。Windows GUI 下 stdout 句柄无效时 flush 会 Errno 22，不能让拉单失败。"""
     msg = " ".join(str(x) for x in args)
-    print(f"[订单接口调试] {label} {msg}", flush=True)
+    line = "[订单接口调试] %s %s" % (label, msg)
+    try:
+        print(line, flush=True)
+    except OSError:
+        try:
+            print(line)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 class TLS12Adapter(HTTPAdapter):
