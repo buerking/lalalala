@@ -6372,6 +6372,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         add_err or "",
                         add_raw or "",
                     ),
+                    purchase_no=purchase_no,
                 )
             except Exception:
                 pass
@@ -6396,6 +6397,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         "订单ID=%s 注文番号=%s addNo body=%s"
                         % (order_id, purchase_no, (add_raw or "")[:240] or "—")
                     ),
+                    purchase_no=purchase_no,
                 )
             except Exception:
                 pass
@@ -6451,6 +6453,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         "乐天市场分单回调异常，请核对是否已出单。"
                         "订单ID=%s 注文番号=%s" % (order_id, purchase_no)
                     ),
+                    purchase_no=purchase_no,
                 )
             except Exception:
                 pass

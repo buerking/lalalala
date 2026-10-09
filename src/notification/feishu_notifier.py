@@ -3,9 +3,11 @@
 飞书机器人 Webhook v2 要求：msg_type + content，见 https://open.feishu.cn/document/ukTMukTMukTM/ucTM5YjL3ETO24yNxkjN
 """
 
-import requests
 import base64
+import re
 from typing import Dict, Any, Optional, List
+
+import requests
 
 from src.utils.logger import LoggerMixin
 from src.utils.retry import retry
@@ -51,6 +53,27 @@ def _is_missing_goods_no_notice(
 ) -> bool:
     blob = "\n".join(list(messages or []) + [str(extra or "")])
     return any(m in blob for m in _MISSING_GOODS_NO_MARKERS)
+
+
+_PURCHASE_NO_RE = re.compile(
+    r"(?:注文番号|purchase_no)\s*[=：:]\s*([0-9A-Za-z][0-9A-Za-z._-]{5,})",
+    re.IGNORECASE,
+)
+
+
+def _pick_purchase_no(
+    purchase_no: Optional[str] = None,
+    messages: Optional[List[str]] = None,
+    extra: Optional[str] = None,
+) -> str:
+    raw = str(purchase_no or "").strip()
+    if raw and raw not in ("—", "-", "未知"):
+        return raw
+    blob = "\n".join(list(messages or []) + [str(extra or "")])
+    m = _PURCHASE_NO_RE.search(blob)
+    if m:
+        return (m.group(1) or "").strip().rstrip("，,。.;；")
+    return ""
 
 
 class FeishuNotifier(LoggerMixin):
@@ -185,6 +208,7 @@ class FeishuNotifier(LoggerMixin):
         user_id: Optional[str] = None,
         extra: Optional[str] = None,
         use_record_webhook: bool = False,
+        purchase_no: Optional[str] = None,
     ):
         """
         自动下单流程出现问题时的飞书群提醒。
@@ -196,6 +220,7 @@ class FeishuNotifier(LoggerMixin):
             user_id: 用户ID（若有，来自订单接口）
             extra: 额外说明（如「已创建工单」）
             use_record_webhook: 发往记录群（自动删单等已处理完的场景）
+            purchase_no: 页面注文番号 / 取引番号（购买后核对用）
         """
         if not self.enabled:
             self.logger.debug("飞书通知已禁用，跳过订单异常提醒")
@@ -225,7 +250,11 @@ class FeishuNotifier(LoggerMixin):
                 )
                 stage_label = "缺 GoodsNo（继续下单）"
             elif stage == "after":
-                title = "【购买后】已点确认/付款，请核对是否已出单"
+                page_no = _pick_purchase_no(purchase_no, messages, extra)
+                if page_no:
+                    title = "【购买后】注文番号 %s，请核对是否已出单" % page_no
+                else:
+                    title = "【购买后】已点确认/付款，请核对是否已出单"
                 header_template = "red"
                 banner = (
                     "<font color='red'>**■■■ 购买后报错 · 已点确认/付款 · "
@@ -242,23 +271,29 @@ class FeishuNotifier(LoggerMixin):
                 stage_label = "购买前"
             if use_record_webhook:
                 stage_label = "已自动处理"
+            page_no = _pick_purchase_no(purchase_no, messages, extra)
             lines = [
                 banner,
                 "",
                 f"**阶段**: {stage_label}",
                 f"**订单ID**: {order_id}",
-                "",
             ]
+            if page_no:
+                lines.append(f"**注文番号**: {page_no}")
+            lines.append("")
             if user_id:
                 lines.append(f"**用户ID**: {user_id}")
                 lines.append("")
+            display_messages = list(messages or [])
+            if page_no and not any(page_no in str(m) for m in display_messages):
+                display_messages = ["页面注文番号：%s" % page_no] + display_messages
             lines.append("**问题摘要**:")
-            for i, msg in enumerate(messages[:20], 1):  # 最多 20 条
+            for i, msg in enumerate(display_messages[:20], 1):  # 最多 20 条
                 # 飞书 lark_md 中换行用 \n，长链接可折叠
                 safe_msg = msg.replace("\n", " ").strip()
                 lines.append(f"{i}. {safe_msg}")
-            if len(messages) > 20:
-                lines.append(f"... 等共 {len(messages)} 条")
+            if len(display_messages) > 20:
+                lines.append(f"... 等共 {len(display_messages)} 条")
             if extra:
                 lines.append("")
                 lines.append(extra)

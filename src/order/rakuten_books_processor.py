@@ -2424,6 +2424,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         add_err or "",
                         add_raw or "",
                     ),
+                    purchase_no=purchase_no,
                 )
             except Exception:
                 pass
@@ -2549,6 +2550,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                     ],
                     user_id=order.get("user_id"),
                     extra="乐天书店分单回调异常，请核对是否已出单。",
+                    purchase_no=purchase_no,
                 )
             except Exception:
                 pass
