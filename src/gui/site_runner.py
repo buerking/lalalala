@@ -581,7 +581,7 @@ class SiteRunner:
         return bl if isinstance(bl, dict) else {}
 
     def _build_books_list_run_config(self, bl: Dict[str, Any]) -> Dict[str, Any]:
-        """书店拉单/下单用配置副本：PcMark 与卡号走书店身份，不改市场 merged_config，也不走 handoff。"""
+        """书店拉单/下单用配置副本：PcMark/店名走书店，卡号与市场同为 8828；不改市场 merged_config，也不走 handoff。"""
         cfg = copy.deepcopy(self.merged_config)
         api = dict(cfg.get("order_api") or {})
         pc_mark = str(bl.get("pc_mark") or "rakuten_books").strip() or "rakuten_books"
@@ -594,7 +594,11 @@ class SiteRunner:
             api["purchase_url_template"] = tpl
         cfg["order_api"] = api
         store = str(bl.get("store_name") or "乐天书店").strip() or "乐天书店"
-        card = str(bl.get("add_no_credit_card") or "rakuten_books").strip() or "rakuten_books"
+        card = str(
+            bl.get("add_no_credit_card")
+            or (cfg.get("payment") or {}).get("add_no_credit_card")
+            or "8828"
+        ).strip() or "8828"
         rb = dict(cfg.get("rakuten_books") or {})
         rb["store_name"] = store
         rb["add_no_credit_card"] = card
@@ -671,7 +675,7 @@ class SiteRunner:
         return success_count
 
     def _run_rakuten_books_list_phase(self, summaries: list) -> Tuple[int, int]:
-        """市场本轮结束后拉书店单，用同一浏览器、书店回调身份。"""
+        """市场本轮结束后拉书店单，用同一浏览器；站点身份是书店，卡号默认 8828。"""
         if self.adapter != "rakuten":
             return 0, 0
         bl = self._rakuten_books_list_cfg()
@@ -702,7 +706,12 @@ class SiteRunner:
         pull = {
             "pc_mark": str(bl.get("pc_mark") or "rakuten_books").strip(),
             "store_name": str(bl.get("store_name") or "乐天书店").strip(),
-            "credit_card": str(bl.get("add_no_credit_card") or "rakuten_books").strip(),
+            "credit_card": str(
+                bl.get("add_no_credit_card")
+                or (cfg.get("payment") or {}).get("add_no_credit_card")
+                or "8828"
+            ).strip()
+            or "8828",
         }
         for order in orders:
             order["_pull_site"] = dict(pull)

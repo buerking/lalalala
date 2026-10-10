@@ -374,9 +374,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
         snap = self._pull_site_from_order(order)
         if snap.get("credit_card"):
             return str(snap["credit_card"]).strip()
+        pay = (self.config.get("payment") or {})
         if self._is_ichiba_handoff():
-            # 转交时绝不能落到独立书店默认 rakuten_books
-            pay = (self.config.get("payment") or {})
+            # 转交时绝不能落到书店 PcMark；卡号与市场同为 8828
             return _cfg_text(
                 self.rb_cfg.get("pull_credit_card"),
                 self.rb_cfg.get("add_no_credit_card"),
@@ -384,7 +384,9 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                 default="8828",
             )
         return _cfg_text(
-            self.rb_cfg.get("add_no_credit_card"), default="rakuten_books"
+            self.rb_cfg.get("add_no_credit_card"),
+            pay.get("add_no_credit_card"),
+            default="8828",
         )
 
     def _ensure_callback_pc_mark(self, order: Optional[Dict[str, Any]] = None) -> str:
