@@ -565,6 +565,157 @@ class SiteRunner:
             format_interval_label(interval_seconds),
             delay,
         )
+        bl = self._rakuten_books_list_cfg()
+        if (
+            self.adapter == "rakuten"
+            and bl.get("enabled", True) is not False
+            and str(bl.get("pc_mark") or "").strip()
+        ):
+            self._logger().info(
+                "本站同一轮先拉乐天市场，再拉乐天书店（共用当前浏览器；书店单用书店回调身份）"
+            )
+
+    def _rakuten_books_list_cfg(self) -> Dict[str, Any]:
+        ri = self.merged_config.get("rakuten_ichiba") or {}
+        bl = ri.get("books_list") if isinstance(ri, dict) else None
+        return bl if isinstance(bl, dict) else {}
+
+    def _build_books_list_run_config(self, bl: Dict[str, Any]) -> Dict[str, Any]:
+        """书店拉单/下单用配置副本：PcMark 与卡号走书店身份，不改市场 merged_config，也不走 handoff。"""
+        cfg = copy.deepcopy(self.merged_config)
+        api = dict(cfg.get("order_api") or {})
+        pc_mark = str(bl.get("pc_mark") or "rakuten_books").strip() or "rakuten_books"
+        api["pc_mark"] = pc_mark
+        gids = bl.get("get_order_list_group_ids")
+        if gids:
+            api["get_order_list_group_ids"] = list(gids)
+        tpl = str(bl.get("purchase_url_template") or "").strip()
+        if tpl:
+            api["purchase_url_template"] = tpl
+        cfg["order_api"] = api
+        store = str(bl.get("store_name") or "乐天书店").strip() or "乐天书店"
+        card = str(bl.get("add_no_credit_card") or "rakuten_books").strip() or "rakuten_books"
+        rb = dict(cfg.get("rakuten_books") or {})
+        rb["store_name"] = store
+        rb["add_no_credit_card"] = card
+        rb["handoff_from_ichiba"] = False
+        rb.pop("pull_pc_mark", None)
+        rb.pop("pull_store_name", None)
+        rb.pop("pull_credit_card", None)
+        if tpl:
+            rb["purchase_url_template"] = tpl
+        cfg["rakuten_books"] = rb
+        pay = dict(cfg.get("payment") or {})
+        pay["add_no_credit_card"] = card
+        cfg["payment"] = pay
+        return cfg
+
+    def _process_order_list(
+        self,
+        orders: List[Dict[str, Any]],
+        process_fn: Callable[[Dict[str, Any]], Tuple[bool, Dict[str, Any]]],
+        summaries: list,
+        *,
+        phase: str = "",
+    ) -> int:
+        success_count = 0
+        total = len(orders or [])
+        if phase:
+            self._logger().info("%s：开始处理 %s 单", phase, total)
+        for order in orders or []:
+            try:
+                ok, summary = process_fn(order)
+                summaries.append(summary)
+                if ok:
+                    success_count += 1
+                    if order.get("from_dev_test"):
+                        from src.utils.dev_test import mark_order_processed
+
+                        mark_order_processed(
+                            self.merged_config, order.get("order_id")
+                        )
+            except Exception as e:
+                self._logger().error("处理订单异常: %s", e, exc_info=True)
+                order_no = str(order.get("order_no") or order.get("order_id") or "未知")
+                summaries.append(
+                    {
+                        "order_no": order_no,
+                        "success": False,
+                        "payment_method": "",
+                        "failure_reason": "处理异常: %s" % e,
+                        "check_cart_requested": False,
+                        "check_cart_response": "未请求",
+                        "add_no_requested": False,
+                        "add_no_response": "未请求",
+                        "update_errors": [],
+                    }
+                )
+                try:
+                    from src.notification.feishu_notifier import FeishuNotifier
+
+                    extra = "若刚才已点注文確定/确认购买，请核对是否已出单。"
+                    if phase:
+                        extra = "%s。%s" % (phase, extra)
+                    FeishuNotifier(self.merged_config).notify_order_issue(
+                        str(order.get("order_id") or order_no),
+                        ["处理订单未捕获异常: %s" % e],
+                        user_id=order.get("user_id"),
+                        extra=extra,
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._sleep_order_cooldown_if_needed()
+        if phase:
+            self._logger().info("%s：完成，成功 %s/%s", phase, success_count, total)
+        return success_count
+
+    def _run_rakuten_books_list_phase(self, summaries: list) -> Tuple[int, int]:
+        """市场本轮结束后拉书店单，用同一浏览器、书店回调身份。"""
+        if self.adapter != "rakuten":
+            return 0, 0
+        bl = self._rakuten_books_list_cfg()
+        if bl.get("enabled", True) is False:
+            return 0, 0
+        if not str(bl.get("pc_mark") or "").strip():
+            return 0, 0
+        if not self.browser_manager or not self.browser_manager.is_running():
+            try:
+                self._ensure_browser_mode(
+                    force_headed=False, reason="书店拉单前确保浏览器"
+                )
+            except Exception as e:
+                self._logger().error("乐天书店阶段浏览器未就绪: %s", e, exc_info=True)
+                return 0, 0
+        cfg = self._build_books_list_run_config(bl)
+        fetcher = OrderFetcher(cfg)
+        try:
+            orders = fetcher.fetch_orders()
+        except Exception as e:
+            self._logger().error("乐天书店拉单失败: %s", e, exc_info=True)
+            return 0, 0
+        if not orders:
+            self._logger().info("乐天书店本轮没有符合条件的订单")
+            return 0, 0
+        self._logger().info("乐天书店拉单获取到 %s 个订单", len(orders))
+        orders = self._dedupe_orders_by_mark(orders)
+        pull = {
+            "pc_mark": str(bl.get("pc_mark") or "rakuten_books").strip(),
+            "store_name": str(bl.get("store_name") or "乐天书店").strip(),
+            "credit_card": str(bl.get("add_no_credit_card") or "rakuten_books").strip(),
+        }
+        for order in orders:
+            order["_pull_site"] = dict(pull)
+        from src.order.rakuten_books_processor import RakutenBooksOrderProcessor
+
+        books_proc = RakutenBooksOrderProcessor(cfg, self.browser_manager)
+        n_ok = self._process_order_list(
+            orders,
+            books_proc.process_order,
+            summaries,
+            phase="乐天书店",
+        )
+        return n_ok, len(orders)
 
     def _run_order_batch(self, order_fetcher: OrderFetcher) -> bool:
         summaries = []
@@ -663,72 +814,70 @@ class SiteRunner:
             except Exception as e:
                 self._logger().error("雅虎闲置议价盯价失败: %s", e, exc_info=True)
 
+        market_n = 0
+        books_ok = 0
+        books_n = 0
+        market_fetch_ok = True
         try:
             orders = order_fetcher.fetch_orders()
         except Exception as e:
             self._logger().error("拉单失败: %s", e, exc_info=True)
+            market_fetch_ok = False
+            orders = []
+
+        if orders:
+            self._logger().info("获取到 %s 个订单", len(orders))
+            # 同一轮 getOrderListSimple 常给多单相同 Mark；第一单 addNo 后 Mark 即失效，
+            # 后续单回调仍可能 Success=true，但后台订单不完结。本轮每种 Mark 只做一单。
+            orders = self._dedupe_orders_by_mark(orders)
+            market_phase = "乐天市场" if self.adapter == "rakuten" else ""
+            success_count += self._process_order_list(
+                orders,
+                order_processor.process_order,
+                summaries,
+                phase=market_phase,
+            )
+            market_n = len(orders)
+        elif market_fetch_ok:
+            if summaries:
+                self._logger().info("本轮仅处理 PayPay 队列")
+            elif self.adapter != "rakuten":
+                self._logger().info("没有符合条件的订单")
+
+        if self.adapter == "rakuten":
+            books_ok, books_n = self._run_rakuten_books_list_phase(summaries)
+            success_count += books_ok
+            if not market_fetch_ok and not books_n and not summaries:
+                self._run_yahoo_bargain_submit(bargain)
+                return False
+            if not market_n and not books_n and not summaries:
+                self._logger().info("没有符合条件的订单")
+                self._run_yahoo_bargain_submit(bargain)
+                return True
+            self._flush_success_log(summaries)
+            self._logger().info(
+                "任务完成，市场成功 %s/%s，书店成功 %s/%s",
+                success_count - books_ok,
+                market_n,
+                books_ok,
+                books_n,
+            )
+            self._run_yahoo_bargain_submit(bargain)
+            return market_fetch_ok
+
+        if not market_fetch_ok:
             if summaries:
                 self._flush_success_log(summaries)
             self._run_yahoo_bargain_submit(bargain)
             return False
-
-        if not orders:
+        if not market_n:
             if summaries:
                 self._flush_success_log(summaries)
-                self._logger().info("本轮仅处理 PayPay 队列")
-            else:
-                self._logger().info("没有符合条件的订单")
             self._run_yahoo_bargain_submit(bargain)
             return True
 
-        self._logger().info("获取到 %s 个订单", len(orders))
-        # 同一轮 getOrderListSimple 常给多单相同 Mark；第一单 addNo 后 Mark 即失效，
-        # 后续单回调仍可能 Success=true，但后台订单不完结。本轮每种 Mark 只做一单。
-        orders = self._dedupe_orders_by_mark(orders)
-        for order in orders:
-            try:
-                ok, summary = order_processor.process_order(order)
-                summaries.append(summary)
-                if ok:
-                    success_count += 1
-                    if order.get("from_dev_test"):
-                        from src.utils.dev_test import mark_order_processed
-
-                        mark_order_processed(
-                            self.merged_config, order.get("order_id")
-                        )
-            except Exception as e:
-                self._logger().error("处理订单异常: %s", e, exc_info=True)
-                order_no = str(order.get("order_no") or order.get("order_id") or "未知")
-                summaries.append(
-                    {
-                        "order_no": order_no,
-                        "success": False,
-                        "payment_method": "",
-                        "failure_reason": "处理异常: %s" % e,
-                        "check_cart_requested": False,
-                        "check_cart_response": "未请求",
-                        "add_no_requested": False,
-                        "add_no_response": "未请求",
-                        "update_errors": [],
-                    }
-                )
-                try:
-                    from src.notification.feishu_notifier import FeishuNotifier
-
-                    FeishuNotifier(self.merged_config).notify_order_issue(
-                        str(order.get("order_id") or order_no),
-                        ["处理订单未捕获异常: %s" % e],
-                        user_id=order.get("user_id"),
-                        extra="若刚才已点注文確定/确认购买，请核对是否已出单。",
-                    )
-                except Exception:
-                    pass
-            finally:
-                self._sleep_order_cooldown_if_needed()
-
         self._flush_success_log(summaries)
-        self._logger().info("任务完成，成功 %s/%s", success_count, len(orders))
+        self._logger().info("任务完成，成功 %s/%s", success_count, market_n)
         self._run_yahoo_bargain_submit(bargain)
         return True
 
