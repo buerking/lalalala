@@ -53,6 +53,33 @@ def build_order_detail_candidate_urls(
     return ["%s/item/%s/order" % (h, item_id) for h in hosts]
 
 
+def page_is_yahoo_not_found(driver, y_cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """
+    被他人抢先成交或商品删除后，完成页常变成 Yahoo フリマ 404：
+    「ご指定のページが見つかりませんでした」。
+    此时 URL 仍可能带 /item/<id>/order/done，不能当成已拍下。
+    """
+    cfg = y_cfg or {}
+    markers = cfg.get("page_not_found_texts") or [
+        "ご指定のページが見つかりませんでした",
+        "指定のページが見つかりませんでした",
+        "ページが見つかりませんでした",
+    ]
+    try:
+        src = driver.page_source or ""
+    except Exception:
+        src = ""
+    if any(str(m).strip() and str(m) in src for m in markers):
+        return True
+    try:
+        title = (driver.title or "").strip()
+    except Exception:
+        title = ""
+    if "見つかりません" in title or "404" in title:
+        return True
+    return False
+
+
 def page_suggests_incomplete_payment_or_3ds(driver) -> bool:
     """页面仍像在未完成认证/支付流程，不应判为已成单。"""
     try:
@@ -77,6 +104,9 @@ def page_indicates_completed_purchase(
 
     与主流程原 _is_success_page 逻辑对齐，并补充 /item/<id>/order 上可能出现的已决済文案。
     """
+    if page_is_yahoo_not_found(driver, y_cfg):
+        return False
+
     iid = (item_id or "").strip().lower()
     cur = (driver.current_url or "").lower()
     done_path = "/item/%s/order/done" % iid
@@ -162,6 +192,9 @@ def try_recover_after_success_page_timeout(
             logger.warning("二次核验打开 URL 失败 %s: %s", url, e)
             continue
         last_url = driver.current_url or url
+        if page_is_yahoo_not_found(driver, y_cfg):
+            logger.info("二次核验：候选页为 404（可能被他人买走），尝试下一 URL")
+            continue
         if page_suggests_incomplete_payment_or_3ds(driver):
             logger.info("二次核验：页面仍似未决済/3DS，尝试下一候选 URL")
             continue
@@ -190,6 +223,11 @@ def try_recover_after_success_page_timeout(
                 if iid_lower and iid_lower not in cur_l:
                     continue
                 if "/order" not in cur_l:
+                    continue
+                if page_is_yahoo_not_found(driver, y_cfg):
+                    logger.info(
+                        "二次核验：商品已售出但完成页 404，无法确认是否本账号成交，不视为成功"
+                    )
                     continue
                 if page_suggests_incomplete_payment_or_3ds(driver):
                     continue

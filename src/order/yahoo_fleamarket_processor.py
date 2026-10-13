@@ -35,6 +35,7 @@ from src.payment.confirm_page_verifier import (
 from src.utils.logger import LoggerMixin
 from src.order.yahoo_fleamarket_order_verify import (
     page_indicates_completed_purchase,
+    page_is_yahoo_not_found,
     try_recover_after_success_page_timeout,
 )
 
@@ -651,31 +652,73 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         最终确认后商品已被售出/删除时，常见跳转至 404：
         「ご指定のページが見つかりませんでした」
         """
-        markers = self.y_cfg.get("page_not_found_texts") or [
-            "ご指定のページが見つかりませんでした",
-            "指定のページが見つかりませんでした",
-            "ページが見つかりませんでした",
+        return page_is_yahoo_not_found(driver, self.y_cfg)
+
+    def _notify_page_not_found_need_human(
+        self,
+        order: Dict[str, Any],
+        item_id: str,
+        product_url: str,
+        current_url: str,
+        *,
+        submitted: bool,
+        when: str,
+        callback_done: bool = False,
+    ) -> str:
+        """
+        完成页变成 Yahoo 404（常见：点确认后被别人买走）。
+        submitted=True 表示已点 #confirm_ok，飞书按购买后，请人工确认是否已买。
+        """
+        order_id = str(order.get("order_id") or "未知")
+        if submitted:
+            gone_msg = (
+                "雅虎闲置：二次确认后出现「ご指定のページが見つかりませんでした」，"
+                "可能提交瞬间被他人买走，完成页打不开。"
+            )
+            if callback_done:
+                extra = (
+                    "请核对是否已出单。完成回调可能已发出，请立刻人工确认是否已购买："
+                    "Yahoo 购买履历、信用卡是否扣款、商品是否由本账号成交。"
+                )
+            else:
+                extra = (
+                    "请核对是否已出单。请立刻人工确认是否已购买："
+                    "Yahoo 购买履历、信用卡是否扣款、商品是否由本账号成交。"
+                    "本单未按成功回调，调度继续。"
+                )
+        else:
+            gone_msg = (
+                "雅虎闲置：%s后进入 404 页面，商品可能已被售出或删除，下单可能未成功。"
+                % when
+            )
+            extra = "雅虎闲置：尚未完成最终确认，本单按失败跳过。请人工看商品是否仍在售。"
+        self.logger.error(
+            "%s order=%s item=%s url=%s",
+            gone_msg,
+            order_id,
+            item_id,
+            current_url,
+        )
+        msgs = [
+            gone_msg,
+            "页面文案：ご指定のページが見つかりませんでした",
+            "商品 item_id=%s url=%s" % (item_id, product_url),
+            "当前页面 URL: %s" % (current_url or ""),
         ]
+        if submitted:
+            msgs.append(
+                "请人工确认是否已购买（Yahoo 购买履历 / 信用卡扣款 / 是否本账号成交）。"
+            )
         try:
-            src = driver.page_source or ""
+            self.feishu_notifier.notify_order_issue(
+                order_id,
+                msgs,
+                user_id=order.get("user_id"),
+                extra=extra,
+            )
         except Exception:
-            src = ""
-        if any(str(m).strip() and str(m) in src for m in markers):
-            return True
-        try:
-            title = (driver.title or "").strip()
-        except Exception:
-            title = ""
-        if "見つかりません" in title or "404" in title:
-            return True
-        try:
-            url = (driver.current_url or "").lower()
-        except Exception:
-            url = ""
-        if "/error" in url or "notfound" in url or "not_found" in url:
-            # URL  alone 不够稳，需配合文案；已有文案则上面已返回
             pass
-        return False
+        return gone_msg
 
     def _wait_success_or_seller_restriction(
         self, driver, item_id: str
@@ -937,31 +980,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
         # 「購入内容を確認する」后也可能直接跳到 404（售出/删除）
         if self._detect_page_not_found(driver):
-            gone_msg = (
-                "雅虎闲置：点击「購入内容を確認する」后进入 404 页面，"
-                "商品可能已被售出或删除，下单可能未成功。"
-            )
             cur = ""
             try:
                 cur = driver.current_url or ""
             except Exception:
                 pass
-            self.logger.error("%s order=%s url=%s", gone_msg, order_id, cur)
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [
-                        gone_msg,
-                        "页面文案：ご指定のページが見つかりませんでした",
-                        "商品 item_id=%s url=%s" % (item_id, product_url),
-                        "当前页面 URL: %s" % cur,
-                        "请人工核验：是否已扣款/是否已成交。",
-                    ],
-                    user_id=order.get("user_id"),
-                    extra="雅虎闲置：确认前已 404，本单按失败跳过。",
-                )
-            except Exception:
-                pass
+            gone_msg = self._notify_page_not_found_need_human(
+                order,
+                item_id,
+                product_url,
+                cur,
+                submitted=False,
+                when="点击「購入内容を確認する」",
+            )
             return False, self._make_summary(
                 order,
                 failure_reason=gone_msg,
@@ -976,31 +1007,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception as e:
             # 弹窗未出现时，再扫一次是否已是 404
             if self._detect_page_not_found(driver):
-                gone_msg = (
-                    "雅虎闲置：二次确认弹窗未出现且已进入 404，"
-                    "商品可能已被售出或删除，下单可能未成功。"
-                )
                 cur = ""
                 try:
                     cur = driver.current_url or ""
                 except Exception:
                     pass
-                self.logger.error("%s order=%s url=%s", gone_msg, order_id, cur)
-                try:
-                    self.feishu_notifier.notify_order_issue(
-                        str(order_id),
-                        [
-                            gone_msg,
-                            "页面文案：ご指定のページが見つかりませんでした",
-                            "商品 item_id=%s url=%s" % (item_id, product_url),
-                            "当前页面 URL: %s" % cur,
-                            "请人工核验：是否已扣款/是否已成交。",
-                        ],
-                        user_id=order.get("user_id"),
-                        extra="雅虎闲置：确认 OK 前已 404，本单按失败跳过。",
-                    )
-                except Exception:
-                    pass
+                gone_msg = self._notify_page_not_found_need_human(
+                    order,
+                    item_id,
+                    product_url,
+                    cur,
+                    submitted=False,
+                    when="二次确认弹窗未出现",
+                )
                 return False, self._make_summary(
                     order,
                     failure_reason=gone_msg,
@@ -1017,32 +1036,14 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
         outcome, info_after_confirm = self._wait_success_or_seller_restriction(driver, item_id)
         if outcome == "page_not_found":
-            gone_msg = (
-                "雅虎闲置：最终确认后进入「ページが見つかりません」页面，"
-                "商品可能已被售出或删除，下单可能未成功。"
-            )
-            self.logger.error(
-                "%s order=%s item=%s url=%s",
-                gone_msg,
-                order_id,
+            gone_msg = self._notify_page_not_found_need_human(
+                order,
                 item_id,
-                info_after_confirm,
+                product_url,
+                info_after_confirm or "",
+                submitted=True,
+                when="最终确认后",
             )
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [
-                        gone_msg,
-                        "页面文案：ご指定のページが見つかりませんでした",
-                        "商品 item_id=%s url=%s" % (item_id, product_url),
-                        "当前页面 URL: %s" % (info_after_confirm or ""),
-                        "请人工核验：是否已扣款/是否已成交。",
-                    ],
-                    user_id=order.get("user_id"),
-                    extra="雅虎闲置：确认提交后商品页 404，本单按失败跳过，调度继续。",
-                )
-            except Exception:
-                pass
             return False, self._make_summary(
                 order,
                 failure_reason=gone_msg,
@@ -1124,6 +1125,23 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 runner_pause_requested=False,
             )
 
+        if self._detect_page_not_found(driver):
+            gone_msg = self._notify_page_not_found_need_human(
+                order,
+                item_id,
+                product_url,
+                (driver.current_url or final_url or ""),
+                submitted=True,
+                when="判定成功后复查",
+            )
+            return False, self._make_summary(
+                order,
+                failure_reason=gone_msg,
+                check_cart_requested=True,
+                check_cart_response="ok",
+                runner_pause_requested=False,
+            )
+
         purchase_url = final_url
         purchase_nobs = [{"no": item_id, "url": purchase_url}]
         credit = self._credit_card()
@@ -1166,25 +1184,18 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 page_src = driver.page_source or ""
             except Exception:
                 page_src = ""
-            if "ご指定のページが見つかりませんでした" in page_src:
-                self.logger.warning(
-                    "雅虎闲置：成功截图页为 404（ご指定のページが見つかりませんでした），URL=%s",
+            if self._detect_page_not_found(driver) or (
+                "ご指定のページが見つかりませんでした" in page_src
+            ):
+                self._notify_page_not_found_need_human(
+                    order,
+                    item_id,
+                    product_url,
                     getattr(driver, "current_url", "") or "",
+                    submitted=True,
+                    when="完成回调后截图页",
+                    callback_done=True,
                 )
-                try:
-                    self.feishu_notifier.notify_order_issue(
-                        str(order_id),
-                        [
-                            "全部流程完成，但未成功进入注文成功页面。请人工核验。",
-                            "截图页出现：ご指定のページが見つかりませんでした",
-                            "当前 URL: %s" % (getattr(driver, "current_url", "") or ""),
-                            "item_id=%s" % item_id,
-                        ],
-                        user_id=order.get("user_id"),
-                        extra="雅虎闲置：第二张截图页异常；仍按原流程上传截图并回调。",
-                    )
-                except Exception:
-                    pass
             shot2 = take_full_page_screenshot(driver)
             detail_shot_url = upload_screenshot_get_url(shot2, self.config) or ""
         finally:
