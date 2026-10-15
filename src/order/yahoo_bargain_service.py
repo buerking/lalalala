@@ -729,6 +729,8 @@ class YahooBargainService(LoggerMixin):
                     oid,
                     rec.get("mark"),
                 )
+            if self._drop_if_prohibited(rec, order):
+                continue
             if self._drop_if_same_item_already_active(rec):
                 continue
             if existing is not None and self._dev_accept_unverified_submit(rec):
@@ -741,6 +743,8 @@ class YahooBargainService(LoggerMixin):
                 continue
             oid = str(rec.get("order_id") or "")
             if any(str(o.get("order_id") or "") == oid for o in orders):
+                continue
+            if self._drop_if_prohibited(rec):
                 continue
             if self._drop_if_same_item_already_active(rec):
                 continue
@@ -781,6 +785,32 @@ class YahooBargainService(LoggerMixin):
             "note": "",
             "submit_attempts": 0,
         }
+
+    def _drop_if_prohibited(
+        self, rec: Dict[str, Any], order: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        from src.order.prohibited_item_guard import inspect_order, is_enabled
+
+        if not is_enabled(self.config):
+            return False
+        hit = inspect_order(order or record_to_order(rec), self.config)
+        if not hit:
+            return False
+        oid = str(rec.get("order_id") or "")
+        note = "禁售商品 %s 关键词=%s" % (hit.category, hit.keyword)
+        self.logger.warning("雅虎闲置议价：%s order=%s", note, oid)
+        self._consume(
+            rec,
+            "lost",
+            note,
+            [
+                "疑似禁售商品，议价单已停止提交、不再重试",
+                "分类：%s" % hit.category,
+                "命中关键词：%s（字段 %s）" % (hit.keyword, hit.field),
+                "文本：%s" % hit.snippet,
+            ],
+        )
+        return True
 
     def _drop_if_same_item_already_active(self, rec: Dict[str, Any]) -> bool:
         """同一商品已有 watching/pending 单，不再提交、不再重试。"""

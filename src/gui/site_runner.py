@@ -591,6 +591,61 @@ class SiteRunner:
         cfg["payment"] = pay
         return cfg
 
+    def _screen_prohibited_orders(
+        self, orders: List[Dict[str, Any]], *, phase: str = ""
+    ) -> List[Dict[str, Any]]:
+        """拉单后、下单前：标题/URL 命中禁售关键词则跳过，飞书只发一次。"""
+        from src.order.prohibited_item_guard import (
+            is_enabled,
+            mark_notified,
+            split_orders,
+            was_notified,
+        )
+        from src.notification.feishu_notifier import FeishuNotifier
+
+        if not orders or not is_enabled(self.merged_config):
+            return orders or []
+        kept, blocked = split_orders(orders, self.merged_config)
+        if not blocked:
+            return kept
+        tag = ("%s " % phase) if phase else ""
+        self._logger().warning(
+            "%s禁售商品拦截 %s/%s 单，本轮不自动下单",
+            tag,
+            len(blocked),
+            len(orders),
+        )
+        notifier = FeishuNotifier(self.merged_config)
+        for order, hit in blocked:
+            oid = str(order.get("order_id") or order.get("order_no") or "")
+            self._logger().warning(
+                "%s禁售跳过 order=%s 分类=%s 关键词=%s 字段=%s",
+                tag,
+                oid,
+                hit.category,
+                hit.keyword,
+                hit.field,
+            )
+            if was_notified(self.merged_config, oid):
+                self._logger().info("%s禁售已通知过，不再发飞书 order=%s", tag, oid)
+                continue
+            try:
+                notifier.notify_order_issue(
+                    oid,
+                    [
+                        "疑似禁售商品，已跳过自动下单，请人工确认",
+                        "分类：%s" % hit.category,
+                        "命中关键词：%s（字段 %s）" % (hit.keyword, hit.field),
+                        "文本：%s" % hit.snippet,
+                    ],
+                    user_id=order.get("user_id"),
+                    extra="购买前拦截，未点击购买。处理完后台订单后可忽略本条。",
+                )
+                mark_notified(self.merged_config, oid)
+            except Exception as e:
+                self._logger().warning("禁售飞书失败 order=%s: %s", oid, e)
+        return kept
+
     def _process_order_list(
         self,
         orders: List[Dict[str, Any]],
@@ -679,6 +734,10 @@ class SiteRunner:
             self._logger().info("乐天书店本轮没有符合条件的订单")
             return 0, 0
         self._logger().info("乐天书店拉单获取到 %s 个订单", len(orders))
+        orders = self._screen_prohibited_orders(orders, phase="乐天书店")
+        if not orders:
+            self._logger().info("乐天书店本轮订单均为禁售已跳过")
+            return 0, 0
         pull = {
             "pc_mark": str(bl.get("pc_mark") or "rakuten_books").strip(),
             "store_name": str(bl.get("store_name") or "乐天书店").strip(),
@@ -813,13 +872,17 @@ class SiteRunner:
         if orders:
             self._logger().info("获取到 %s 个订单", len(orders))
             market_phase = "乐天市场" if self.adapter == "rakuten" else ""
-            success_count += self._process_order_list(
-                orders,
-                order_processor.process_order,
-                summaries,
-                phase=market_phase,
-            )
-            market_n = len(orders)
+            orders = self._screen_prohibited_orders(orders, phase=market_phase)
+            if orders:
+                success_count += self._process_order_list(
+                    orders,
+                    order_processor.process_order,
+                    summaries,
+                    phase=market_phase,
+                )
+                market_n = len(orders)
+            else:
+                self._logger().info("本轮订单均为禁售已跳过")
         elif market_fetch_ok:
             if summaries:
                 self._logger().info("本轮仅处理 PayPay 队列")
