@@ -215,6 +215,37 @@ class YahooBargainService(LoggerMixin):
         except (TypeError, ValueError):
             return 24.0
 
+    def _submit_max_attempts(self) -> int:
+        """协商页提交失败最多重试几次（含首次）。默认 3，避免每 10 秒无限重试刷飞书。"""
+        raw = self.y_cfg.get("bargain_submit_max_attempts", 3)
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            return 3
+
+    @staticmethod
+    def _record_item_id(rec: Dict[str, Any]) -> str:
+        products = rec.get("products") or []
+        if not products:
+            return ""
+        return (extract_yahoo_item_id(str(products[0].get("url") or "")) or "").strip()
+
+    def _active_other_for_item(
+        self, item_id: str, exclude_oid: str
+    ) -> Optional[Dict[str, Any]]:
+        iid = (item_id or "").strip().lower()
+        if not iid:
+            return None
+        ex = str(exclude_oid or "").strip()
+        for rec in self.store.list_active():
+            oid = str(rec.get("order_id") or "").strip()
+            if not oid or oid == ex:
+                continue
+            other = self._record_item_id(rec).lower()
+            if other and other == iid:
+                return rec
+        return None
+
     def _watch_start(self, rec: Dict[str, Any]) -> Optional[datetime]:
         start = _parse_iso(rec.get("bargain_submitted_at")) or _parse_iso(
             rec.get("fetched_at")
@@ -698,6 +729,8 @@ class YahooBargainService(LoggerMixin):
                     oid,
                     rec.get("mark"),
                 )
+            if self._drop_if_same_item_already_active(rec):
+                continue
             if existing is not None and self._dev_accept_unverified_submit(rec):
                 continue
             self._submit_one(rec)
@@ -708,6 +741,8 @@ class YahooBargainService(LoggerMixin):
                 continue
             oid = str(rec.get("order_id") or "")
             if any(str(o.get("order_id") or "") == oid for o in orders):
+                continue
+            if self._drop_if_same_item_already_active(rec):
                 continue
             if self._dev_accept_unverified_submit(rec):
                 continue
@@ -744,7 +779,36 @@ class YahooBargainService(LoggerMixin):
             "bargain_submitted_at": None,
             "fetched_at": _now_iso(),
             "note": "",
+            "submit_attempts": 0,
         }
+
+    def _drop_if_same_item_already_active(self, rec: Dict[str, Any]) -> bool:
+        """同一商品已有 watching/pending 单，不再提交、不再重试。"""
+        oid = str(rec.get("order_id") or "")
+        item_id = self._record_item_id(rec)
+        other = self._active_other_for_item(item_id, oid)
+        if not other:
+            return False
+        other_oid = str(other.get("order_id") or "")
+        other_st = str(other.get("status") or "")
+        note = "同商品已有议价单 %s（%s），跳过重复提交" % (other_oid, other_st or "active")
+        self.logger.warning(
+            "雅虎闲置议价：%s order=%s item=%s",
+            note,
+            oid,
+            item_id,
+        )
+        self._consume(
+            rec,
+            "lost",
+            note,
+            [
+                "同一商品已在议价队列中，本单停止提交、不再重试",
+                "本单 order=%s 已有单 order=%s status=%s item=%s"
+                % (oid, other_oid, other_st, item_id),
+            ],
+        )
+        return True
 
     def _submit_one(self, rec: Dict[str, Any]) -> None:
         oid = str(rec.get("order_id") or "")
@@ -777,6 +841,8 @@ class YahooBargainService(LoggerMixin):
                 "BargainPrice 无效",
                 ["议价金额无效 order=%s BargainPrice=%s" % (oid, rec.get("bargain_price"))],
             )
+            return
+        if self._drop_if_same_item_already_active(rec):
             return
 
         data, err = self.yp._fetch_item_status(item_id)
@@ -819,18 +885,39 @@ class YahooBargainService(LoggerMixin):
                     [msg, "item=%s url=%s 议价金额=%s" % (item_id, url, bargain_yen)],
                 )
                 return
-            self.logger.warning("雅虎闲置议价：提交未完成，留待下轮重试 order=%s %s", oid, msg)
+            attempts = int(rec.get("submit_attempts") or 0) + 1
+            rec["submit_attempts"] = attempts
             rec["note"] = msg
-            self.store.upsert(rec)
-            try:
-                self.feishu.notify_order_issue(
+            rec["last_check_at"] = _now_iso()
+            max_n = self._submit_max_attempts()
+            if attempts < max_n:
+                self.store.upsert(rec)
+                self.logger.warning(
+                    "雅虎闲置议价：提交未完成，本轮不发飞书，留待下轮重试 "
+                    "order=%s attempt=%s/%s %s",
                     oid,
-                    [msg, "item=%s 议价金额=%s" % (item_id, bargain_yen)],
-                    user_id=rec.get("user_id"),
-                    extra="雅虎闲置议价提交失败，将在后续轮次重试",
+                    attempts,
+                    max_n,
+                    msg,
                 )
-            except Exception:
-                pass
+                return
+            self.logger.warning(
+                "雅虎闲置议价：提交失败已达 %s 次，停止重试 order=%s %s",
+                max_n,
+                oid,
+                msg,
+            )
+            self._consume(
+                rec,
+                "lost",
+                "提交失败已达 %s 次: %s" % (max_n, msg),
+                [
+                    "议价提交连续 %s 次未进入协商页，已停止重试，请人工看协商是否已发出"
+                    % max_n,
+                    msg,
+                    "item=%s 议价金额=%s url=%s" % (item_id, bargain_yen, url),
+                ],
+            )
             return
 
         rec["status"] = "watching"
