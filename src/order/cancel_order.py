@@ -13,6 +13,7 @@ from src.utils.retry import call_api_with_retries, is_transient_http_error
 
 DEFAULT_CANCEL_REASON = "整单商品均已售出"
 LIMIT_CANCEL_REASON = "限购商品已达上限"
+BARGAIN_TIMEOUT_CANCEL_REASON = "议价超时未成交"
 
 
 def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30) -> Tuple[int, str]:

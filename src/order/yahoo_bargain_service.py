@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 雅虎闲置议价：
-- 每轮定时任务开头盯本地队列（默认 24h 开商品页，之后改商品 API，满 72h 超时）
+- 每轮定时任务开头盯本地队列（默认 24h 开商品页，之后改商品 API，满 72h 超时并删单退款）
 - 普通拉单结束后拉 getBargainOrderListSimple，提交「価格の相談」
 - 提交时找不到议价窗口：飞书提醒后改为 API 盯价，不再反复打开商品页
 """
@@ -13,6 +13,10 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.notification.feishu_notifier import FeishuNotifier
+from src.order.cancel_order import (
+    BARGAIN_TIMEOUT_CANCEL_REASON,
+    auto_cancel_and_notify,
+)
 from src.order.order_fetcher import OrderFetcher
 from src.order.yahoo_bargain_store import YahooBargainStore, _now_iso
 from src.order.yahoo_fleamarket_processor import (
@@ -320,6 +324,26 @@ class YahooBargainService(LoggerMixin):
                 extra = "商品不支持议价，已停止，不再重试"
             self._notify(rec, messages, extra)
 
+    def _consume_timeout(self, rec: Dict[str, Any], hours: float) -> None:
+        """未买成且超过盯价时限：本地标 time_out，并调用删单退款。"""
+        oid = str(rec.get("order_id") or "")
+        note = "超过 %s 小时未达成议价，已请求删单退款" % hours
+        msgs = [
+            "议价超时（%s 小时）未成交，自动删单退款" % hours,
+            "订单号 %s 议价金额 %s" % (rec.get("order_no") or oid, rec.get("bargain_price")),
+        ]
+        self.store.consume(oid, "time_out", note=note)
+        self.logger.info("雅虎闲置议价：已消费 order=%s status=time_out %s", oid, note)
+        auto_cancel_and_notify(
+            record_to_order(rec),
+            self.config,
+            msgs,
+            reason=BARGAIN_TIMEOUT_CANCEL_REASON,
+            feishu_notifier=self.feishu,
+            logger=self.logger,
+            human_reason="议价超时自动删单失败，请人工删单退款。",
+        )
+
     @staticmethod
     def _should_drop_unsupported_bargain(msg: str) -> bool:
         text = str(msg or "")
@@ -370,16 +394,7 @@ class YahooBargainService(LoggerMixin):
             st = str(rec.get("status") or "")
             try:
                 if self._is_timeout(rec):
-                    self._consume(
-                        rec,
-                        "time_out",
-                        "超过 %s 小时未达成议价" % hours,
-                        [
-                            "议价超时（%s 小时），请人工处理" % hours,
-                            "订单号 %s item 议价金额 %s"
-                            % (rec.get("order_no") or oid, rec.get("bargain_price")),
-                        ],
-                    )
+                    self._consume_timeout(rec, hours)
                     continue
             except Exception as e:
                 self.logger.error(
