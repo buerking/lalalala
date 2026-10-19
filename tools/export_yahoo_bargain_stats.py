@@ -282,7 +282,7 @@ def daily_rows(recs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "timeout": timeout_n,
                 "active": active_n,
                 "bargain_rate": pct(b_ok, n),
-                "buy_rate": pct(p_ok, n),
+                "buy_rate": pct(p_ok, b_ok),
             }
         )
     if unknown:
@@ -300,7 +300,7 @@ def daily_rows(recs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     1 for r in unknown if str(r.get("status") or "") in ACTIVE_STATUSES
                 ),
                 "bargain_rate": pct(b_ok, n),
-                "buy_rate": pct(p_ok, n),
+                "buy_rate": pct(p_ok, b_ok),
             }
         )
     return rows
@@ -664,7 +664,7 @@ def build_workbook(
             sum(1 for r in recs if str(r.get("status") or "") == "time_out"),
             sum(1 for r in recs if str(r.get("status") or "") in ACTIVE_STATUSES),
             pct(bargain_ok, n),
-            pct(buy_ok, n),
+            pct(buy_ok, bargain_ok),
         ]
     )
 
@@ -677,8 +677,8 @@ def build_workbook(
         ["议价笔数（合计）", n],
         ["议价成功笔数", bargain_ok],
         ["购买成功笔数", buy_ok],
-        ["议价成功率", pct(bargain_ok, n)],
-        ["购买成功率", pct(buy_ok, n)],
+        ["议价成功率（议价成功/议价）", pct(bargain_ok, n)],
+        ["购买成功率（购买成功/议价成功）", pct(buy_ok, bargain_ok)],
         ["", ""],
         ["当前状态", "笔数"],
     ]
@@ -742,6 +742,15 @@ def build_workbook(
         [
             "购买成功笔数",
             "status=ok，即议价达价后自动下单成功。",
+        ],
+        [
+            "议价成功率",
+            "议价成功笔数 / 议价笔数。当天发起议价后，有多少达成自动购买条件。",
+        ],
+        [
+            "购买成功率",
+            "购买成功笔数 / 议价成功笔数。达价并启动购买后，有多少真正下单成功。"
+            "当天没有议价成功时留空（不是 0%）。不是购买成功/议价笔数。",
         ],
         [
             "不算议价成功",
