@@ -5890,20 +5890,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                         % gid
                     )
                     self.logger.warning("乐天市场：%s order=%s", msg, order_id)
-                    if not missing_gno_notified:
-                        missing_gno_notified = True
-                        try:
-                            self.feishu_notifier.notify_order_issue(
-                                str(order_id),
-                                [msg],
-                                user_id=order.get("user_id"),
-                                extra=(
-                                    "乐天市场：接口 List 缺 GoodsNo，已忽略并继续尝试下单。"
-                                    "如果卡到下单中，需要去订单历史中查询。如订单已下单，则可忽略。"
-                                ),
-                            )
-                        except Exception:
-                            pass
+                    missing_gno_notified = True
 
             try:
                 self.logger.info(

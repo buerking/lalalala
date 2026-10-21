@@ -30,16 +30,6 @@ _AFTER_PURCHASE_MARKERS = (
     "已点注文確定且拿到注文番号",
 )
 
-_MISSING_GOODS_NO_MARKERS = (
-    "缺 GoodsNo",
-    "缺少 GoodsNo",
-)
-
-_MISSING_GNO_TITLE = (
-    "如果卡到下单中，需要去订单历史中查询。如订单已下单，则可忽略。"
-)
-
-
 def classify_purchase_stage(
     messages: Optional[List[str]] = None, extra: Optional[str] = None
 ) -> str:
@@ -48,13 +38,6 @@ def classify_purchase_stage(
     if any(m in blob for m in _AFTER_PURCHASE_MARKERS):
         return "after"
     return "before"
-
-
-def _is_missing_goods_no_notice(
-    messages: Optional[List[str]] = None, extra: Optional[str] = None
-) -> bool:
-    blob = "\n".join(list(messages or []) + [str(extra or "")])
-    return any(m in blob for m in _MISSING_GOODS_NO_MARKERS)
 
 
 _PURCHASE_NO_RE = re.compile(
@@ -243,14 +226,6 @@ class FeishuNotifier(LoggerMixin):
                     "<font color='blue'>**■■■ 售罄已自动删单退款 · 仅记录 · "
                     "无需人工 ■■■**</font>"
                 )
-            elif _is_missing_goods_no_notice(messages, extra):
-                title = _MISSING_GNO_TITLE
-                header_template = "orange"
-                banner = (
-                    "<font color='orange'>**■■■ 接口缺 GoodsNo · 程序仍会继续下单 · "
-                    "卡在「下单中」请查订单历史；已下单可忽略 ■■■**</font>"
-                )
-                stage_label = "缺 GoodsNo（继续下单）"
             elif stage == "after":
                 page_no = _pick_purchase_no(purchase_no, messages, extra)
                 if page_no:
@@ -308,11 +283,6 @@ class FeishuNotifier(LoggerMixin):
             )
             if use_record_webhook:
                 self.logger.info("已发送飞书记录群提醒: 订单 %s 已自动删单", order_id)
-            elif _is_missing_goods_no_notice(messages, extra):
-                self.logger.info(
-                    "已发送飞书提醒: 订单 %s 缺 GoodsNo（继续下单，已下单可忽略）",
-                    order_id,
-                )
             else:
                 self.logger.info(
                     "已发送飞书提醒: 订单 %s 需人工处理 stage=%s",

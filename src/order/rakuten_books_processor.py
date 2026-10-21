@@ -2003,7 +2003,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             self.logger.error("乐天书店：%s order=%s", msg, order_id)
             return False, self._make_summary(order, failure_reason=msg)
 
-        missing_gno_notified = False
         for idx, product in enumerate(products, 1):
             purl = normalize_rakuten_books_product_url(
                 str(product.get("url") or "").strip()
@@ -2013,7 +2012,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             source_lines: List[Dict[str, Any]] = list(
                 product.get("_source_lines") or [product]
             )
-            # GoodsId 仍必填；缺 GoodsNo 只通知并继续尝试下单
+            # GoodsId 仍必填；缺 GoodsNo 只记日志并继续尝试下单
             for line in source_lines:
                 gid, gno = self._api_goods_id_and_no(line)
                 if not gid:
@@ -2040,20 +2039,6 @@ class RakutenBooksOrderProcessor(LoggerMixin):
                         % (gid, str(line.get("url") or purl))
                     )
                     self.logger.warning("乐天书店：%s order=%s", msg, order_id)
-                    if not missing_gno_notified:
-                        missing_gno_notified = True
-                        try:
-                            self.feishu_notifier.notify_order_issue(
-                                str(order_id),
-                                [msg],
-                                user_id=order.get("user_id"),
-                                extra=(
-                                    "乐天书店：接口 List 缺 GoodsNo，已忽略并继续尝试下单。"
-                                    "如果卡到下单中，需要去订单历史中查询。如订单已下单，则可忽略。"
-                                ),
-                            )
-                        except Exception:
-                            pass
 
             # 浏览器：同书号已合并，一次选数量后加购；回调仍按接口行
             try:
