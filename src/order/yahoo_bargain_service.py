@@ -504,6 +504,17 @@ class YahooBargainService(LoggerMixin):
                 page_err or "empty",
             )
             return
+        got_id = str(state.get("page_item_id") or "").strip()
+        if got_id and got_id != item_id:
+            self.logger.warning(
+                "雅虎闲置议价：页面仍是另一件商品，本轮跳过（不改本单状态） "
+                "order=%s expect=%s got=%s",
+                oid,
+                item_id,
+                got_id,
+            )
+            return
+
         rec["last_check_at"] = _now_iso()
         rec["last_seen_price"] = state.get("deal_price")
         rec["last_page_accepted"] = bool(state.get("accepted"))
@@ -534,6 +545,7 @@ class YahooBargainService(LoggerMixin):
                     and page_title
                     and not titles_equivalent(saved_title, page_title)
                     and not state.get("accepted")
+                    and (state.get("page_matched") or got_id == item_id)
                 ):
                     listed = state.get("deal_price")
                     self.logger.warning(

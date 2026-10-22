@@ -63,6 +63,183 @@ def extract_yahoo_item_id(url: str) -> Optional[str]:
     return None
 
 
+_NEXT_DATA_RE = re.compile(
+    r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+    re.DOTALL | re.IGNORECASE,
+)
+_CANONICAL_ITEM_RE = re.compile(
+    r'<link[^>]*rel=["\']canonical["\'][^>]*href=["\'][^"\']*/item/([^"/?#]+)',
+    re.IGNORECASE,
+)
+_PAGE_DATA_ID_RE = re.compile(r'["\']productID["\']\s*:\s*["\']([^"\']+)["\']')
+_TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECASE)
+# 主栏标价在「N円」后不远处有「送料無料」；避开 実質N円 / 推荐卡
+_YEN_THEN_SHIP_RE = re.compile(
+    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円.{0,400}送料無料",
+    re.DOTALL,
+)
+
+# 页面身份：同一 Chrome 连开多件商品时，#item_buy_button 在旧页也会命中。
+_YAHOO_ITEM_IDENTITY_JS = r"""
+return (function(expected) {
+  function yenInt(v) {
+    if (v == null || v === '') return null;
+    var n = Number(String(v).replace(/,/g, '').trim());
+    return (n > 0 && isFinite(n)) ? n : null;
+  }
+  function fromNext() {
+    var el = document.getElementById('__NEXT_DATA__');
+    if (!el || !el.textContent) return null;
+    try {
+      var data = JSON.parse(el.textContent);
+      var it = data && data.props && data.props.initialState
+        && data.props.initialState.itemsState
+        && data.props.initialState.itemsState.items
+        && data.props.initialState.itemsState.items.item;
+      if (!it || !it.id) return null;
+      return {id: String(it.id), title: String(it.title || ''), price: yenInt(it.price)};
+    } catch (e) { return null; }
+  }
+  function fromPageData() {
+    try {
+      var items = window.pageData && window.pageData.items;
+      if (!items || !items.productID) return null;
+      return {
+        id: String(items.productID),
+        title: String(items.productName || ''),
+        price: yenInt(items.price)
+      };
+    } catch (e) { return null; }
+  }
+  function fromCanonical() {
+    var a = document.querySelector('link[rel="canonical"]');
+    var href = (a && (a.getAttribute('href') || a.href)) || '';
+    var m = href.match(/\/item\/([^/?#]+)/);
+    return m ? m[1] : '';
+  }
+  function fromJsonLd() {
+    var scripts = document.querySelectorAll('script[type="application/ld+json"]');
+    for (var i = 0; i < scripts.length; i++) {
+      try {
+        var j = JSON.parse(scripts[i].textContent || 'null');
+        if (Array.isArray(j)) {
+          j = j.filter(function(x){ return x && x['@type'] === 'Product'; })[0] || null;
+        }
+        if (j && j['@type'] === 'Product') {
+          var offers = j.offers || {};
+          return {title: String(j.name || ''), price: yenInt(offers.price)};
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+  function priceNearShipping() {
+    var roots = [];
+    var main = document.querySelector('main');
+    var aside = document.querySelector('aside');
+    if (main) roots.push(main);
+    if (aside) roots.push(aside);
+    if (!roots.length) roots.push(document.body);
+    var best = null, bestLen = 9999;
+    for (var r = 0; r < roots.length; r++) {
+      var nodes = roots[r].querySelectorAll('span, div, p');
+      for (var i = 0; i < nodes.length; i++) {
+        var t = '';
+        try { t = (nodes[i].innerText || '').replace(/[\s\u00a0]/g, ''); } catch (e) { continue; }
+        if (t.indexOf('送料無料') < 0) continue;
+        if (t.indexOf('実質') >= 0 || t.indexOf('最安') >= 0) continue;
+        if (t.length > 80) continue;
+        var m = t.match(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
+        if (!m) continue;
+        if (t.length < bestLen) {
+          bestLen = t.length;
+          best = m[1].replace(/,/g, '');
+        }
+      }
+    }
+    return yenInt(best);
+  }
+  function titleFromDom() {
+    var h = document.querySelector('main h1') || document.querySelector('h1');
+    if (h) {
+      var t = (h.innerText || '').replace(/\s+/g, ' ').trim();
+      if (t) return t;
+    }
+    var dt = (document.title || '').split('\uFF5C')[0].split('|')[0].trim();
+    return dt;
+  }
+  var next = fromNext();
+  var pd = fromPageData();
+  var canonId = fromCanonical();
+  var ld = fromJsonLd();
+  var id = (next && next.id) || (pd && pd.id) || canonId || '';
+  var title = (next && next.title) || (pd && pd.title) || (ld && ld.title) || titleFromDom();
+  var price = (next && next.price) || (pd && pd.price) || (ld && ld.price) || null;
+  if (!price) price = priceNearShipping();
+  return {
+    itemId: id,
+    title: title || '',
+    price: price,
+    matched: !!(expected && id && id === expected)
+  };
+})(arguments[0]);
+"""
+
+
+def parse_yahoo_item_identity_from_html(src: str) -> Dict[str, Any]:
+    """从 HTML 解析当前商品身份（不依赖编译后的 sc-* class）。"""
+    out: Dict[str, Any] = {"item_id": "", "title": "", "price": None}
+    if not src:
+        return out
+    m = _NEXT_DATA_RE.search(src)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            item = (
+                ((data.get("props") or {}).get("initialState") or {})
+                .get("itemsState", {})
+                .get("items", {})
+                .get("item")
+            )
+            if isinstance(item, dict) and item.get("id"):
+                out["item_id"] = str(item.get("id") or "")
+                out["title"] = " ".join(str(item.get("title") or "").split())
+                try:
+                    n = int(round(float(item.get("price"))))
+                    if n > 0:
+                        out["price"] = n
+                except (TypeError, ValueError):
+                    pass
+        except Exception:
+            pass
+    if not out["item_id"]:
+        cm = _CANONICAL_ITEM_RE.search(src)
+        if cm:
+            out["item_id"] = cm.group(1)
+        else:
+            pm = _PAGE_DATA_ID_RE.search(src)
+            if pm:
+                out["item_id"] = pm.group(1)
+    if not out["title"]:
+        tm = _TITLE_TAG_RE.search(src)
+        if tm:
+            t = re.sub(r"<[^>]+>", "", tm.group(1))
+            t = " ".join(t.split()).split("｜")[0].split("|")[0].strip()
+            out["title"] = t
+    if not out["price"]:
+        for sm in _YEN_THEN_SHIP_RE.finditer(src.replace("\u00a0", " ")):
+            prefix = src[max(0, sm.start() - 24) : sm.start()]
+            if "実質" in prefix or "最安" in prefix:
+                continue
+            raw = sm.group(1).replace(",", "")
+            if raw.isdigit():
+                n = int(raw)
+                if n > 0:
+                    out["price"] = n
+                    break
+    return out
+
+
 class YahooFleaMarketOrderProcessor(LoggerMixin):
     def __init__(self, config: Dict[str, Any], browser_manager: BrowserManager):
         self.config = config
@@ -194,61 +371,114 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             return price, ""
         return None, "无法从当前页面解析真实价格（阶段=%s）" % stage
 
-    def _extract_item_detail_listed_price(self, driver) -> Optional[int]:
-        """商品详情标价（ItemPrice），只取主商品栏，避开推荐区 / 実質N円 / 最安値。"""
+    def _read_yahoo_item_identity(
+        self, driver, expected_id: str = ""
+    ) -> Dict[str, Any]:
+        """当前页商品 id/标题/标价。必须与 expect 一致才能当本单页面。"""
+        ident: Dict[str, Any] = {
+            "item_id": "",
+            "title": "",
+            "price": None,
+            "matched": False,
+        }
+        raw = None
         try:
-            raw = driver.execute_script(
-                """
-                const title = document.querySelector(
-                  'h1.ItemTitle__Component, [class*="ItemTitle__Component"]'
-                );
-                const root = (title && title.closest('aside, section, article, main'))
-                  || document.querySelector('#prcs')
-                  || document;
-                const nodes = root.querySelectorAll(
-                  '.ItemPrice__Component, [class*="ItemPrice__Component"]'
-                );
-                for (const el of nodes) {
-                  const t = (el.innerText || '').replace(/\\s+/g, '');
-                  if (!t || t.includes('最安') || t.includes('実質')) continue;
-                  const m = t.match(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
-                  if (m) return m[1];
-                }
-                return null;
-                """
-            )
+            raw = driver.execute_script(_YAHOO_ITEM_IDENTITY_JS, expected_id or "")
         except Exception:
             raw = None
-        if raw:
-            v = self._yen_text_to_int(str(raw))
-            if v:
-                return v
-        sels = (
-            "aside .ItemPrice__Component",
-            ".ItemPrice__Component",
-            "[class*='ItemPrice__Component']",
-        )
-        for sel in sels:
+        if isinstance(raw, dict):
+            ident["item_id"] = str(raw.get("itemId") or "")
+            ident["title"] = " ".join(str(raw.get("title") or "").split())
             try:
-                els = driver.find_elements(By.CSS_SELECTOR, sel)
+                p = raw.get("price")
+                if p is not None and str(p).strip() != "":
+                    n = int(round(float(p)))
+                    if n > 0:
+                        ident["price"] = n
+            except (TypeError, ValueError):
+                pass
+            ident["matched"] = bool(raw.get("matched"))
+        if expected_id and ident["item_id"] == expected_id:
+            ident["matched"] = True
+        need_html = (
+            not ident["item_id"] or not ident["title"] or ident["price"] is None
+        )
+        if need_html:
+            src = ""
+            try:
+                src = driver.page_source or ""
             except Exception:
-                els = []
-            for el in els:
-                try:
-                    if not el.is_displayed():
-                        continue
-                    raw_txt = (el.text or "").replace("\u00a0", " ").strip()
-                except Exception:
-                    continue
-                if "最安" in raw_txt or "実質" in raw_txt:
-                    continue
-                m = _YEN_AMOUNT_RE.search(raw_txt.replace(" ", ""))
-                if not m:
-                    continue
-                v = self._yen_text_to_int(m.group(1))
-                if v:
-                    return v
-        return None
+                src = ""
+            parsed = parse_yahoo_item_identity_from_html(src)
+            if not ident["item_id"]:
+                ident["item_id"] = str(parsed.get("item_id") or "")
+            if not ident["title"]:
+                ident["title"] = str(parsed.get("title") or "")
+            if ident["price"] is None:
+                ident["price"] = parsed.get("price")
+            if expected_id and ident["item_id"] == expected_id:
+                ident["matched"] = True
+        return ident
+
+    def _wait_yahoo_item_page(self, driver, item_id: str, wait_sec: int) -> bool:
+        if not item_id:
+            return False
+
+        def _ready(d) -> bool:
+            try:
+                return bool(self._read_yahoo_item_identity(d, item_id).get("matched"))
+            except Exception:
+                return False
+
+        try:
+            WebDriverWait(driver, max(1, int(wait_sec))).until(_ready)
+            return True
+        except TimeoutException:
+            return bool(self._read_yahoo_item_identity(driver, item_id).get("matched"))
+
+    def _open_yahoo_item_page(
+        self, driver, product_url: str, item_id: str, wait_sec: int
+    ) -> Tuple[bool, str]:
+        """导航并等到 __NEXT_DATA__/canonical 的商品 id 就是本单，避免读上一件残留页。"""
+        last_err = "商品页未切到目标商品"
+        for attempt in (1, 2):
+            try:
+                self.browser_manager.navigate(product_url)
+            except Exception as e:
+                return False, "打开商品页失败: %s" % e
+            ok = self._wait_yahoo_item_page(driver, item_id, wait_sec)
+            extra = float(self.y_cfg.get("wait_after_product_load_seconds", 2))
+            if extra > 0:
+                time.sleep(extra)
+            ident = self._read_yahoo_item_identity(driver, item_id)
+            if ident.get("matched"):
+                return True, ""
+            last_err = "商品页未切到目标商品 item=%s 当前=%s" % (
+                item_id,
+                ident.get("item_id") or "empty",
+            )
+            if attempt == 1:
+                self.logger.warning("雅虎闲置议价：%s，再导航一次", last_err)
+        return False, last_err
+
+    def _extract_item_detail_listed_price(
+        self, driver, expected_item_id: str = ""
+    ) -> Optional[int]:
+        """商品详情标价：优先本单 __NEXT_DATA__，再取「N円」且邻近「送料無料」的主栏。"""
+        ident = self._read_yahoo_item_identity(driver, expected_item_id)
+        if expected_item_id and ident.get("item_id") and ident["item_id"] != expected_item_id:
+            return None
+        if ident.get("price"):
+            return ident["price"]
+        src = ""
+        try:
+            src = driver.page_source or ""
+        except Exception:
+            src = ""
+        parsed = parse_yahoo_item_identity_from_html(src)
+        if expected_item_id and parsed.get("item_id") and parsed["item_id"] != expected_item_id:
+            return None
+        return parsed.get("price")
 
     def _find_item_buy_button(self, driver):
         """
@@ -283,34 +513,20 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 return bucket[0]
         return None
 
-    def read_bargain_page_state(self, driver) -> Dict[str, Any]:
+    def read_bargain_page_state(
+        self, driver, expected_item_id: str = ""
+    ) -> Dict[str, Any]:
         """
         从已打开的商品页读取议价专属态。
         卖家同意后的价格只出现在登录账号的页面上，商品 API 看不到。
         """
+        ident = self._read_yahoo_item_identity(driver, expected_item_id)
         src = ""
         try:
             src = driver.page_source or ""
         except Exception:
             src = ""
-        title = ""
-        try:
-            heads = driver.find_elements(
-                By.CSS_SELECTOR,
-                "h1.ItemTitle__Component, [class*='ItemTitle__Component']",
-            )
-            for h in heads:
-                try:
-                    if not h.is_displayed():
-                        continue
-                    t = " ".join((h.text or "").split())
-                except Exception:
-                    continue
-                if t:
-                    title = t
-                    break
-        except Exception:
-            pass
+        title = ident.get("title") or ""
         exclusive = None
         m = re.search(r"あなたが相談した価格\s*([0-9,]{1,9})\s*円", src)
         if m:
@@ -320,7 +536,9 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             or "相談した価格で購入手続きへ" in src
             or exclusive
         )
-        listed = self._extract_item_detail_listed_price(driver)
+        listed = ident.get("price")
+        if listed is None:
+            listed = self._extract_item_detail_listed_price(driver, expected_item_id)
         buy = self._find_item_buy_button(driver)
         buy_text = ""
         buy_kind = "none"
@@ -354,6 +572,8 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             "buy_text": buy_text,
             "sold": sold,
             "title": title,
+            "page_item_id": ident.get("item_id") or "",
+            "page_matched": bool(ident.get("matched")),
         }
 
     def inspect_bargain_watch_page(
@@ -361,40 +581,28 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         """打开商品页（需已登录会话）读取专属议价/标价。"""
         driver = self.browser_manager.get_driver()
+        item_id = extract_yahoo_item_id(product_url) or ""
         wait_sec = int(
             self.y_cfg.get("bargain_watch_page_wait_seconds")
             or min(15, int(self.y_cfg.get("product_page_buy_button_wait_seconds", 45)))
         )
         self.logger.info(
-            "雅虎闲置议价：打开商品页盯价 wait=%ss url=%s",
+            "雅虎闲置议价：打开商品页盯价 wait=%ss item=%s url=%s",
             wait_sec,
+            item_id,
             product_url,
         )
-        try:
-            self.browser_manager.navigate(product_url)
-        except Exception as e:
-            return None, "打开商品页失败: %s" % e
-        try:
-            WebDriverWait(driver, wait_sec).until(
-                lambda d: bool(
-                    d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
-                    or d.find_elements(By.CSS_SELECTOR, "#fltdscnt")
-                    or d.find_elements(
-                        By.CSS_SELECTOR,
-                        "h1.ItemTitle__Component, [class*='ItemTitle__Component']",
-                    )
-                )
-            )
-        except TimeoutException:
-            self.logger.info(
-                "雅虎闲置议价：商品页 %ss 内未出现购买按钮/议价窗，本轮先读现有 DOM",
-                wait_sec,
-            )
-        time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
-        state = self.read_bargain_page_state(driver)
+        ok, err = self._open_yahoo_item_page(driver, product_url, item_id, wait_sec)
+        if not ok:
+            return None, err
+        state = self.read_bargain_page_state(driver, expected_item_id=item_id)
+        got_id = str(state.get("page_item_id") or "")
+        if item_id and got_id and got_id != item_id:
+            return None, "商品页未切到目标商品 item=%s 当前=%s" % (item_id, got_id)
         self.logger.info(
-            "雅虎闲置议价：商品页状态 accepted=%s exclusive=%s listed=%s "
+            "雅虎闲置议价：商品页状态 item=%s accepted=%s exclusive=%s listed=%s "
             "deal=%s buy=%s sold=%s title=%s",
+            got_id or item_id,
             state.get("accepted"),
             state.get("exclusive_price"),
             state.get("listed_price"),
@@ -1324,27 +1532,27 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             yen_str,
             product_url,
         )
-        try:
-            self.browser_manager.navigate(product_url)
-        except Exception as e:
-            return False, "打开商品页失败: %s" % e
-
+        ok, err = self._open_yahoo_item_page(driver, product_url, item_id, wait_sec)
+        if not ok:
+            return False, err
         page_ready = False
         try:
             WebDriverWait(driver, wait_sec).until(
                 lambda d: (
                     d.find_elements(By.CSS_SELECTOR, "#fltdscnt")
-                    or d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
                     or d.find_elements(
                         By.CSS_SELECTOR, 'input[placeholder="購入したい金額を入力"]'
                     )
+                    or d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
                 )
             )
             page_ready = True
         except TimeoutException:
             page_ready = False
-        time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
-        page_state = self.read_bargain_page_state(driver)
+        page_state = self.read_bargain_page_state(driver, expected_item_id=item_id)
+        got_id = str(page_state.get("page_item_id") or "")
+        if item_id and got_id and got_id != item_id:
+            return False, "商品页未切到目标商品 item=%s 当前=%s" % (item_id, got_id)
         if page_state.get("accepted"):
             self.logger.info(
                 "雅虎闲置议价：商品页已是卖家同意专属价 exclusive=%s buy=%s",
