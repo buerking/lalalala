@@ -195,8 +195,36 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         return None, "无法从当前页面解析真实价格（阶段=%s）" % stage
 
     def _extract_item_detail_listed_price(self, driver) -> Optional[int]:
-        """商品详情标价（ItemPrice），避开 PayPay カード「実質N円」和最安値。"""
+        """商品详情标价（ItemPrice），只取主商品栏，避开推荐区 / 実質N円 / 最安値。"""
+        try:
+            raw = driver.execute_script(
+                """
+                const title = document.querySelector(
+                  'h1.ItemTitle__Component, [class*="ItemTitle__Component"]'
+                );
+                const root = (title && title.closest('aside, section, article, main'))
+                  || document.querySelector('#prcs')
+                  || document;
+                const nodes = root.querySelectorAll(
+                  '.ItemPrice__Component, [class*="ItemPrice__Component"]'
+                );
+                for (const el of nodes) {
+                  const t = (el.innerText || '').replace(/\\s+/g, '');
+                  if (!t || t.includes('最安') || t.includes('実質')) continue;
+                  const m = t.match(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
+                  if (m) return m[1];
+                }
+                return null;
+                """
+            )
+        except Exception:
+            raw = None
+        if raw:
+            v = self._yen_text_to_int(str(raw))
+            if v:
+                return v
         sels = (
+            "aside .ItemPrice__Component",
             ".ItemPrice__Component",
             "[class*='ItemPrice__Component']",
         )
@@ -209,10 +237,12 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 try:
                     if not el.is_displayed():
                         continue
-                    raw = (el.text or "").replace("\u00a0", " ").strip()
+                    raw_txt = (el.text or "").replace("\u00a0", " ").strip()
                 except Exception:
                     continue
-                m = _YEN_AMOUNT_RE.search(raw.replace(" ", ""))
+                if "最安" in raw_txt or "実質" in raw_txt:
+                    continue
+                m = _YEN_AMOUNT_RE.search(raw_txt.replace(" ", ""))
                 if not m:
                     continue
                 v = self._yen_text_to_int(m.group(1))
@@ -266,10 +296,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         title = ""
         try:
             heads = driver.find_elements(
-                By.CSS_SELECTOR, "h1.ItemTitle__Component, h1"
+                By.CSS_SELECTOR,
+                "h1.ItemTitle__Component, [class*='ItemTitle__Component']",
             )
-            if heads:
-                title = " ".join((heads[0].text or "").split())
+            for h in heads:
+                try:
+                    if not h.is_displayed():
+                        continue
+                    t = " ".join((h.text or "").split())
+                except Exception:
+                    continue
+                if t:
+                    title = t
+                    break
         except Exception:
             pass
         exclusive = None
@@ -340,6 +379,10 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 lambda d: bool(
                     d.find_elements(By.CSS_SELECTOR, "a#item_buy_button")
                     or d.find_elements(By.CSS_SELECTOR, "#fltdscnt")
+                    or d.find_elements(
+                        By.CSS_SELECTOR,
+                        "h1.ItemTitle__Component, [class*='ItemTitle__Component']",
+                    )
                 )
             )
         except TimeoutException:
@@ -351,13 +394,14 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         state = self.read_bargain_page_state(driver)
         self.logger.info(
             "雅虎闲置议价：商品页状态 accepted=%s exclusive=%s listed=%s "
-            "deal=%s buy=%s sold=%s",
+            "deal=%s buy=%s sold=%s title=%s",
             state.get("accepted"),
             state.get("exclusive_price"),
             state.get("listed_price"),
             state.get("deal_price"),
             state.get("buy_text") or state.get("buy_kind"),
             state.get("sold"),
+            (state.get("title") or "")[:80],
         )
         return state, ""
 

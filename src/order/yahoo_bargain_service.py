@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -103,6 +104,30 @@ def _image_urls(data: Optional[dict]) -> List[str]:
 
 def _norm_text(v: Any) -> str:
     return " ".join(str(v or "").split())
+
+
+_FW_DIGITS = "０１２３４５６７８９"
+_HW_DIGITS = "0123456789"
+_TITLE_PUNCT_RE = re.compile(r"[\s　\-_/・.,，。:：;；【】\[\]()（）]")
+
+
+def _compact_title(v: Any) -> str:
+    t = _norm_text(v).casefold()
+    t = t.translate(str.maketrans(_FW_DIGITS, _HW_DIGITS))
+    return _TITLE_PUNCT_RE.sub("", t)
+
+
+def titles_equivalent(a: Any, b: Any) -> bool:
+    """拍品页 h1 与 API 标题可能差空格/全角；不是换商品。"""
+    na, nb = _norm_text(a), _norm_text(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    ca, cb = _compact_title(na), _compact_title(nb)
+    if not ca or not cb:
+        return False
+    return ca == cb or ca in cb or cb in ca
 
 
 def build_item_snapshot(data: Optional[dict], item_id: str) -> Dict[str, Any]:
@@ -503,14 +528,21 @@ class YahooBargainService(LoggerMixin):
                 self.store.upsert(rec)
             else:
                 saved_title = _norm_text(snap.get("title"))
-                # 专属价页标题与 API 快照可能略有差异；卖家已同意时不因此停买
+                # 只比主栏 ItemTitle；泛化 h1 会误抓页头/推荐。卖家已同意时不因此停买。
                 if (
                     saved_title
                     and page_title
-                    and saved_title != page_title
+                    and not titles_equivalent(saved_title, page_title)
                     and not state.get("accepted")
                 ):
                     listed = state.get("deal_price")
+                    self.logger.warning(
+                        "雅虎闲置议价：标题不一致 order=%s 快照=%s 页面=%s 价=%s",
+                        oid,
+                        saved_title,
+                        page_title,
+                        listed,
+                    )
                     self._consume(
                         rec,
                         "lost",
@@ -518,6 +550,8 @@ class YahooBargainService(LoggerMixin):
                         [
                             "议价后卖家可能改了商品（标题不一致），已停止自动购买",
                             "item=%s 页面价=%s 议价=%s" % (item_id, listed, bargain_yen),
+                            "快照标题: %s" % saved_title,
+                            "页面标题: %s" % page_title,
                             url,
                         ],
                     )
@@ -608,7 +642,7 @@ class YahooBargainService(LoggerMixin):
                 rec["item_snapshot"] = current_snap
             elif api_title:
                 saved_title = _norm_text(saved.get("title"))
-                if saved_title and saved_title != api_title:
+                if saved_title and not titles_equivalent(saved_title, api_title):
                     self._consume(
                         rec,
                         "lost",
@@ -616,6 +650,8 @@ class YahooBargainService(LoggerMixin):
                         [
                             "议价后卖家可能改了商品（标题不一致），已停止自动购买",
                             "item=%s API价=%s 议价=%s" % (item_id, listed, bargain_yen),
+                            "快照标题: %s" % saved_title,
+                            "API标题: %s" % api_title,
                             url,
                         ],
                     )
