@@ -31,6 +31,7 @@ from src.payment.confirm_page_verifier import (
     take_full_page_screenshot,
     upload_screenshot_get_url,
     check_cart_goods_simple,
+    screenshot_url_or_placeholder,
 )
 from src.utils.logger import LoggerMixin
 from src.order.yahoo_fleamarket_order_verify import (
@@ -789,6 +790,31 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             d["runner_pause_requested"] = True
         return d
 
+    def _screenshot_url_for_callback(
+        self,
+        order: Dict[str, Any],
+        uploaded_url: Optional[str],
+        *,
+        stage: str,
+    ) -> str:
+        """截图上传失败只飞书报警，用占位图继续提交接口，不中断下单。"""
+        url, used_placeholder = screenshot_url_or_placeholder(uploaded_url, self.config)
+        if not used_placeholder:
+            return url
+        order_id = order.get("order_id", "未知")
+        msg = "雅虎闲置：%s截图上传失败，使用占位图继续提交接口 %s" % (stage, url)
+        self.logger.warning(msg)
+        try:
+            self.feishu_notifier.notify_order_issue(
+                str(order_id),
+                [msg, "请人工核对当时页面；本单未因此中断。"],
+                user_id=order.get("user_id"),
+                extra="仅报警，截图接口已用占位图继续。",
+            )
+        except Exception as e:
+            self.logger.warning("雅虎闲置：截图占位飞书提醒失败: %s", e)
+        return url
+
     def _dismiss_ok_modal(self, driver, timeout: float = 5.0) -> None:
         """下单后可能出现的 React 弹窗（例：置き配说明），点 OK。"""
         deadline = time.time() + timeout
@@ -1185,11 +1211,17 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             }
         ]
         shot_path = None
+        ok_chk, chk_err, chk_raw = False, "", ""
         try:
-            shot_path = take_full_page_screenshot(driver)
-            screen_url = upload_screenshot_get_url(shot_path, self.config)
-            if not screen_url:
-                return False, self._make_summary(order, failure_reason="截图上传失败")
+            uploaded = ""
+            try:
+                shot_path = take_full_page_screenshot(driver)
+                uploaded = upload_screenshot_get_url(shot_path, self.config) or ""
+            except Exception as e:
+                self.logger.warning("雅虎闲置：确认页截图/上传异常: %s", e)
+            screen_url = self._screenshot_url_for_callback(
+                order, uploaded, stage="确认页-checkCart"
+            )
             ok_chk, chk_err, chk_raw = check_cart_goods_simple(
                 order,
                 total=price_int,
@@ -1429,7 +1461,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             )
         goods_no_list = [{"no": goods_no_for_check, "price": price_int, "num": 1}]
         shot2 = None
-        detail_shot_url = ""
+        uploaded2 = ""
         try:
             # 第二张截图前：若详情/完成页实际是 404，仅告警，不中断后续上传与回调
             try:
@@ -1448,8 +1480,12 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                     when="完成回调后截图页",
                     callback_done=True,
                 )
-            shot2 = take_full_page_screenshot(driver)
-            detail_shot_url = upload_screenshot_get_url(shot2, self.config) or ""
+            try:
+                shot2 = take_full_page_screenshot(driver)
+                uploaded2 = upload_screenshot_get_url(shot2, self.config) or ""
+            except Exception as e:
+                self.logger.warning("雅虎闲置：成功页截图/上传异常: %s", e)
+                uploaded2 = ""
         finally:
             if shot2:
                 try:
@@ -1459,21 +1495,21 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 except Exception:
                     pass
 
+        detail_shot_url = self._screenshot_url_for_callback(
+            order, uploaded2, stage="成功页-updateGoodsNo"
+        )
         update_errors: List[str] = []
-        if detail_shot_url:
-            ok_u, uerr = send_update_goods_no_callback(
-                order,
-                item_id,
-                goods_no_list,
-                detail_shot_url,
-                self._store_name(),
-                self.config,
-                use_curl=use_curl,
-            )
-            if not ok_u:
-                update_errors.append(uerr or "updateGoodsNoCallback 失败")
-        else:
-            update_errors.append("成功页截图上传失败，跳过 updateGoodsNoCallback")
+        ok_u, uerr = send_update_goods_no_callback(
+            order,
+            item_id,
+            goods_no_list,
+            detail_shot_url,
+            self._store_name(),
+            self.config,
+            use_curl=use_curl,
+        )
+        if not ok_u:
+            update_errors.append(uerr or "updateGoodsNoCallback 失败")
 
         self.logger.info("雅虎闲置：订单 %s 处理完成，PurchaseNo=%s", order_id, item_id)
         return True, self._make_summary(

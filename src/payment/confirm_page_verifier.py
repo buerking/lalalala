@@ -23,6 +23,33 @@ from src.utils.retry import call_api_with_retries, is_transient_http_error
 # 浏览器窗口最大高度限制（像素），超出则只截到该高度
 MAX_SCREENSHOT_HEIGHT = 12000
 
+# 截图上传失败时给 checkCart / updateGoodsNo 的占位图，避免因上传中断下单
+DEFAULT_PLACEHOLDER_SCREENSHOT_URL = (
+    "https://www.jpgoodbuy.com/themes/default/images/rbhm/JPGOODBUY.svg"
+)
+
+
+def placeholder_screenshot_url(config: Optional[Dict[str, Any]] = None) -> str:
+    api = (config or {}).get("order_api") or {}
+    custom = str(api.get("placeholder_screenshot_url") or "").strip()
+    return custom or DEFAULT_PLACEHOLDER_SCREENSHOT_URL
+
+
+def screenshot_url_or_placeholder(
+    uploaded_url: Optional[str],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, bool]:
+    """
+    上传成功用真实 URL；失败则用占位图，供结算/完成回调继续提交。
+
+    Returns:
+        (url, used_placeholder)
+    """
+    u = str(uploaded_url or "").strip()
+    if u:
+        return u, False
+    return placeholder_screenshot_url(config), True
+
 
 def _parse_yen_text(text: str) -> int:
     """从「359円」「1,039円」等文案解析出整数金额。"""

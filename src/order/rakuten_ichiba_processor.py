@@ -43,6 +43,7 @@ from src.payment.confirm_page_verifier import (
     upload_screenshot_get_url,
     check_cart_goods_simple,
     is_cart_goods_mismatch_error,
+    screenshot_url_or_placeholder,
 )
 from src.auth.rakuten_session import RakutenLoginError, RakutenSessionGuard
 from src.utils.logger import LoggerMixin
@@ -6053,10 +6054,30 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             ok_chk, chk_err, chk_raw = False, "", ""
             shot_path = None
             try:
-                shot_path = take_full_page_screenshot(driver)
-                screen_url = upload_screenshot_get_url(shot_path, self.config)
-                if not screen_url:
-                    return False, self._make_summary(order, failure_reason="截图上传失败")
+                uploaded = ""
+                try:
+                    shot_path = take_full_page_screenshot(driver)
+                    uploaded = upload_screenshot_get_url(shot_path, self.config) or ""
+                except Exception as e:
+                    self.logger.warning("乐天市场：确认页截图/上传异常: %s", e)
+                screen_url, used_ph = screenshot_url_or_placeholder(uploaded, self.config)
+                if used_ph:
+                    self.logger.warning(
+                        "乐天市场：确认页截图上传失败，使用占位图继续 checkCart url=%s",
+                        screen_url,
+                    )
+                    try:
+                        self.feishu_notifier.notify_order_issue(
+                            str(order.get("order_id") or ""),
+                            [
+                                "确认页截图上传失败，已用占位图继续结算校验，请人工核对页面。",
+                                "占位图: %s" % screen_url,
+                            ],
+                            user_id=order.get("user_id"),
+                            extra="仅报警，不中断下单。",
+                        )
+                    except Exception as e:
+                        self.logger.warning("乐天市场：截图占位飞书提醒失败: %s", e)
                 ok_chk, chk_err, chk_raw = check_cart_goods_simple(
                     order,
                     total=total,
@@ -6406,12 +6427,32 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             self._navigate(driver, detail_url)
             time.sleep(float(self.ri_cfg.get("wait_after_detail_load_seconds", 3)))
             shot2 = take_full_page_screenshot(driver)
-            detail_shot_url = upload_screenshot_get_url(shot2, self.config)
+            uploaded2 = upload_screenshot_get_url(shot2, self.config)
+            detail_shot_url, used_ph2 = screenshot_url_or_placeholder(
+                uploaded2, self.config
+            )
+            if used_ph2:
+                self.logger.warning(
+                    "乐天市场：详情页截图上传失败，使用占位图继续 updateGoodsNo url=%s",
+                    detail_shot_url,
+                )
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [
+                            "详情页截图上传失败，已用占位图继续 updateGoodsNoCallback。",
+                            "占位图: %s" % detail_shot_url,
+                        ],
+                        user_id=order.get("user_id"),
+                        extra="仅报警，不中断下单。",
+                    )
+                except Exception as e:
+                    self.logger.warning("乐天市场：截图占位飞书提醒失败: %s", e)
             ok_u, uerr = send_update_goods_no_callback(
                 order,
                 purchase_no,
                 goods_no_list,
-                detail_shot_url or "",
+                detail_shot_url,
                 self._store_name(),
                 self.config,
                 use_curl=use_curl,
