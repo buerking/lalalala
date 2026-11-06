@@ -791,6 +791,60 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             d["runner_pause_requested"] = True
         return d
 
+    def _reject_if_prohibited_text(
+        self,
+        order: Dict[str, Any],
+        text: str,
+        *,
+        field: str,
+    ) -> Optional[Dict[str, Any]]:
+        """标题等文本命中禁售关键词：飞书报警并返回失败 summary；未命中返回 None。"""
+        from src.order.prohibited_item_guard import (
+            is_enabled,
+            match_text,
+            mark_notified,
+            was_notified,
+        )
+
+        if not is_enabled(self.config):
+            return None
+        hit = match_text(text, self.config, field=field)
+        if not hit:
+            return None
+        order_id = str(order.get("order_id") or "未知")
+        msg = "疑似禁售商品，已停止购买 分类=%s 关键词=%s" % (
+            hit.category,
+            hit.keyword,
+        )
+        self.logger.warning(
+            "雅虎闲置：%s order=%s field=%s text=%s",
+            msg,
+            order_id,
+            field,
+            (text or "")[:80],
+        )
+        if not was_notified(self.config, order_id):
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    order_id,
+                    [
+                        "疑似禁售商品，已跳过自动下单，请人工确认",
+                        "分类：%s" % hit.category,
+                        "命中关键词：%s（字段 %s）" % (hit.keyword, hit.field),
+                        "文本：%s" % hit.snippet,
+                    ],
+                    user_id=order.get("user_id"),
+                    extra="购买前拦截，未点击购买。处理完后台订单后可忽略本条。",
+                )
+                mark_notified(self.config, order_id)
+            except Exception as e:
+                self.logger.warning("雅虎闲置：禁售飞书失败 order=%s: %s", order_id, e)
+        return self._make_summary(
+            order,
+            failure_reason=msg,
+            runner_pause_requested=False,
+        )
+
     def _screenshot_url_for_callback(
         self,
         order: Dict[str, Any],
@@ -1058,6 +1112,16 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
         if err:
             self.logger.warning("雅虎闲置：商品 API 请求失败（将尝试页面兜底）: %s", err)
+        if data:
+            api_title = str(data.get("title") or "")
+            item = data.get("item") if isinstance(data.get("item"), dict) else {}
+            if not api_title:
+                api_title = str(item.get("title") or item.get("name") or "")
+            blocked = self._reject_if_prohibited_text(
+                order, api_title, field="item_api_title"
+            )
+            if blocked:
+                return False, blocked
 
         driver = self.browser_manager.get_driver()
         use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
@@ -1101,6 +1165,13 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             except Exception:
                 pass
             return False, self._make_summary(order, failure_reason=msg)
+
+        ident = self._read_yahoo_item_identity(driver, item_id)
+        blocked = self._reject_if_prohibited_text(
+            order, str(ident.get("title") or ""), field="page_title"
+        )
+        if blocked:
+            return False, blocked
 
         buy_label = ""
         try:

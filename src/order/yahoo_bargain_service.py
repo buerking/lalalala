@@ -614,6 +614,10 @@ class YahooBargainService(LoggerMixin):
                 bargain_yen,
                 oid,
             )
+        if self._drop_if_prohibited(
+            rec, extra_text=page_title, extra_field="page_title"
+        ):
+            return
         self._try_auto_buy(rec, item_id, url, listed, bargain_yen, oid)
 
     def _monitor_one_api(self, rec: Dict[str, Any]) -> None:
@@ -646,6 +650,7 @@ class YahooBargainService(LoggerMixin):
         rec["last_check_at"] = _now_iso()
         rec["last_seen_price"] = listed
         rec["watch_mode"] = "api"
+        api_title = ""
         if data:
             current_snap = build_item_snapshot(data, item_id)
             saved = dict(rec.get("item_snapshot") or {})
@@ -704,6 +709,10 @@ class YahooBargainService(LoggerMixin):
             bargain_yen,
             oid,
         )
+        if self._drop_if_prohibited(
+            rec, extra_text=api_title, extra_field="item_api_title"
+        ):
+            return
         self._try_auto_buy(rec, item_id, url, listed, bargain_yen, oid)
 
     def _invoke_buy(
@@ -946,13 +955,23 @@ class YahooBargainService(LoggerMixin):
         }
 
     def _drop_if_prohibited(
-        self, rec: Dict[str, Any], order: Optional[Dict[str, Any]] = None
+        self,
+        rec: Dict[str, Any],
+        order: Optional[Dict[str, Any]] = None,
+        extra_text: str = "",
+        extra_field: str = "page_title",
     ) -> bool:
-        from src.order.prohibited_item_guard import inspect_order, is_enabled
+        from src.order.prohibited_item_guard import (
+            inspect_order,
+            is_enabled,
+            match_text,
+        )
 
         if not is_enabled(self.config):
             return False
         hit = inspect_order(order or record_to_order(rec), self.config)
+        if not hit and extra_text:
+            hit = match_text(extra_text, self.config, field=extra_field)
         if not hit:
             return False
         oid = str(rec.get("order_id") or "")
