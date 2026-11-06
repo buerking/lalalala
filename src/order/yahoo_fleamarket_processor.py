@@ -35,6 +35,7 @@ from src.payment.confirm_page_verifier import (
 )
 from src.utils.logger import LoggerMixin
 from src.order.yahoo_fleamarket_order_verify import (
+    describe_purchase_stall,
     page_indicates_completed_purchase,
     page_is_yahoo_not_found,
     try_recover_after_success_page_timeout,
@@ -1362,25 +1363,33 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         final_url = info_after_confirm
         stall_msg = ""
         if not ok_trade:
-            # 与改二次核验前一致：一超时就发飞书，便于人工反查；二次核验成功时仍会保留本条记录
+            stall_hint = ""
+            try:
+                stall_hint = describe_purchase_stall(driver, item_id)
+            except Exception:
+                stall_hint = ""
+            # 勿写 /item/<id>/...：飞书 HTML 会把 <id> 吃掉变成 /item//order/done
             stall_msg = (
-                "雅虎闲置：二次确认后未在 %s 秒内进入成功页（/item/<id>/order/done 或 成功文案），可能 3DS 或页面异常。当前 URL: %s"
+                "雅虎闲置：二次确认后未在 %s 秒内进入成功页（/item/%s/order/done 或成功文案），"
+                "可能 3DS 或页面异常。当前 URL: %s"
                 % (
                     int(self.y_cfg.get("post_confirm_wait_seconds", 120)),
+                    item_id,
                     final_url,
                 )
             )
-            self.logger.error(stall_msg)
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [stall_msg],
-                    user_id=order.get("user_id"),
-                    # extra="建议人工检查支付/3DS。本站点 Runner 将暂停。",
-                    extra="建议人工检查支付/3DS。本单已跳过，调度将继续处理后续订单。",
-                )
-            except Exception:
-                pass
+            self.logger.error("%s %s", stall_msg, stall_hint)
+            # 议价达价单由 YahooBargainService 核验库存后可能再试一次，此处先不飞书，避免误报
+            if not order.get("from_bargain"):
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [stall_msg, stall_hint] if stall_hint else [stall_msg],
+                        user_id=order.get("user_id"),
+                        extra="建议人工检查支付/3DS。本单已跳过，调度将继续处理后续订单。",
+                    )
+                except Exception:
+                    pass
 
             recovered, detail_url = try_recover_after_success_page_timeout(
                 driver,

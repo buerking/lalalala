@@ -706,6 +706,101 @@ class YahooBargainService(LoggerMixin):
         )
         self._try_auto_buy(rec, item_id, url, listed, bargain_yen, oid)
 
+    def _invoke_buy(
+        self, order: Dict[str, Any], oid: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        try:
+            bought, summary = self._process_order(order)
+            return bool(bought), summary or {}
+        except Exception as e:
+            self.logger.error(
+                "雅虎闲置议价：自动购买异常 order=%s: %s", oid, e, exc_info=True
+            )
+            return False, {"failure_reason": str(e)}
+
+    @staticmethod
+    def _is_success_page_stall(summary: Optional[Dict[str, Any]]) -> bool:
+        fail = str((summary or {}).get("failure_reason") or "")
+        return "二次确认后未在" in fail or "可能 3DS" in fail
+
+    def _retry_buy_if_still_listed(
+        self,
+        rec: Dict[str, Any],
+        item_id: str,
+        url: str,
+        bargain_yen: int,
+        oid: str,
+        order: Dict[str, Any],
+    ) -> Optional[Tuple[bool, Dict[str, Any]]]:
+        """
+        完成页超时后：商品 API 仍在售且页面仍是议价达成，则再下单一次。
+        无法确认库存或卖家已撤回专属价时返回 None，沿用第一次失败原因。
+        """
+        if self.y_cfg.get("bargain_buy_retry_on_stall", True) is False:
+            return None
+        self.logger.info(
+            "雅虎闲置议价：完成页超时，先查商品 API 是否仍在库 order=%s item=%s",
+            oid,
+            item_id,
+        )
+        data, err = self.yp._fetch_item_status(item_id)
+        if err and not data:
+            self.logger.warning(
+                "雅虎闲置议价：库存复查 API 失败，不重试 order=%s err=%s", oid, err
+            )
+            return None
+        st = str(_dig(data, "status") or "")
+        if not item_is_on_sale(data):
+            self.logger.info(
+                "雅虎闲置议价：库存复查不可售 status=%s，不重试 order=%s",
+                st or "-",
+                oid,
+            )
+            return None
+        self.logger.info(
+            "雅虎闲置议价：库存复查仍在售 status=%s price=%s，重开商品页确认议价 order=%s",
+            st or "-",
+            item_listed_price(data),
+            oid,
+        )
+        state, page_err = self.yp.inspect_bargain_watch_page(url)
+        if page_err or not state:
+            self.logger.warning(
+                "雅虎闲置议价：重开商品页失败，不重试 order=%s err=%s",
+                oid,
+                page_err or "无状态",
+            )
+            return None
+        if state.get("sold"):
+            self.logger.info("雅虎闲置议价：重开商品页显示售罄，不重试 order=%s", oid)
+            return None
+        accepted = bool(state.get("accepted"))
+        deal = _yen_int(state.get("deal_price") or state.get("listed_price"))
+        if not accepted:
+            self.logger.info(
+                "雅虎闲置议价：重开商品页卖家未同意专属价 deal=%s 议价=%s，不重试 order=%s",
+                deal,
+                bargain_yen,
+                oid,
+            )
+            return None
+        if deal is not None and deal > bargain_yen:
+            self.logger.info(
+                "雅虎闲置议价：重开后现价 %s > 议价 %s，不重试 order=%s",
+                deal,
+                bargain_yen,
+                oid,
+            )
+            return None
+        self.logger.info(
+            "雅虎闲置议价：仍议价成功 accepted=%s deal=%s buy=%s，再尝试一次下单 order=%s",
+            accepted,
+            deal,
+            state.get("buy_text") or state.get("buy_kind"),
+            oid,
+        )
+        return self._invoke_buy(order, oid)
+
     def _try_auto_buy(
         self,
         rec: Dict[str, Any],
@@ -726,12 +821,13 @@ class YahooBargainService(LoggerMixin):
             )
             return
         order = record_to_order(rec)
-        try:
-            bought, summary = self._process_order(order)
-        except Exception as e:
-            bought = False
-            summary = {"failure_reason": str(e)}
-            self.logger.error("雅虎闲置议价：自动购买异常 order=%s: %s", oid, e, exc_info=True)
+        bought, summary = self._invoke_buy(order, oid)
+        if (not bought) and self._is_success_page_stall(summary):
+            retried = self._retry_buy_if_still_listed(
+                rec, item_id, url, bargain_yen, oid, order
+            )
+            if retried is not None:
+                bought, summary = retried
         if self._cooldown:
             try:
                 self._cooldown()

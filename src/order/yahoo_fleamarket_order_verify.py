@@ -96,6 +96,39 @@ def page_suggests_incomplete_payment_or_3ds(driver) -> bool:
     return any(n in src for n in needles)
 
 
+def describe_purchase_stall(driver, item_id: str = "") -> str:
+    """完成页等待超时后的短诊断，便于区分 DOM 漏判 vs 停在 /order 或 3DS。"""
+    try:
+        cur = driver.current_url or ""
+    except Exception:
+        cur = ""
+    bits = ["url=%s" % (cur or "-")]
+    iid = (item_id or "").strip().lower()
+    cur_l = cur.lower()
+    if iid and ("/item/%s/order/done" % iid) in cur_l:
+        bits.append("已在/order/done")
+    elif iid and ("/item/%s/order" % iid) in cur_l:
+        bits.append("停在/order未到/done")
+    if page_suggests_incomplete_payment_or_3ds(driver):
+        bits.append("含3DS/未决済文案")
+    else:
+        bits.append("未见3DS文案")
+    if page_is_yahoo_not_found(driver):
+        bits.append("404")
+    return " ".join(bits)
+
+
+def item_api_status_text(data: Optional[dict]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for bag in (data, data.get("item")):
+        if isinstance(bag, dict):
+            st = str(bag.get("status") or "").strip()
+            if st:
+                return st
+    return ""
+
+
 def page_indicates_completed_purchase(
     driver, item_id: str, y_cfg: Dict[str, Any]
 ) -> bool:
@@ -203,12 +236,21 @@ def try_recover_after_success_page_timeout(
             return True, last_url
 
     if item_api_check and y_cfg.get("stall_verify_item_api_fallback", True):
+        data = None
+        api_err = ""
         try:
-            data, _api_err = item_api_check(item_id)
+            data, api_err = item_api_check(item_id)
         except Exception as e:
             logger.warning("二次核验：商品 API 检查异常 %s", e)
             data = None
-        if data and str(data.get("status", "")).upper() == "SOLD":
+            api_err = str(e)
+        api_status = item_api_status_text(data)
+        logger.info(
+            "二次核验：商品 API status=%s err=%s",
+            api_status or "-",
+            api_err or "",
+        )
+        if data and api_status.upper() == "SOLD":
             logger.info("二次核验：商品 API status=SOLD，打开订单详情页供后续截图")
             iid_lower = (item_id or "").strip().lower()
             for url in candidates:
