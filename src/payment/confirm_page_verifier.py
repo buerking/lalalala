@@ -225,7 +225,7 @@ def upload_screenshot_get_url(
     Args:
         image_path: 截图文件路径
         config: 全局 config，从中取 order_api.common_upload_url
-        folder: 上传目录，默认 /surugayascreen
+        folder: 上传目录，默认 /upload/surugayascreen
         use_requests: 是否用 requests（False 时用 curl，需自行处理 base64 表单）
 
     Returns:
@@ -237,7 +237,7 @@ def upload_screenshot_get_url(
         print("[结算校验] 未配置 order_api.common_upload_url，无法上传截图")
         return None
     if folder is None:
-        folder = (api_config.get("upload_folder") or "/surugayascreen").strip()
+        folder = (api_config.get("upload_folder") or "/upload/surugayascreen").strip()
 
     path = Path(image_path)
     ext = path.suffix if path.suffix else ".png"

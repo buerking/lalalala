@@ -29,6 +29,7 @@ from src.order.rakuten_ichiba_seller_rules import (
 from src.order.added_cart_callback import send_added_cart_callback
 from src.order.cancel_order import (
     LIMIT_CANCEL_REASON,
+    LIMIT_CANCEL_USER_LOG,
     auto_cancel_and_notify,
     looks_like_purchase_limit,
 )
@@ -5416,6 +5417,7 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             logger=self.logger,
             ticket_creator=self.ticket_creator,
             human_reason="乐天市场限购自动删单失败，请人工处理。",
+            user_log=LIMIT_CANCEL_USER_LOG,
         )
 
     def _shop_checkout(self, driver) -> None:

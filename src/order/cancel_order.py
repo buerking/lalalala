@@ -5,7 +5,7 @@
 
 import json
 import subprocess
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from src.utils.sign_generator import SignGenerator
@@ -14,6 +14,9 @@ from src.utils.retry import call_api_with_retries, is_transient_http_error
 DEFAULT_CANCEL_REASON = "整单商品均已售出"
 LIMIT_CANCEL_REASON = "限购商品已达上限"
 BARGAIN_TIMEOUT_CANCEL_REASON = "议价超时未成交"
+SELLER_RESTRICT_CANCEL_REASON = "卖家限制购买用户"
+SELLER_RESTRICT_USER_LOG = "当前卖家拒绝与疯趣日淘JPGOODBUY交易，已为您删单退款。"
+LIMIT_CANCEL_USER_LOG = "当前商品超出卖家限购数量，无法继续购买，已为您删单退款。"
 
 
 def _post_with_curl(url: str, body: Dict[str, str], timeout: int = 30) -> Tuple[int, str]:
@@ -148,7 +151,9 @@ def send_cancel_order_simple(
         if data.get("Success") is not True:
             err = "Success=false: %s" % (data.get("Message") or "")
             return False, False, (False, err, body_text or "")
-        if data.get("Data") is not True:
+        # 后端常见 Success=true 且 Data=true；也有 Data=[] / null 表示已处理
+        payload = data.get("Data")
+        if payload is False:
             err = "Data=false: %s" % (data.get("Message") or "")
             return False, False, (False, err, body_text or "")
         return True, False, (True, "", body_text or "")
@@ -184,10 +189,11 @@ def auto_cancel_and_notify(
     logger: Any,
     ticket_creator: Any = None,
     human_reason: str = "",
+    user_log: Optional[str] = None,
 ) -> bool:
     """
     调用 cancelOrderSimple。
-    成功：只发记录群（无需人工）。失败：工单 + 人工飞书。
+    成功：写用户可见订单日志（若提供）+ 只发记录群。失败：工单 + 人工飞书。
     """
     order_id = str((order or {}).get("order_id") or "未知")
     user_id = (order or {}).get("user_id")
@@ -204,7 +210,33 @@ def auto_cancel_and_notify(
     if ok:
         if logger:
             logger.info("售罄/限购已自动删单退款 order=%s reason=%s", order_id, reason)
+        log_text = str(user_log or "").strip()
+        if log_text:
+            try:
+                from src.order.add_order_log import send_add_order_log_simple
+
+                log_ok, log_err, _ = send_add_order_log_simple(
+                    order, log_text, config, use_curl=bool(use_curl)
+                )
+                if logger:
+                    if log_ok:
+                        logger.info(
+                            "已写入用户订单日志 order=%s content=%s",
+                            order_id,
+                            log_text,
+                        )
+                    else:
+                        logger.warning(
+                            "删单成功但写入订单日志失败 order=%s err=%s",
+                            order_id,
+                            log_err or "",
+                        )
+            except Exception as e:
+                if logger:
+                    logger.warning("写入订单日志异常 order=%s: %s", order_id, e)
         record_msgs = list(msgs) + ["已调用 cancelOrderSimple 自动删单退款"]
+        if log_text:
+            record_msgs.append(log_text)
         try:
             feishu_notifier.notify_order_issue(
                 order_id,

@@ -31,6 +31,7 @@ from src.order.add_no_callback import format_add_no_feishu_extra, send_add_no_ca
 from src.order.added_cart_callback import send_added_cart_callback
 from src.order.cancel_order import (
     LIMIT_CANCEL_REASON,
+    LIMIT_CANCEL_USER_LOG,
     auto_cancel_and_notify,
     looks_like_purchase_limit,
 )
@@ -1089,6 +1090,7 @@ class RakutenBooksOrderProcessor(LoggerMixin):
             logger=self.logger,
             ticket_creator=self.ticket_creator,
             human_reason="乐天书店限购自动删单失败，请人工处理。",
+            user_log=LIMIT_CANCEL_USER_LOG,
         )
 
     def _click_books_commit_order(self, driver, commit_sel: str = "") -> None:

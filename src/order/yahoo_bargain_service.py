@@ -854,10 +854,19 @@ class YahooBargainService(LoggerMixin):
             )
             return
         fail = (summary or {}).get("failure_reason") or "下单未成功"
+        note = "下单未成功: %s" % fail
+        if "已删单退款" in str(fail):
+            self.store.consume(oid, "lost", note=note)
+            self.logger.info(
+                "雅虎闲置议价：已消费 order=%s status=lost %s（删单退款已处理，不再飞书）",
+                oid,
+                note,
+            )
+            return
         self._consume(
             rec,
             "lost",
-            "下单未成功: %s" % fail,
+            note,
             [
                 "议价已达价但自动下单失败: %s" % fail,
                 "item=%s 现价=%s 议价=%s" % (item_id, listed, bargain_yen),

@@ -24,7 +24,12 @@ from src.browser.browser_manager import BrowserManager
 from src.notification.feishu_notifier import FeishuNotifier
 from src.notification.ticket_creator import TicketCreator
 from src.order.add_no_callback import send_add_no_callback
-from src.order.cancel_order import send_cancel_order_simple
+from src.order.add_order_log import send_add_order_log_simple
+from src.order.cancel_order import (
+    SELLER_RESTRICT_CANCEL_REASON,
+    SELLER_RESTRICT_USER_LOG,
+    send_cancel_order_simple,
+)
 from src.order.added_cart_callback import send_added_cart_callback
 from src.order.update_goods_no_callback import send_update_goods_no_callback
 from src.payment.confirm_page_verifier import (
@@ -1202,30 +1207,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception as e:
             return False, self._make_summary(order, failure_reason="点击购买失败: %s" % e)
 
-        # 进入下单页后，若出现卖家限制购买用户（疑似拉黑），则跳过本单并通知飞书（非 3DS）
+        # 进入下单页后，若出现卖家限制购买用户（疑似拉黑）：删单退款 + 用户日志
         try:
             src = driver.page_source or ""
         except Exception:
             src = ""
         seller_restrict_text = "この商品は出品者により「購入」ができるユーザーが制限されています"
         if seller_restrict_text in src:
-            msg = (
-                "雅虎闲置：该商品被卖家限制购买用户（疑似被拉黑），无法下单。"
-                "请人工处理本订单。本单已自动跳过并继续处理后续订单。"
+            fail = self._handle_seller_restrict_cancel(
+                order, item_id, product_url, seller_restrict_text
             )
-            self.logger.warning("%s item=%s url=%s", msg, item_id, product_url)
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [msg, "商品 item_id=%s url=%s" % (item_id, product_url)],
-                    user_id=order.get("user_id"),
-                    extra="原因页文案：%s" % seller_restrict_text,
-                )
-            except Exception:
-                pass
             return False, self._make_summary(
                 order,
-                failure_reason="卖家限制购买用户，已跳过（疑似拉黑）",
+                failure_reason=fail,
                 runner_pause_requested=False,
             )
 
@@ -1408,23 +1402,12 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 runner_pause_requested=False,
             )
         if outcome == "seller_restricted":
-            skip_msg = (
-                "雅虎闲置：卖家限制交易，无法购买（購入できません）。原因：%s。"
-                "本单已自动跳过（非 3DS/非支付卡死），调度将继续处理后续订单。"
-            ) % (info_after_confirm,)
-            self.logger.warning(skip_msg)
-            try:
-                self.feishu_notifier.notify_order_issue(
-                    str(order_id),
-                    [skip_msg, "商品 item_id=%s url=%s" % (item_id, product_url)],
-                    user_id=order.get("user_id"),
-                    extra="无需按 3DS 排查；本站点任务不会因此暂停。",
-                )
-            except Exception:
-                pass
+            fail = self._handle_seller_restrict_cancel(
+                order, item_id, product_url, info_after_confirm or ""
+            )
             return False, self._make_summary(
                 order,
-                failure_reason="卖家限制交易，已跳过：%s" % (info_after_confirm[:300]),
+                failure_reason=fail,
                 check_cart_requested=True,
                 check_cart_response="ok",
                 runner_pause_requested=False,
@@ -1810,6 +1793,96 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             driver.current_url or "",
         )
         return True, ""
+
+    def _handle_seller_restrict_cancel(
+        self,
+        order: Dict[str, Any],
+        item_id: str,
+        product_url: str,
+        page_reason: str,
+    ) -> str:
+        """卖家限制购买：cancelOrderSimple 删单退款，成功后写用户可见订单日志。"""
+        order_id = order.get("order_id", "未知")
+        user_id = order.get("user_id")
+        use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
+        page_reason = (page_reason or "").strip()
+        self.logger.warning(
+            "雅虎闲置：卖家限制购买，准备删单退款 order=%s item=%s reason=%s url=%s",
+            order_id,
+            item_id,
+            page_reason[:200],
+            product_url,
+        )
+        try:
+            ok, err, raw = send_cancel_order_simple(
+                order,
+                self.config,
+                reason=SELLER_RESTRICT_CANCEL_REASON,
+                use_curl=bool(use_curl),
+            )
+        except Exception as e:
+            ok, err, raw = False, "调用异常: %s" % e, ""
+
+        if ok:
+            self.logger.info(
+                "雅虎闲置：卖家限制购买已删单退款 order=%s %s",
+                order_id,
+                SELLER_RESTRICT_USER_LOG,
+            )
+            try:
+                log_ok, log_err, _ = send_add_order_log_simple(
+                    order,
+                    SELLER_RESTRICT_USER_LOG,
+                    self.config,
+                    use_curl=bool(use_curl),
+                )
+                if log_ok:
+                    self.logger.info(
+                        "雅虎闲置：已写入用户订单日志 order=%s content=%s",
+                        order_id,
+                        SELLER_RESTRICT_USER_LOG,
+                    )
+                else:
+                    self.logger.warning(
+                        "雅虎闲置：删单成功但写入订单日志失败 order=%s err=%s",
+                        order_id,
+                        log_err or "",
+                    )
+            except Exception as e:
+                self.logger.warning("雅虎闲置：写入订单日志异常 order=%s: %s", order_id, e)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [
+                        "卖家限制购买用户，已自动删单退款",
+                        SELLER_RESTRICT_USER_LOG,
+                        "商品 item_id=%s url=%s" % (item_id, product_url),
+                        "页面原因：%s" % (page_reason or "-"),
+                    ],
+                    user_id=user_id,
+                    extra="已自动删单退款，无需人工；本消息仅作记录。",
+                    use_record_webhook=True,
+                )
+            except Exception as e:
+                self.logger.warning("飞书记录群提醒失败: %s", e)
+            return "卖家限制购买用户，已删单退款"
+
+        fail_msgs = [
+            "雅虎闲置：卖家限制购买用户，无法下单，自动删单退款失败",
+            "cancelOrderSimple 失败: %s" % (err or "未知"),
+            "商品 item_id=%s url=%s" % (item_id, product_url),
+        ]
+        if page_reason:
+            fail_msgs.append("页面原因：%s" % page_reason)
+        if raw:
+            fail_msgs.append("响应: %s" % str(raw)[:300])
+        self.logger.warning(
+            "雅虎闲置：卖家限制购买删单失败，仍通知人工 order=%s err=%s",
+            order_id,
+            err,
+        )
+        self._handle_order_issue(order, fail_msgs, reason="雅虎闲置卖家限制")
+        return "卖家限制购买用户，删单退款失败: %s" % (err or "未知")
 
     def _handle_sold_cancel(self, order: Dict[str, Any], sold_msg: str) -> None:
         """API 售罄：调用 cancelOrderSimple；成功则只发记录群，失败仍走人工飞书。"""

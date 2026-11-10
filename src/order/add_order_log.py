@@ -210,7 +210,8 @@ def send_add_order_log_simple(
                 data.get("Data"),
             )
             return False, False, (False, err, body_text or "")
-        if data.get("Data") is not True:
+        payload = data.get("Data")
+        if payload is False:
             err = "Data=false: %s" % (data.get("Message") or "")
             _log(
                 "失败 %s ErrorCode=%s Success=%s",
@@ -219,7 +220,7 @@ def send_add_order_log_simple(
                 data.get("Success"),
             )
             return False, False, (False, err, body_text or "")
-        _log("成功 Success=true Data=true ErrorCode=%s", data.get("ErrorCode"))
+        _log("成功 Success=true Data=%s ErrorCode=%s", payload, data.get("ErrorCode"))
         return True, False, (True, "", body_text or "")
 
     result = call_api_with_retries(
