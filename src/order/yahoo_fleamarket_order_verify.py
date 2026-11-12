@@ -80,12 +80,42 @@ def page_is_yahoo_not_found(driver, y_cfg: Optional[Dict[str, Any]] = None) -> b
     return False
 
 
+# 确认页弹窗「購入できません」：支付信息被拒，并非成交。
+# 失败文案「購入手続きが完了できませんでした」包含成功关键词「購入手続きが完了」，
+# 且确认页 URL 也是 /item/<id>/order，旧逻辑会误判成功并提交 addNo。
+_PURCHASE_FAILED_MARKERS = (
+    "購入手続きが完了できませんでした",
+    "入力したお支払い情報をご確認",
+    "お支払い情報をご確認ください",
+)
+
+
+def html_suggests_purchase_failed(html: str) -> str:
+    """页面 HTML 是否为支付失败弹窗；命中则返回匹配文案，否则空串。"""
+    src = html or ""
+    for m in _PURCHASE_FAILED_MARKERS:
+        if m in src:
+            return m
+    return ""
+
+
+def page_suggests_purchase_failed(driver) -> str:
+    """当前页是否为「購入できません / お支払い情報をご確認」支付失败。"""
+    try:
+        src = driver.page_source or ""
+    except Exception:
+        return ""
+    return html_suggests_purchase_failed(src)
+
+
 def page_suggests_incomplete_payment_or_3ds(driver) -> bool:
     """页面仍像在未完成认证/支付流程，不应判为已成单。"""
     try:
         src = driver.page_source or ""
     except Exception:
         return False
+    if html_suggests_purchase_failed(src):
+        return True
     needles = (
         "3Dセキュア",
         "本人認証サービス",
@@ -109,7 +139,10 @@ def describe_purchase_stall(driver, item_id: str = "") -> str:
         bits.append("已在/order/done")
     elif iid and ("/item/%s/order" % iid) in cur_l:
         bits.append("停在/order未到/done")
-    if page_suggests_incomplete_payment_or_3ds(driver):
+    fail_hit = page_suggests_purchase_failed(driver)
+    if fail_hit:
+        bits.append("支付失败弹窗:%s" % fail_hit)
+    elif page_suggests_incomplete_payment_or_3ds(driver):
         bits.append("含3DS/未决済文案")
     else:
         bits.append("未见3DS文案")
@@ -140,16 +173,20 @@ def page_indicates_completed_purchase(
     if page_is_yahoo_not_found(driver, y_cfg):
         return False
 
+    try:
+        body_text = driver.page_source or ""
+    except Exception:
+        body_text = ""
+
+    # 支付失败弹窗优先：即使 URL 含 /order 或文案含子串「購入手続きが完了」也不算成交
+    if html_suggests_purchase_failed(body_text):
+        return False
+
     iid = (item_id or "").strip().lower()
     cur = (driver.current_url or "").lower()
     done_path = "/item/%s/order/done" % iid
     if iid and done_path in cur:
         return True
-
-    try:
-        body_text = driver.page_source or ""
-    except Exception:
-        body_text = ""
 
     extra_markers = y_cfg.get("order_detail_completed_markers")
     if isinstance(extra_markers, list):
@@ -158,7 +195,7 @@ def page_indicates_completed_purchase(
             if s and s in body_text:
                 return True
 
-    if "購入が完了" in body_text:
+    if "購入が完了" in body_text and "購入が完了できません" not in body_text:
         return True
 
     # 完成页常见区块（原逻辑）
@@ -175,12 +212,13 @@ def page_indicates_completed_purchase(
         pass
 
     # /order（非 done）上已支付、已截标等（伪 3DS 后可能停在此 URL）
+    # 「購入手続きが完了」不可单独匹配：失败句「購入手続きが完了できませんでした」会命中
     tail_markers = (
         "支払い済み",
         "決済が完了",
         "お支払いが完了",
         "購入が完了しました",
-        "購入手続きが完了",
+        "購入手続きが完了しました",
     )
     if any(m in body_text for m in tail_markers):
         if iid and ("/item/%s/order" % iid) in cur:
@@ -228,6 +266,9 @@ def try_recover_after_success_page_timeout(
         if page_is_yahoo_not_found(driver, y_cfg):
             logger.info("二次核验：候选页为 404（可能被他人买走），尝试下一 URL")
             continue
+        if page_suggests_purchase_failed(driver):
+            logger.info("二次核验：支付失败弹窗（未成交），尝试下一候选 URL")
+            continue
         if page_suggests_incomplete_payment_or_3ds(driver):
             logger.info("二次核验：页面仍似未决済/3DS，尝试下一候选 URL")
             continue
@@ -269,6 +310,11 @@ def try_recover_after_success_page_timeout(
                 if page_is_yahoo_not_found(driver, y_cfg):
                     logger.info(
                         "二次核验：商品已售出但完成页 404，无法确认是否本账号成交，不视为成功"
+                    )
+                    continue
+                if page_suggests_purchase_failed(driver):
+                    logger.info(
+                        "二次核验：商品 API 已售出但页面为支付失败弹窗，不视为本账号成交"
                     )
                     continue
                 if page_suggests_incomplete_payment_or_3ds(driver):

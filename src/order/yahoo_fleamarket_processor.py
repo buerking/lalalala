@@ -43,6 +43,7 @@ from src.order.yahoo_fleamarket_order_verify import (
     describe_purchase_stall,
     page_indicates_completed_purchase,
     page_is_yahoo_not_found,
+    page_suggests_purchase_failed,
     try_recover_after_success_page_timeout,
 )
 
@@ -1067,6 +1068,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         Returns:
             ("success", current_url)
             ("seller_restricted", 原因摘要)
+            ("payment_failed", 失败文案)
             ("page_not_found", 当前 URL)
             ("timeout", 当前 URL)
         """
@@ -1080,6 +1082,9 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             if reason:
                 self._dismiss_seller_restriction_modal(driver)
                 return "seller_restricted", reason
+            pay_fail = page_suggests_purchase_failed(driver)
+            if pay_fail:
+                return "payment_failed", pay_fail
             if self._is_success_page(driver, item_id):
                 return "success", driver.current_url or ""
             time.sleep(max(0.3, poll))
@@ -1089,6 +1094,9 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         if reason2:
             self._dismiss_seller_restriction_modal(driver)
             return "seller_restricted", reason2
+        pay_fail2 = page_suggests_purchase_failed(driver)
+        if pay_fail2:
+            return "payment_failed", pay_fail2
         return "timeout", driver.current_url or ""
 
     def process_order(self, order: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
@@ -1405,6 +1413,34 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             fail = self._handle_seller_restrict_cancel(
                 order, item_id, product_url, info_after_confirm or ""
             )
+            return False, self._make_summary(
+                order,
+                failure_reason=fail,
+                check_cart_requested=True,
+                check_cart_response="ok",
+                runner_pause_requested=False,
+            )
+        if outcome == "payment_failed":
+            fail = (
+                "雅虎闲置：购买未完成，支付信息被拒绝（%s）。未按成功回调。"
+                % (info_after_confirm or "購入手続きが完了できませんでした")
+            )
+            self.logger.error("%s order=%s item=%s", fail, order_id, item_id)
+            try:
+                self.feishu_notifier.notify_order_issue(
+                    str(order_id),
+                    [
+                        fail,
+                        "页面弹窗：購入できません / 購入手続きが完了できませんでした。"
+                        "入力したお支払い情報をご確認ください",
+                        "商品 item_id=%s url=%s" % (item_id, product_url),
+                    ],
+                    user_id=order.get("user_id"),
+                    extra="未实际成交。请核对信用卡/PayPay 支付方式后重试。"
+                    "本单未按成功回调，调度继续。",
+                )
+            except Exception:
+                pass
             return False, self._make_summary(
                 order,
                 failure_reason=fail,
