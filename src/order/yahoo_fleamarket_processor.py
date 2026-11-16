@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import random
 import re
@@ -284,6 +285,19 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         self.logger.info("关键点击前随机等待 %.2f 秒（%s）", sec, action)
         time.sleep(sec)
 
+    def _js_click_allow_timeout(self, driver, el, what: str) -> None:
+        """点击可能触发整页跳转；page_load_timeout 时 stop 后继续，避免整单静默失败。"""
+        try:
+            driver.execute_script("arguments[0].click();", el)
+        except TimeoutException:
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            self.logger.warning(
+                "雅虎闲置：点击%s后页面加载超时，已停止加载并继续", what
+            )
+
     def _store_name(self) -> str:
         return str(self.y_cfg.get("store_name") or "雅虎闲置").strip()
 
@@ -472,7 +486,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
     @staticmethod
     def _listing_title_core(title: str) -> str:
-        s = " ".join((title or "").split())
+        s = " ".join(html.unescape(title or "").split())
         for sep in ("｜", "|"):
             s = s.split(sep)[0].strip()
         return s
@@ -571,10 +585,15 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         from src.order.yahoo_bargain_service import titles_equivalent
 
         if not titles_equivalent(exp_title, page_title):
-            return (
+            msg = (
                 "雅虎闲置：%s标题与订单不符，已中止下单。订单item=%s 期望标题=%s 页面标题=%s URL=%s"
                 % (stage, expected, exp_title[:80], page_title[:80], cur)
             )
+            # 完成页商品ID已对上时已实际付款，标题实体差异不得阻断 addNo
+            if stage == "完成页":
+                self.logger.warning("%s（商品ID已一致，继续完成回调）", msg)
+                return ""
+            return msg
         return ""
 
     def _fail_wrong_item(
@@ -1028,7 +1047,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             EC.element_to_be_clickable((By.XPATH, xp))
         )
         self._random_pre_click_wait("購入内容を確認する")
-        driver.execute_script("arguments[0].click();", el)
+        self._js_click_allow_timeout(driver, el, "購入内容を確認する")
         time.sleep(float(self.y_cfg.get("wait_after_confirm_click_seconds", 2)))
 
     def _click_confirm_ok(self, driver, timeout: int = 25) -> None:
@@ -1038,7 +1057,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             EC.element_to_be_clickable((By.CSS_SELECTOR, css))
         )
         self._random_pre_click_wait("confirm_ok")
-        driver.execute_script("arguments[0].click();", el)
+        self._js_click_allow_timeout(driver, el, "confirm_ok")
         time.sleep(float(self.y_cfg.get("wait_after_confirm_ok_seconds", 2)))
 
     def _is_success_page(self, driver, item_id: str) -> bool:
@@ -1363,9 +1382,10 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
         try:
             self._random_pre_click_wait("商品页%s" % buy_label)
-            driver.execute_script("arguments[0].click();", clickable)
+            self._js_click_allow_timeout(driver, clickable, buy_label or "購入手続きへ")
             time.sleep(float(self.y_cfg.get("wait_after_buy_click_seconds", 3)))
         except Exception as e:
+            self.logger.error("雅虎闲置：点击购买失败: %s", e)
             return False, self._make_summary(order, failure_reason="点击购买失败: %s" % e)
 
         wrong = self._wrong_item_reason(

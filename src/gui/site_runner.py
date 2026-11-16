@@ -670,6 +670,12 @@ class SiteRunner:
                         mark_order_processed(
                             self.merged_config, order.get("order_id")
                         )
+                else:
+                    self._logger().error(
+                        "订单 %s 未成功: %s",
+                        order.get("order_id") or order.get("order_no") or "未知",
+                        (summary or {}).get("failure_reason") or "无失败原因",
+                    )
             except Exception as e:
                 self._logger().error("处理订单异常: %s", e, exc_info=True)
                 order_no = str(order.get("order_no") or order.get("order_id") or "未知")

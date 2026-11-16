@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import re
 from datetime import datetime, timedelta
@@ -103,7 +104,7 @@ def _image_urls(data: Optional[dict]) -> List[str]:
 
 
 def _norm_text(v: Any) -> str:
-    return " ".join(str(v or "").split())
+    return " ".join(html.unescape(str(v or "")).split())
 
 
 _FW_DIGITS = "０１２３４５６７８９"
