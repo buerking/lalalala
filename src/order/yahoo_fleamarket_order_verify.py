@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -17,6 +18,12 @@ from src.browser.browser_manager import BrowserManager
 
 # item_id -> (api_json_or_None, err_or_None)
 ItemApiCheck = Callable[[str], Tuple[Optional[dict], Optional[str]]]
+_ITEM_ID_IN_URL_RE = re.compile(r"/item/([^/?#]+)", re.IGNORECASE)
+
+
+def item_id_from_url(url: str) -> str:
+    m = _ITEM_ID_IN_URL_RE.search(url or "")
+    return (m.group(1) if m else "").strip()
 
 
 def build_order_detail_candidate_urls(
@@ -184,6 +191,10 @@ def page_indicates_completed_purchase(
 
     iid = (item_id or "").strip().lower()
     cur = (driver.current_url or "").lower()
+    url_iid = item_id_from_url(cur).lower()
+    # 上一件残留页的完成页也会有「購入が完了しました」，必须是本单 item
+    if iid and url_iid and url_iid != iid:
+        return False
     done_path = "/item/%s/order/done" % iid
     if iid and done_path in cur:
         return True

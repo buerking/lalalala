@@ -41,6 +41,7 @@ from src.payment.confirm_page_verifier import (
 from src.utils.logger import LoggerMixin
 from src.order.yahoo_fleamarket_order_verify import (
     describe_purchase_stall,
+    item_id_from_url,
     page_indicates_completed_purchase,
     page_is_yahoo_not_found,
     page_suggests_purchase_failed,
@@ -466,8 +467,132 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 ident.get("item_id") or "empty",
             )
             if attempt == 1:
-                self.logger.warning("雅虎闲置议价：%s，再导航一次", last_err)
+                self.logger.warning("雅虎闲置：%s，再导航一次", last_err)
         return False, last_err
+
+    @staticmethod
+    def _listing_title_core(title: str) -> str:
+        s = " ".join((title or "").split())
+        for sep in ("｜", "|"):
+            s = s.split(sep)[0].strip()
+        return s
+
+    @staticmethod
+    def _is_generic_listing_title(title: str) -> bool:
+        """结算/完成页 document.title 常是『購入手続き』，不能当商品名。"""
+        core = YahooFleaMarketOrderProcessor._listing_title_core(title)
+        if not core:
+            return True
+        generic = ("購入手続き", "購入が完了", "購入内容", "お支払い")
+        return any(g in core for g in generic) and len(core) < 40
+
+    @staticmethod
+    def _title_looks_like_item_id(title: str, item_id: str = "", goods_no: str = "") -> bool:
+        t = " ".join((title or "").split())
+        if not t or t == "未知商品":
+            return True
+        tl = t.lower()
+        if item_id and tl == item_id.strip().lower():
+            return True
+        if goods_no and tl == goods_no.strip().lower():
+            return True
+        return bool(re.match(r"^z[0-9a-z_-]+$", tl))
+
+    @classmethod
+    def _expected_listing_title(
+        cls,
+        product: Optional[Dict[str, Any]],
+        api_data: Optional[dict],
+        item_id: str,
+    ) -> str:
+        """期望标题：商品 API 标题优先；EDI 的 GoodsNo 不能当标题。"""
+        if isinstance(api_data, dict):
+            t = str(api_data.get("title") or "").strip()
+            bag = api_data.get("item") if isinstance(api_data.get("item"), dict) else {}
+            if not t:
+                t = str(bag.get("title") or bag.get("name") or "").strip()
+            t = " ".join(t.split())
+            if t and not cls._title_looks_like_item_id(t, item_id):
+                return t
+        gno = str((product or {}).get("goods_no") or (product or {}).get("no") or "")
+        for key in ("name", "title", "goods_name"):
+            t = " ".join(str((product or {}).get(key) or "").split())
+            if t and not cls._title_looks_like_item_id(t, item_id, gno):
+                return t
+        return ""
+
+    def _wrong_item_reason(
+        self,
+        driver,
+        expected_id: str,
+        stage: str,
+        expected_title: str = "",
+    ) -> str:
+        """当前页 URL / 页面身份 / 标题与订单不一致时返回原因，一致返回空串。"""
+        expected = (expected_id or "").strip()
+        if not expected:
+            return ""
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        url_id = (item_id_from_url(cur) or extract_yahoo_item_id(cur) or "").strip()
+        ident = self._read_yahoo_item_identity(driver, expected)
+        page_id = str(ident.get("item_id") or "").strip()
+        if url_id and url_id.lower() != expected.lower():
+            return (
+                "雅虎闲置：%s商品ID与订单不符，已中止下单。订单item=%s 当前URL的item=%s URL=%s"
+                % (stage, expected, url_id, cur)
+            )
+        if page_id and page_id.lower() != expected.lower():
+            return (
+                "雅虎闲置：%s页面商品ID与订单不符，已中止下单。订单item=%s 页面item=%s URL=%s"
+                % (stage, expected, page_id, cur)
+            )
+        exp_title = self._listing_title_core(expected_title)
+        page_title = self._listing_title_core(str(ident.get("title") or ""))
+        if not exp_title:
+            return ""
+        require_title = stage in ("商品页", "点击购买前")
+        if not page_title:
+            if require_title:
+                return (
+                    "雅虎闲置：%s未能读取商品标题，已中止下单。订单item=%s 期望标题=%s URL=%s"
+                    % (stage, expected, exp_title[:80], cur)
+                )
+            return ""
+        if self._is_generic_listing_title(page_title):
+            if require_title:
+                return (
+                    "雅虎闲置：%s页面标题不是商品名，已中止下单。订单item=%s 期望标题=%s 页面标题=%s URL=%s"
+                    % (stage, expected, exp_title[:80], page_title[:80], cur)
+                )
+            return ""
+        from src.order.yahoo_bargain_service import titles_equivalent
+
+        if not titles_equivalent(exp_title, page_title):
+            return (
+                "雅虎闲置：%s标题与订单不符，已中止下单。订单item=%s 期望标题=%s 页面标题=%s URL=%s"
+                % (stage, expected, exp_title[:80], page_title[:80], cur)
+            )
+        return ""
+
+    def _fail_wrong_item(
+        self, order: Dict[str, Any], msg: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        self.logger.error(msg)
+        try:
+            self._handle_order_issue(
+                order,
+                [
+                    msg,
+                    "未继续加购/完成回调。请人工确认浏览器是否误开其他商品、购买履历是否已误下单。",
+                ],
+                reason="商品与订单不符",
+            )
+        except Exception:
+            pass
+        return False, self._make_summary(order, failure_reason=msg)
 
     def _extract_item_detail_listed_price(
         self, driver, expected_item_id: str = ""
@@ -1136,22 +1261,45 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             if blocked:
                 return False, blocked
 
+        expected_title = self._expected_listing_title(
+            product, data if isinstance(data, dict) else None, item_id
+        )
+        if expected_title:
+            self.logger.info("雅虎闲置：本单期望标题 %s", expected_title[:80])
+        else:
+            self.logger.warning("雅虎闲置：无可用期望标题，本单仅核对商品ID")
+
         driver = self.browser_manager.get_driver()
         use_curl = (self.config.get("order_api") or {}).get("use_curl_for_order_api", True)
 
         buy_wait = int(self.y_cfg.get("product_page_buy_button_wait_seconds", 45))
-        self.logger.info("雅虎闲置：打开商品页（可不等待整页加载完成）%s", product_url)
-        try:
-            self.browser_manager.navigate(product_url)
-        except Exception as e:
-            self.logger.error("雅虎闲置：导航商品页异常 %s: %s", product_url, e)
-            return False, self._make_summary(order, failure_reason="打开商品页失败: %s" % e)
+        self.logger.info("雅虎闲置：打开商品页并核对商品ID与标题 %s", product_url)
+        ok_open, open_err = self._open_yahoo_item_page(
+            driver, product_url, item_id, buy_wait
+        )
+        if not ok_open:
+            msg = open_err or "打开商品页失败"
+            self.logger.error("雅虎闲置：%s order=%s", msg, order_id)
+            try:
+                self._handle_order_issue(
+                    order,
+                    [msg, "订单商品=%s url=%s" % (item_id, product_url)],
+                    reason="商品页与订单不符",
+                )
+            except Exception:
+                pass
+            return False, self._make_summary(order, failure_reason=msg)
+
+        wrong = self._wrong_item_reason(
+            driver, item_id, "商品页", expected_title=expected_title
+        )
+        if wrong:
+            return self._fail_wrong_item(order, wrong)
 
         try:
-            WebDriverWait(driver, buy_wait).until(
+            WebDriverWait(driver, min(15, buy_wait)).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "a#item_buy_button"))
             )
-            time.sleep(float(self.y_cfg.get("wait_after_product_load_seconds", 2)))
             self.logger.info(
                 "雅虎闲置：商品页已出现购买按钮，当前 URL: %s",
                 driver.current_url or "",
@@ -1180,6 +1328,11 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             return False, self._make_summary(order, failure_reason=msg)
 
         ident = self._read_yahoo_item_identity(driver, item_id)
+        wrong = self._wrong_item_reason(
+            driver, item_id, "点击购买前", expected_title=expected_title
+        )
+        if wrong:
+            return self._fail_wrong_item(order, wrong)
         blocked = self._reject_if_prohibited_text(
             order, str(ident.get("title") or ""), field="page_title"
         )
@@ -1214,6 +1367,12 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             time.sleep(float(self.y_cfg.get("wait_after_buy_click_seconds", 3)))
         except Exception as e:
             return False, self._make_summary(order, failure_reason="点击购买失败: %s" % e)
+
+        wrong = self._wrong_item_reason(
+            driver, item_id, "下单确认页", expected_title=expected_title
+        )
+        if wrong:
+            return self._fail_wrong_item(order, wrong)
 
         # 进入下单页后，若出现卖家限制购买用户（疑似拉黑）：删单退款 + 用户日志
         try:
@@ -1524,6 +1683,20 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 check_cart_response="ok",
                 runner_pause_requested=False,
             )
+
+        wrong = self._wrong_item_reason(
+            driver, item_id, "完成页", expected_title=expected_title
+        )
+        if not wrong:
+            done_id = item_id_from_url(final_url or "")
+            if done_id and done_id.lower() != item_id.lower():
+                wrong = (
+                    "雅虎闲置：完成页商品与订单不符，已中止回调。"
+                    "订单item=%s 完成页item=%s URL=%s"
+                    % (item_id, done_id, final_url or "")
+                )
+        if wrong:
+            return self._fail_wrong_item(order, wrong)
 
         purchase_url = final_url
         purchase_nobs = [{"no": item_id, "url": purchase_url}]
