@@ -57,7 +57,11 @@ def build_order_detail_candidate_urls(
             "https://paypayfleamarket.yahoo.co.jp",
             "https://paypayfleamarket-sec.yahoo.co.jp",
         ]
-    return ["%s/item/%s/order" % (h, item_id) for h in hosts]
+    out: List[str] = []
+    for h in hosts:
+        out.append("%s/item/%s/order/done" % (h, item_id))
+        out.append("%s/item/%s/order" % (h, item_id))
+    return out
 
 
 def page_is_yahoo_not_found(driver, y_cfg: Optional[Dict[str, Any]] = None) -> bool:
@@ -248,10 +252,9 @@ def try_recover_after_success_page_timeout(
     item_api_check: Optional[ItemApiCheck] = None,
 ) -> Tuple[bool, str]:
     """
-    等待完成页超时后：依次打开订单详情候选 URL，判断是否已实际拍下。
+    等待完成页超时后：打开 /order/done、/order，仅按页面内容判断是否已成交。
 
-    可选：商品 API 返回 status=SOLD 时，在页面无明显「未决済/3DS」提示且 URL 落在
-    /item/<id>/order 时，视为已成交（减轻伪 3DS 后文案与完成页不一致的漏判）。
+    商品 API status=SOLD 只记日志，不当成交：别人买走也会 SOLD，不能据此调 addNo。
 
     Returns:
         (是否恢复为成功, 当前/最后尝试的详情页 URL)
@@ -287,50 +290,15 @@ def try_recover_after_success_page_timeout(
             logger.info("雅虎闲置：二次核验认为已成交，URL=%s", last_url)
             return True, last_url
 
-    if item_api_check and y_cfg.get("stall_verify_item_api_fallback", True):
-        data = None
-        api_err = ""
+    if item_api_check:
         try:
             data, api_err = item_api_check(item_id)
         except Exception as e:
-            logger.warning("二次核验：商品 API 检查异常 %s", e)
-            data = None
-            api_err = str(e)
-        api_status = item_api_status_text(data)
+            data, api_err = None, str(e)
         logger.info(
-            "二次核验：商品 API status=%s err=%s",
-            api_status or "-",
+            "二次核验：页面未判成交，商品 API status=%s err=%s（SOLD 不视为成功、不调 addNo）",
+            item_api_status_text(data) or "-",
             api_err or "",
         )
-        if data and api_status.upper() == "SOLD":
-            logger.info("二次核验：商品 API status=SOLD，打开订单详情页供后续截图")
-            iid_lower = (item_id or "").strip().lower()
-            for url in candidates:
-                try:
-                    BrowserManager.navigate_allow_timeout(driver, url, logger)
-                    time.sleep(sec)
-                except Exception as e:
-                    logger.warning("二次核验(API)打开 URL 失败 %s: %s", url, e)
-                    continue
-                last_url = driver.current_url or url
-                cur_l = (last_url or "").lower()
-                if iid_lower and iid_lower not in cur_l:
-                    continue
-                if "/order" not in cur_l:
-                    continue
-                if page_is_yahoo_not_found(driver, y_cfg):
-                    logger.info(
-                        "二次核验：商品已售出但完成页 404，无法确认是否本账号成交，不视为成功"
-                    )
-                    continue
-                if page_suggests_purchase_failed(driver):
-                    logger.info(
-                        "二次核验：商品 API 已售出但页面为支付失败弹窗，不视为本账号成交"
-                    )
-                    continue
-                if page_suggests_incomplete_payment_or_3ds(driver):
-                    continue
-                logger.info("雅虎闲置：二次核验(API+URL) 视为已成交，URL=%s", last_url)
-                return True, last_url
 
     return False, last_url

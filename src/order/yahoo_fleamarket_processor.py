@@ -1648,18 +1648,6 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 )
             )
             self.logger.error("%s %s", stall_msg, stall_hint)
-            # 议价达价单由 YahooBargainService 核验库存后可能再试一次，此处先不飞书，避免误报
-            if not order.get("from_bargain"):
-                try:
-                    self.feishu_notifier.notify_order_issue(
-                        str(order_id),
-                        [stall_msg, stall_hint] if stall_hint else [stall_msg],
-                        user_id=order.get("user_id"),
-                        extra="建议人工检查支付/3DS。本单已跳过，调度将继续处理后续订单。",
-                    )
-                except Exception:
-                    pass
-
             recovered, detail_url = try_recover_after_success_page_timeout(
                 driver,
                 item_id,
@@ -1671,11 +1659,22 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 ok_trade = True
                 final_url = detail_url or (driver.current_url or "")
                 self.logger.info(
-                    "雅虎闲置：完成页等待超时，经订单详情二次核验视为已成交，继续后续截图与回调"
+                    "雅虎闲置：完成页等待超时，经页面二次核验视为已成交，继续后续截图与回调"
                 )
+            elif not order.get("from_bargain"):
+                # 页面核验未成功：不调 addNo，交给人工。议价达价单可能再试一次，此处先不飞书
+                try:
+                    self.feishu_notifier.notify_order_issue(
+                        str(order_id),
+                        [stall_msg, stall_hint] if stall_hint else [stall_msg],
+                        user_id=order.get("user_id"),
+                        extra="页面二次核验未确认成交，未调用 addNoCallbackSimple。"
+                        "请人工核对支付/3DS/购买履历。本单按失败跳过，调度继续。",
+                    )
+                except Exception:
+                    pass
 
         if not ok_trade:
-            # 飞书已在上方超时分支发送，此处不再重复
             return False, self._make_summary(
                 order,
                 failure_reason=stall_msg,
