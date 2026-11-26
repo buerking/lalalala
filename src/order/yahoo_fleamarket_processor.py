@@ -56,6 +56,10 @@ _YEN_AMOUNT_RE = re.compile(
     r"(?:クレジットカード[：:]\s*)?([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円"
 )
 _YEN_ONLY_RE = re.compile(r"^\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円\s*$")
+# 主价常被拆成 <span>14,000</span><span>円</span>，源码里数字和「円」中间夹标签
+_YEN_SPLIT_SRC_RE = re.compile(
+    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:</?[^>]+>\s*){0,8}円"
+)
 
 
 def extract_yahoo_item_id(url: str) -> Optional[str]:
@@ -84,8 +88,9 @@ _CANONICAL_ITEM_RE = re.compile(
 _PAGE_DATA_ID_RE = re.compile(r'["\']productID["\']\s*:\s*["\']([^"\']+)["\']')
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECASE)
 # 主栏标价在「N円」后不远处有「送料無料」；避开 実質N円 / 推荐卡
+# 允许数字与「円」被 span 拆开：14,000</span><span>円
 _YEN_THEN_SHIP_RE = re.compile(
-    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円.{0,400}送料無料",
+    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:</?[^>]+>\s*){0,8}円.{0,400}送料無料",
     re.DOTALL,
 )
 
@@ -193,6 +198,57 @@ return (function(expected) {
     matched: !!(expected && id && id === expected)
   };
 })(arguments[0]);
+"""
+
+# 结算页 / 商品页取价：用 innerText 拼回被拆开的「14,000」+「円」
+_YAHOO_PAGE_PRICE_JS = r"""
+return (function() {
+  function yenInt(v) {
+    if (v == null || v === '') return null;
+    var n = Number(String(v).replace(/,/g, '').trim());
+    return (n > 0 && isFinite(n)) ? n : null;
+  }
+  function firstYen(text, re) {
+    var m = String(text || '').match(re);
+    return m ? yenInt(String(m[1] || '').replace(/,/g, '')) : null;
+  }
+  var body = '';
+  try { body = (document.body && document.body.innerText) || ''; } catch (e) {}
+  var compact = body.replace(/[\s\u00a0]/g, '');
+  var pay = firstYen(compact, /クレジットカード[：:]([0-9,]+)円/);
+  if (pay) return pay;
+  var tot = firstYen(compact, /お支払い金額(?:（合計）)?([0-9,]+)円/)
+         || firstYen(compact, /合計金額([0-9,]+)円/)
+         || firstYen(compact, /お支払い([0-9,]+)円/);
+  if (tot) return tot;
+  var hits = [];
+  var nodes = document.querySelectorAll('span,div,p,dd,td,strong,b,li,h1,h2,h3');
+  for (var i = 0; i < nodes.length; i++) {
+    var t = '';
+    try { t = (nodes[i].innerText || '').replace(/[\s\u00a0]/g, ''); } catch (e) { continue; }
+    if (!t || t.indexOf('円') < 0) continue;
+    if (t.indexOf('実質') >= 0 || t.indexOf('最安') >= 0) continue;
+    if (t.length > 32) continue;
+    var m = t.match(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
+    if (!m) continue;
+    var n = yenInt(String(m[1]).replace(/,/g, ''));
+    if (n) hits.push(n);
+  }
+  if (!hits.length) return null;
+  var counts = {};
+  for (var j = 0; j < hits.length; j++) {
+    counts[hits[j]] = (counts[hits[j]] || 0) + 1;
+  }
+  var best = null, bestC = 0;
+  for (var k in counts) {
+    var ck = counts[k], kv = Number(k);
+    if (ck > bestC || (ck === bestC && (best == null || kv > best))) {
+      bestC = ck;
+      best = kv;
+    }
+  }
+  return best;
+})();
 """
 
 
@@ -320,9 +376,35 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
     def _extract_page_price_yen(self, driver) -> Optional[int]:
         """
         从当前页可见文案解析成交金额（日元整数）。
-        优先：支付行「クレジットカード：N円」；其次：仅含「N円」的短节点众数；
-        再兜底：整页文案中出现最多的金额。不依赖易变的 sc-* class。
+        优先：innerText（能拼回拆开的「14,000」+「円」）与支付行；
+        其次：页面 JSON 标价、仅含「N円」的短节点众数；
+        再兜底：整页源码（含数字与円被标签拆开的情况）。不依赖易变的 sc-* class。
         """
+
+        def _mode(vals: List[int]) -> Optional[int]:
+            if not vals:
+                return None
+            counts: Dict[int, int] = {}
+            for v in vals:
+                counts[v] = counts.get(v, 0) + 1
+            return sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[0][0]
+
+        try:
+            js_price = driver.execute_script(_YAHOO_PAGE_PRICE_JS)
+            v = int(js_price) if js_price is not None else 0
+            if v > 0:
+                return v
+        except Exception:
+            pass
+
+        ident = self._read_yahoo_item_identity(driver)
+        try:
+            ident_price = int(ident.get("price") or 0)
+        except (TypeError, ValueError):
+            ident_price = 0
+        if ident_price > 0:
+            return ident_price
+
         texts: List[str] = []
         try:
             for el in driver.find_elements(By.XPATH, "//*[contains(text(),'円')]"):
@@ -356,32 +438,26 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 if v:
                     all_hits.append(v)
 
-        def _mode(vals: List[int]) -> Optional[int]:
-            if not vals:
-                return None
-            # 众数；并列时取较大值（避免误抓到小额杂项）
-            counts: Dict[int, int] = {}
-            for v in vals:
-                counts[v] = counts.get(v, 0) + 1
-            best = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[0][0]
-            return best
-
         for bucket in (pay_hits, only_hits, all_hits):
             picked = _mode(bucket)
             if picked:
                 return picked
 
-        # DOM 节点拿不到时，回退整页源码粗扫（仍用众数）
         try:
             src = driver.page_source or ""
         except Exception:
             src = ""
+        src_n = src.replace("\u00a0", "")
         src_hits: List[int] = []
-        for m in _YEN_AMOUNT_RE.finditer(src.replace("\u00a0", "")):
-            v = self._yen_text_to_int(m.group(1))
-            if v and v < 100_000_000:  # 排除明显噪声
-                src_hits.append(v)
-        return _mode(src_hits)
+        for cre in (_YEN_AMOUNT_RE, _YEN_SPLIT_SRC_RE):
+            for m in cre.finditer(src_n):
+                v = self._yen_text_to_int(m.group(1))
+                if v and v < 100_000_000:
+                    src_hits.append(v)
+            picked = _mode(src_hits)
+            if picked:
+                return picked
+        return None
 
     def _require_page_price(self, driver, stage: str) -> Tuple[Optional[int], str]:
         """
@@ -392,6 +468,11 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         if price and price > 0:
             self.logger.info("雅虎闲置：页面真实价格 %s 円（阶段=%s）", price, stage)
             return price, ""
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        self.logger.warning("雅虎闲置：未能解析价格 stage=%s url=%s", stage, cur)
         return None, "无法从当前页面解析真实价格（阶段=%s）" % stage
 
     def _read_yahoo_item_identity(
@@ -458,6 +539,30 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             return True
         except TimeoutException:
             return bool(self._read_yahoo_item_identity(driver, item_id).get("matched"))
+
+    def _wait_yahoo_checkout_page(self, driver, item_id: str, wait_sec: int) -> bool:
+        """点击購入手続きへ后，等到 /item/{id}/order（含 paypayfleamarket-sec）。"""
+        expected = (item_id or "").strip().lower()
+
+        def _ready(d) -> bool:
+            try:
+                cur = (d.current_url or "").lower()
+            except Exception:
+                return False
+            if "/order" not in cur:
+                return False
+            uid = (
+                item_id_from_url(cur) or extract_yahoo_item_id(cur) or ""
+            ).strip().lower()
+            if expected and uid and uid != expected:
+                return False
+            return True
+
+        try:
+            WebDriverWait(driver, max(1, int(wait_sec))).until(_ready)
+            return True
+        except TimeoutException:
+            return _ready(driver)
 
     def _open_yahoo_item_page(
         self, driver, product_url: str, item_id: str, wait_sec: int
@@ -1387,6 +1492,16 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception as e:
             self.logger.error("雅虎闲置：点击购买失败: %s", e)
             return False, self._make_summary(order, failure_reason="点击购买失败: %s" % e)
+
+        checkout_wait = int(self.y_cfg.get("checkout_page_wait_seconds") or 20)
+        if not self._wait_yahoo_checkout_page(driver, item_id, checkout_wait):
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                cur = ""
+            msg = "雅虎闲置：点击購入手続きへ后未进入下单确认页 URL=%s" % cur
+            self.logger.error(msg)
+            return False, self._make_summary(order, failure_reason=msg)
 
         wrong = self._wrong_item_reason(
             driver, item_id, "下单确认页", expected_title=expected_title
