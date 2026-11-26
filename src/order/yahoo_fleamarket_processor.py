@@ -251,6 +251,112 @@ return (function() {
 })();
 """
 
+# 结算页支付检测：默认只读 radio 状态。doClick=true 时才点不一致的项。
+# 规则：クレジットカード + 尾号（GMO2167→2167），禁止留在 PayPay残高。
+# 不依赖 styled-components 的 sc-* class；用 name=method / name=creditcard + 文案。
+_YAHOO_LOCK_PAYMENT_JS = r"""
+return (function(last4, doClick) {
+  last4 = String(last4 || '');
+  function vis(el) {
+    if (!el || !el.getClientRects) return false;
+    try { return el.getClientRects().length > 0; } catch (e) { return false; }
+  }
+  function txt(el) {
+    try { return ((el && el.innerText) || '').replace(/\s+/g, ' ').trim(); } catch (e) { return ''; }
+  }
+  function nearText(el) {
+    var n = el;
+    for (var i = 0; i < 8 && n; i++) {
+      var t = txt(n);
+      if (t) return t;
+      n = n.parentElement;
+    }
+    return '';
+  }
+  function last4From(text) {
+    var t = String(text || '');
+    var m = t.match(/(?:下4桁\s*|[*＊xX]{2,}\s*)(\d{4})/) || t.match(/(\d{4})/);
+    return m ? m[1] : '';
+  }
+  function classifyMethod(text) {
+    var t = String(text || '');
+    if (t.indexOf('PayPay残高') >= 0) return 'balance';
+    if (t.indexOf('PayPayクレジット') >= 0) return 'paypay_credit';
+    if (t.indexOf('クレジットカード') >= 0) return 'card';
+    return '';
+  }
+  function clickEl(el) {
+    if (!el) return false;
+    try { el.scrollIntoView({block: 'center', inline: 'nearest'}); } catch (e) {}
+    try { el.click(); return true; } catch (e) {}
+    return false;
+  }
+  var methods = Array.from(document.querySelectorAll('input[type=radio][name=method]'));
+  var balance = null, cardMethod = null;
+  for (var i = 0; i < methods.length; i++) {
+    var lab = methods[i].closest('label') || methods[i];
+    var kind = classifyMethod(txt(lab) || nearText(methods[i]));
+    if (kind === 'balance') balance = methods[i];
+    else if (kind === 'card') cardMethod = methods[i];
+  }
+  if (doClick && cardMethod && !cardMethod.disabled && !cardMethod.checked) {
+    var clab = cardMethod.closest('label');
+    if (clab && vis(clab)) clickEl(clab);
+    if (!cardMethod.checked) clickEl(cardMethod);
+  }
+  var cards = Array.from(document.querySelectorAll('input[type=radio][name=creditcard]'));
+  var target = null;
+  var foundLast4s = [];
+  for (var j = 0; j < cards.length; j++) {
+    if (cards[j].disabled) continue;
+    var ctext = txt(cards[j].closest('label')) || nearText(cards[j]);
+    var l4 = last4From(ctext);
+    if (l4 && foundLast4s.indexOf(l4) < 0) foundLast4s.push(l4);
+    if (l4 !== last4) continue;
+    if (!target) target = cards[j];
+    if (cards[j].checked) target = cards[j];
+  }
+  if (doClick && target && !target.checked) {
+    var tlab = target.closest('label');
+    if (tlab && vis(tlab)) clickEl(tlab);
+    if (!target.checked) clickEl(target);
+  }
+  var selectedLast4 = '';
+  var selectedText = '';
+  for (var k = 0; k < cards.length; k++) {
+    if (!cards[k].checked) continue;
+    selectedText = (txt(cards[k].closest('label')) || nearText(cards[k])).slice(0, 80);
+    selectedLast4 = last4From(selectedText);
+  }
+  var methodKind = '';
+  if (balance && balance.checked) methodKind = 'balance';
+  else if (cardMethod && cardMethod.checked) methodKind = 'card';
+  else {
+    for (var p = 0; p < methods.length; p++) {
+      if (!methods[p].checked) continue;
+      methodKind = classifyMethod(txt(methods[p].closest('label')) || nearText(methods[p])) || 'other';
+    }
+  }
+  var ok = !!(
+    cardMethod && cardMethod.checked
+    && !(balance && balance.checked)
+    && selectedLast4 === last4
+  );
+  return {
+    ok: ok,
+    methodKind: methodKind,
+    methodCardChecked: !!(cardMethod && cardMethod.checked),
+    balanceChecked: !!(balance && balance.checked),
+    foundCard: !!target,
+    foundLast4s: foundLast4s,
+    selectedLast4: selectedLast4,
+    selectedText: selectedText,
+    methodCount: methods.length,
+    cardCount: cards.length
+  };
+})(arguments[0], arguments[1]);
+"""
+
 
 def parse_yahoo_item_identity_from_html(src: str) -> Dict[str, Any]:
     """从 HTML 解析当前商品身份（不依赖编译后的 sc-* class）。"""
@@ -361,6 +467,11 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         return str(
             (self.config.get("payment") or {}).get("add_no_credit_card") or "GMO2167"
         ).strip()
+
+    def _card_last4(self) -> str:
+        """GMO2167 → 2167。结算页按卡尾号锁定，不是整段卡代号。"""
+        digits = re.sub(r"\D", "", self._credit_card() or "")
+        return digits[-4:] if len(digits) >= 4 else digits
 
     @staticmethod
     def _yen_text_to_int(raw: str) -> Optional[int]:
@@ -1144,6 +1255,72 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 pass
             time.sleep(0.3)
 
+    def _inspect_yahoo_checkout_payment(self, driver, last4: str, do_click: bool = False):
+        try:
+            return driver.execute_script(_YAHOO_LOCK_PAYMENT_JS, last4, bool(do_click))
+        except Exception as e:
+            self.logger.warning("雅虎闲置：读取支付方式失败: %s", e)
+            return None
+
+    def _ensure_yahoo_checkout_credit_card(self, driver) -> Optional[str]:
+        """
+        先检测结算页支付方式。已是「クレジットカード」且尾号符合配置则不点击。
+        仅在突发改成 PayPay残高 / 其它卡时才点回去；点不回则中止。
+        """
+        last4 = self._card_last4()
+        if not last4:
+            return "未配置信用卡尾号（payment.add_no_credit_card）"
+        deadline = time.time() + 8.0
+        st = None
+        while time.time() < deadline:
+            st = self._inspect_yahoo_checkout_payment(driver, last4, False)
+            if isinstance(st, dict) and int(st.get("methodCount") or 0) > 0:
+                break
+            time.sleep(0.3)
+        if not isinstance(st, dict) or int(st.get("methodCount") or 0) <= 0:
+            return "结算页未出现支付方式选项（method radio）"
+        if st.get("ok"):
+            self.logger.info(
+                "雅虎闲置：支付方式符合规则（クレジットカード 尾号 %s），不点击",
+                last4,
+            )
+            return None
+        self.logger.warning(
+            "雅虎闲置：支付方式与规则不一致 method=%s balance=%s selected=%s found=%s，点击改回尾号 %s",
+            st.get("methodKind"),
+            st.get("balanceChecked"),
+            st.get("selectedLast4") or "-",
+            st.get("foundLast4s") or [],
+            last4,
+        )
+        self._random_pre_click_wait("纠正支付方式%s" % last4)
+        last = st
+        for _ in range(3):
+            self._inspect_yahoo_checkout_payment(driver, last4, True)
+            time.sleep(0.4)
+            last = self._inspect_yahoo_checkout_payment(driver, last4, False)
+            if isinstance(last, dict) and last.get("ok"):
+                self.logger.info(
+                    "雅虎闲置：已纠正为 クレジットカード 尾号 %s", last4
+                )
+                return None
+            time.sleep(0.35)
+        last = last if isinstance(last, dict) else {}
+        if last.get("balanceChecked"):
+            return (
+                "结算页仍选中 PayPay残高，无法改回信用卡尾号 %s（禁止用残高下单）"
+                % last4
+            )
+        if not last.get("foundCard"):
+            return (
+                "结算页未找到尾号 %s 的信用卡（页面卡尾号=%s），禁止用 PayPay残高 继续"
+                % (last4, last.get("foundLast4s") or "-")
+            )
+        return (
+            "结算页支付方式与规则不一致且未能纠正（需要信用卡尾号 %s，method=%s selected=%s）"
+            % (last4, last.get("methodKind") or "-", last.get("selectedLast4") or "-")
+        )
+
     def _click_confirm_purchase(self, driver, timeout: int = 25) -> None:
         xp = self.y_cfg.get("confirm_purchase_button_xpath") or (
             "//button[.//div[normalize-space()='購入内容を確認する']]"
@@ -1527,6 +1704,13 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
         self._dismiss_ok_modal(driver, timeout=float(self.y_cfg.get("modal_ok_seconds", 6)))
 
+        # 检测支付方式；已是信用卡尾号则不点，仅突发不一致时纠正
+        pay_err = self._ensure_yahoo_checkout_credit_card(driver)
+        if pay_err:
+            self.logger.error("雅虎闲置：%s order=%s item=%s", pay_err, order_id, item_id)
+            self._handle_order_issue(order, [pay_err], reason="支付方式与规则不一致")
+            return False, self._make_summary(order, failure_reason=pay_err)
+
         # 后端传价一律以当前页真实金额为准（不用订单接口价 / 商品 API 价）
         price_int, price_err = self._require_page_price(driver, "下单确认页-回调前")
         if not price_int:
@@ -1617,6 +1801,18 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 failure_reason=chk_err or "checkCartGoodsSimple 失败",
                 check_cart_requested=True,
                 check_cart_response=(chk_raw or "")[:500],
+            )
+
+        # 点确认前再检测一次；一致则不点
+        pay_err2 = self._ensure_yahoo_checkout_credit_card(driver)
+        if pay_err2:
+            self.logger.error("雅虎闲置：%s order=%s item=%s", pay_err2, order_id, item_id)
+            self._handle_order_issue(order, [pay_err2], reason="支付方式与规则不一致")
+            return False, self._make_summary(
+                order,
+                failure_reason=pay_err2,
+                check_cart_requested=True,
+                check_cart_response="ok",
             )
 
         # 最终确认
