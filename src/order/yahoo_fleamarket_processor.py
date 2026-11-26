@@ -51,14 +51,16 @@ from src.order.yahoo_fleamarket_order_verify import (
 
 
 _ITEM_PATH_RE = re.compile(r"/item/(?P<id>[^/?#]+)", re.IGNORECASE)
+# 金额数字须左边界，避免「下4桁 2167」+「20,000円」去空白后变成 216720,000円 → 误读 720000
+_YEN_NUM = r"(?<![0-9,])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
 # 页面金额：17,300円 / 17300円；也匹配「クレジットカード：7,600円」
 _YEN_AMOUNT_RE = re.compile(
-    r"(?:クレジットカード[：:]\s*)?([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円"
+    r"(?:クレジットカード[：:]\s*)?" + _YEN_NUM + r"\s*円"
 )
 _YEN_ONLY_RE = re.compile(r"^\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*円\s*$")
 # 主价常被拆成 <span>14,000</span><span>円</span>，源码里数字和「円」中间夹标签
 _YEN_SPLIT_SRC_RE = re.compile(
-    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:</?[^>]+>\s*){0,8}円"
+    _YEN_NUM + r"\s*(?:</?[^>]+>\s*){0,8}円"
 )
 
 
@@ -90,8 +92,18 @@ _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECA
 # 主栏标价在「N円」后不远处有「送料無料」；避开 実質N円 / 推荐卡
 # 允许数字与「円」被 span 拆开：14,000</span><span>円
 _YEN_THEN_SHIP_RE = re.compile(
-    r"([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:</?[^>]+>\s*){0,8}円.{0,400}送料無料",
+    _YEN_NUM + r"\s*(?:</?[^>]+>\s*){0,8}円.{0,400}?送料無料",
     re.DOTALL,
+)
+# 结算页商品卡是「送料無料」在金额前面
+_SHIP_THEN_YEN_RE = re.compile(
+    r"送料無料.{0,400}?" + _YEN_NUM + r"\s*(?:</?[^>]+>\s*){0,8}円",
+    re.DOTALL,
+)
+# 信用卡行：下4桁 2167 紧挨 20,000円（去空白后是 216720,000円，要先吃掉尾号）
+_LAST4_THEN_YEN_RE = re.compile(
+    r"下4桁\s*\d{4}(?:\s|</?[^>]+>)*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+    r"\s*(?:</?[^>]+>\s*){0,8}円"
 )
 
 # 页面身份：同一 Chrome 连开多件商品时，#item_buy_button 在旧页也会命中。
@@ -107,10 +119,17 @@ return (function(expected) {
     if (!el || !el.textContent) return null;
     try {
       var data = JSON.parse(el.textContent);
-      var it = data && data.props && data.props.initialState
-        && data.props.initialState.itemsState
-        && data.props.initialState.itemsState.items
-        && data.props.initialState.itemsState.items.item;
+      var st = data && data.props && data.props.initialState;
+      var purchase = st && st.purchaseState && st.purchaseState.purchase
+        && st.purchaseState.purchase.detail && st.purchaseState.purchase.detail.item;
+      if (purchase && purchase.id) {
+        return {
+          id: String(purchase.id),
+          title: String(purchase.title || ''),
+          price: null
+        };
+      }
+      var it = st && st.itemsState && st.itemsState.items && st.itemsState.items.item;
       if (!it || !it.id) return null;
       return {id: String(it.id), title: String(it.title || ''), price: yenInt(it.price)};
     } catch (e) { return null; }
@@ -164,11 +183,11 @@ return (function(expected) {
         if (t.indexOf('送料無料') < 0) continue;
         if (t.indexOf('実質') >= 0 || t.indexOf('最安') >= 0) continue;
         if (t.length > 80) continue;
-        var m = t.match(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
+        var m = t.match(/(^|[^0-9,])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
         if (!m) continue;
         if (t.length < bestLen) {
           bestLen = t.length;
-          best = m[1].replace(/,/g, '');
+          best = m[2].replace(/,/g, '');
         }
       }
     }
@@ -200,7 +219,8 @@ return (function(expected) {
 })(arguments[0]);
 """
 
-# 结算页 / 商品页取价：用 innerText 拼回被拆开的「14,000」+「円」
+# 结算页 / 商品页取价：只认页面可见金额，不用 JSON item.price（那是用户编辑价）。
+# 拼回拆开的「20,000」+「円」；排除残高 / 実質；避免 下4桁2167 拼进 20,000円。
 _YAHOO_PAGE_PRICE_JS = r"""
 return (function() {
   function yenInt(v) {
@@ -208,31 +228,51 @@ return (function() {
     var n = Number(String(v).replace(/,/g, '').trim());
     return (n > 0 && isFinite(n)) ? n : null;
   }
-  function firstYen(text, re) {
-    var m = String(text || '').match(re);
-    return m ? yenInt(String(m[1] || '').replace(/,/g, '')) : null;
+  function noisy(t) {
+    var s = String(t || '');
+    return s.indexOf('残高') >= 0 || s.indexOf('利用可能') >= 0
+      || s.indexOf('チャージ') >= 0 || s.indexOf('ポイント') >= 0
+      || s.indexOf('実質') >= 0 || s.indexOf('最安') >= 0
+      || s.indexOf('失効') >= 0 || /[0-9,]+pt/i.test(s);
   }
-  var body = '';
-  try { body = (document.body && document.body.innerText) || ''; } catch (e) {}
-  var compact = body.replace(/[\s\u00a0]/g, '');
-  var pay = firstYen(compact, /クレジットカード[：:]([0-9,]+)円/);
-  if (pay) return pay;
-  var tot = firstYen(compact, /お支払い金額(?:（合計）)?([0-9,]+)円/)
-         || firstYen(compact, /合計金額([0-9,]+)円/)
-         || firstYen(compact, /お支払い([0-9,]+)円/);
-  if (tot) return tot;
-  var hits = [];
+  function yenFromText(t) {
+    var um = String(t || '').match(/下4桁\s*\d{4}([0-9,]+)円/);
+    if (um) return yenInt(String(um[1]).replace(/,/g, ''));
+    var m = String(t || '').match(/(^|[^0-9,])([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
+    return m ? yenInt(String(m[2]).replace(/,/g, '')) : null;
+  }
   var nodes = document.querySelectorAll('span,div,p,dd,td,strong,b,li,h1,h2,h3');
+  var nearShip = null, nearShipLen = 9999;
+  var nearCard = null, nearCardLen = 9999;
+  var hits = [];
   for (var i = 0; i < nodes.length; i++) {
     var t = '';
     try { t = (nodes[i].innerText || '').replace(/[\s\u00a0]/g, ''); } catch (e) { continue; }
     if (!t || t.indexOf('円') < 0) continue;
-    if (t.indexOf('実質') >= 0 || t.indexOf('最安') >= 0) continue;
-    if (t.length > 32) continue;
-    var m = t.match(/([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)円/);
-    if (!m) continue;
-    var n = yenInt(String(m[1]).replace(/,/g, ''));
-    if (n) hits.push(n);
+    if (noisy(t)) continue;
+    if (t.length > 48) continue;
+    var n = yenFromText(t);
+    if (!n) continue;
+    if (t.indexOf('送料無料') >= 0 && t.length < nearShipLen) {
+      nearShipLen = t.length;
+      nearShip = n;
+    }
+    if (t.indexOf('下4桁') >= 0 && t.length < nearCardLen) {
+      nearCardLen = t.length;
+      nearCard = n;
+    }
+    if (t.length <= 32) hits.push(n);
+  }
+  if (nearShip) return nearShip;
+  if (nearCard) return nearCard;
+  var body = '';
+  try { body = (document.body && document.body.innerText) || ''; } catch (e) {}
+  var compact = body.replace(/[\s\u00a0]/g, '');
+  var tot = compact.match(/お支払い金額(?:（合計）)?([0-9,]+)円/)
+         || compact.match(/合計金額([0-9,]+)円/);
+  if (tot) {
+    var tv = yenInt(String(tot[1]).replace(/,/g, ''));
+    if (tv) return tv;
   }
   if (!hits.length) return null;
   var counts = {};
@@ -242,7 +282,7 @@ return (function() {
   var best = null, bestC = 0;
   for (var k in counts) {
     var ck = counts[k], kv = Number(k);
-    if (ck > bestC || (ck === bestC && (best == null || kv > best))) {
+    if (ck > bestC || (ck === bestC && (best == null || kv < best))) {
       bestC = ck;
       best = kv;
     }
@@ -367,21 +407,16 @@ def parse_yahoo_item_identity_from_html(src: str) -> Dict[str, Any]:
     if m:
         try:
             data = json.loads(m.group(1))
+            st = (data.get("props") or {}).get("initialState") or {}
             item = (
-                ((data.get("props") or {}).get("initialState") or {})
-                .get("itemsState", {})
-                .get("items", {})
-                .get("item")
-            )
+                ((st.get("purchaseState") or {}).get("purchase") or {})
+                .get("detail") or {}
+            ).get("item")
+            if not (isinstance(item, dict) and item.get("id")):
+                item = ((st.get("itemsState") or {}).get("items") or {}).get("item")
             if isinstance(item, dict) and item.get("id"):
                 out["item_id"] = str(item.get("id") or "")
                 out["title"] = " ".join(str(item.get("title") or "").split())
-                try:
-                    n = int(round(float(item.get("price"))))
-                    if n > 0:
-                        out["price"] = n
-                except (TypeError, ValueError):
-                    pass
         except Exception:
             pass
     if not out["item_id"]:
@@ -399,15 +434,26 @@ def parse_yahoo_item_identity_from_html(src: str) -> Dict[str, Any]:
             t = " ".join(t.split()).split("｜")[0].split("|")[0].strip()
             out["title"] = t
     if not out["price"]:
-        for sm in _YEN_THEN_SHIP_RE.finditer(src.replace("\u00a0", " ")):
-            prefix = src[max(0, sm.start() - 24) : sm.start()]
-            if "実質" in prefix or "最安" in prefix:
-                continue
-            raw = sm.group(1).replace(",", "")
-            if raw.isdigit():
-                n = int(raw)
-                if n > 0:
-                    out["price"] = n
+        src_n = src.replace("\u00a0", " ")
+        compact = re.sub(r"[\s\u00a0]+", "", src_n)
+        lm = _LAST4_THEN_YEN_RE.search(compact)
+        if lm:
+            raw = lm.group(1).replace(",", "")
+            if raw.isdigit() and int(raw) > 0:
+                out["price"] = int(raw)
+        if not out["price"]:
+            for cre in (_SHIP_THEN_YEN_RE, _YEN_THEN_SHIP_RE):
+                for sm in cre.finditer(src_n):
+                    blob = sm.group(0)
+                    if any(x in blob for x in ("実質", "最安", "残高", "利用可能")):
+                        continue
+                    raw = sm.group(1).replace(",", "")
+                    if raw.isdigit():
+                        n = int(raw)
+                        if n > 0:
+                            out["price"] = n
+                            break
+                if out["price"]:
                     break
     return out
 
@@ -474,6 +520,31 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         return digits[-4:] if len(digits) >= 4 else digits
 
     @staticmethod
+    def _product_order_yen(self, product: Optional[Dict[str, Any]]) -> int:
+        """订单 List.GoodsPrice（日元）。"""
+        if not isinstance(product, dict):
+            return 0
+        try:
+            n = int(round(float(product.get("price") or 0)))
+        except (TypeError, ValueError):
+            n = 0
+        return n if n > 0 else 0
+
+    def _price_looks_like_balance_mistake(
+        self, page_yen: int, order_yen: int
+    ) -> Optional[str]:
+        """页面解析价远高于订单价时，多半是误取了 PayPay残高。"""
+        if page_yen <= 0 or order_yen <= 0:
+            return None
+        if page_yen < order_yen * 5:
+            return None
+        return (
+            "页面解析价 %s 円 远高于订单 GoodsPrice %s 円，"
+            "疑似误把 PayPay残高 当成成交价，已中止以免按错误金额 checkCart"
+            % (page_yen, order_yen)
+        )
+
+    @staticmethod
     def _yen_text_to_int(raw: str) -> Optional[int]:
         s = (raw or "").replace(",", "").replace("，", "").strip()
         if not s.isdigit():
@@ -486,10 +557,8 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
 
     def _extract_page_price_yen(self, driver) -> Optional[int]:
         """
-        从当前页可见文案解析成交金额（日元整数）。
-        优先：innerText（能拼回拆开的「14,000」+「円」）与支付行；
-        其次：页面 JSON 标价、仅含「N円」的短节点众数；
-        再兜底：整页源码（含数字与円被标签拆开的情况）。不依赖易变的 sc-* class。
+        从当前页可见文案解析成交金额（日元整数），不用 JSON item.price。
+        优先：商品卡「送料無料」旁、信用卡「下4桁」旁的金额；排除残高 / 実質。
         """
 
         def _mode(vals: List[int]) -> Optional[int]:
@@ -498,7 +567,8 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
             counts: Dict[int, int] = {}
             for v in vals:
                 counts[v] = counts.get(v, 0) + 1
-            return sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[0][0]
+            # 票数优先；同票取较小值，避免 PayPay残高 那种大额偶然胜出
+            return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
         try:
             js_price = driver.execute_script(_YAHOO_PAGE_PRICE_JS)
@@ -507,14 +577,6 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 return v
         except Exception:
             pass
-
-        ident = self._read_yahoo_item_identity(driver)
-        try:
-            ident_price = int(ident.get("price") or 0)
-        except (TypeError, ValueError):
-            ident_price = 0
-        if ident_price > 0:
-            return ident_price
 
         texts: List[str] = []
         try:
@@ -528,12 +590,27 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception:
             pass
 
+        ship_hits: List[int] = []
+        last4_hits: List[int] = []
         pay_hits: List[int] = []
         only_hits: List[int] = []
         all_hits: List[int] = []
 
         for t in texts:
+            if any(x in t for x in ("残高", "利用可能", "チャージ", "ポイント", "実質")):
+                continue
             compact = t.replace("\u00a0", " ").replace(" ", "")
+            lm = _LAST4_THEN_YEN_RE.search(compact)
+            if lm:
+                v = self._yen_text_to_int(lm.group(1))
+                if v:
+                    last4_hits.append(v)
+            if "送料無料" in compact:
+                m_ship = _YEN_AMOUNT_RE.search(compact)
+                if m_ship:
+                    v = self._yen_text_to_int(m_ship.group(1))
+                    if v:
+                        ship_hits.append(v)
             for m in re.finditer(r"クレジットカード[：:]([0-9,]+)円", compact):
                 v = self._yen_text_to_int(m.group(1))
                 if v:
@@ -549,7 +626,7 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
                 if v:
                     all_hits.append(v)
 
-        for bucket in (pay_hits, only_hits, all_hits):
+        for bucket in (ship_hits, last4_hits, pay_hits, only_hits, all_hits):
             picked = _mode(bucket)
             if picked:
                 return picked
@@ -559,9 +636,26 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         except Exception:
             src = ""
         src_n = src.replace("\u00a0", "")
+        compact_src = re.sub(r"[\s\u00a0]+", "", src_n)
+        lm = _LAST4_THEN_YEN_RE.search(compact_src)
+        if lm:
+            v = self._yen_text_to_int(lm.group(1))
+            if v:
+                return v
+        for cre in (_SHIP_THEN_YEN_RE, _YEN_THEN_SHIP_RE):
+            for sm in cre.finditer(src_n):
+                ctx = src_n[max(0, sm.start() - 24) : sm.end() + 8]
+                if any(x in ctx for x in ("残高", "利用可能", "チャージ", "実質")):
+                    continue
+                v = self._yen_text_to_int(sm.group(1))
+                if v:
+                    return v
         src_hits: List[int] = []
         for cre in (_YEN_AMOUNT_RE, _YEN_SPLIT_SRC_RE):
             for m in cre.finditer(src_n):
+                ctx = src_n[max(0, m.start() - 48) : m.end() + 16]
+                if any(x in ctx for x in ("残高", "利用可能", "チャージ", "実質")):
+                    continue
                 v = self._yen_text_to_int(m.group(1))
                 if v and v < 100_000_000:
                     src_hits.append(v)
@@ -1715,6 +1809,13 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         price_int, price_err = self._require_page_price(driver, "下单确认页-回调前")
         if not price_int:
             return False, self._make_summary(order, failure_reason=price_err)
+        bad_price = self._price_looks_like_balance_mistake(
+            price_int, self._product_order_yen(product)
+        )
+        if bad_price:
+            self.logger.error("雅虎闲置：%s order=%s item=%s", bad_price, order_id, item_id)
+            self._handle_order_issue(order, [bad_price], reason="页面价格异常")
+            return False, self._make_summary(order, failure_reason=bad_price)
 
         # addedCartCallbackSimple 需要站点特定字段；不要复用骏河屋默认值
         callback_product = dict(product or {})
@@ -1752,6 +1853,17 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         price_int, price_err = self._require_page_price(driver, "下单确认页-checkCart前")
         if not price_int:
             return False, self._make_summary(order, failure_reason=price_err)
+        bad_price2 = self._price_looks_like_balance_mistake(
+            price_int, self._product_order_yen(product)
+        )
+        if bad_price2:
+            self.logger.error("雅虎闲置：%s order=%s item=%s", bad_price2, order_id, item_id)
+            self._handle_order_issue(order, [bad_price2], reason="页面价格异常")
+            return False, self._make_summary(
+                order,
+                failure_reason=bad_price2,
+                check_cart_requested=False,
+            )
         callback_product["price"] = price_int
         goods_no_for_check = callback_product["goods_no"]
         goods_list = [
