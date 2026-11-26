@@ -519,7 +519,6 @@ class YahooFleaMarketOrderProcessor(LoggerMixin):
         digits = re.sub(r"\D", "", self._credit_card() or "")
         return digits[-4:] if len(digits) >= 4 else digits
 
-    @staticmethod
     def _product_order_yen(self, product: Optional[Dict[str, Any]]) -> int:
         """订单 List.GoodsPrice（日元）。"""
         if not isinstance(product, dict):
