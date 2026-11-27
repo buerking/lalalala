@@ -97,6 +97,14 @@ _SHOP_OWNED_CART_SLUGS = frozenset({"biccamera"})
 _SHOP_OWNED_CART_BIDS = {"biccamera": "269553"}
 
 
+class RakutenAddCartVerifyFailed(RuntimeError):
+    """加购点击后购物车核验失败，携带当时页面快照供飞书转发。"""
+
+    def __init__(self, message: str, dump: str = ""):
+        super().__init__(message)
+        self.dump = dump or ""
+
+
 class RakutenBooksHandoffNeeded(Exception):
     """商品实为乐天书店，应转交书店流程（保留当前订单回调身份）。"""
 
@@ -4835,6 +4843,172 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
             self.logger.info("乐天市场：共勾选卖家确认复选框 %s 项", clicked)
         return clicked
 
+    def _clip_debug_text(self, text: str, limit: int) -> str:
+        s = str(text or "")
+        if len(s) <= limit:
+            return s
+        return s[:limit] + "\n...[truncated %s chars]" % (len(s) - limit)
+
+    def _feishu_safe_page_html(self, html: str) -> str:
+        """飞书 lark_md 会吃掉 HTML 标签，改成全角括号方便原样复制。"""
+        return (
+            (html or "")
+            .replace("&", "＆")
+            .replace("<", "＜")
+            .replace(">", "＞")
+        )
+
+    def _capture_add_fail_page_dump(
+        self,
+        driver,
+        product: Dict[str, Any],
+        expected_products: List[Dict[str, Any]],
+    ) -> str:
+        """加购核验失败时抓当前 URL / 购物车数量 / 可见文案 / 关键 HTML。"""
+        lines: List[str] = [
+            "【加购失败页面快照】请整段复制给开发（HTML 里的＜＞即原标签）",
+        ]
+        url = ""
+        title = ""
+        try:
+            url = str(driver.current_url or "").strip()
+        except Exception:
+            url = ""
+        try:
+            title = str(driver.title or "").strip()
+        except Exception:
+            title = ""
+        product_url = str((product or {}).get("url") or "").strip()
+        lines.append("current_url: %s" % url)
+        lines.append("title: %s" % title)
+        lines.append("order_url: %s" % product_url)
+        lines.append(
+            "expected_key: %s qty=%s"
+            % (
+                self._product_cart_key(product_url),
+                (product or {}).get("quantity"),
+            )
+        )
+        try:
+            expected = self._expected_cart_quantities(expected_products)
+        except Exception as e:
+            expected = "err:%s" % e
+        try:
+            actual = self._actual_cart_quantities(driver)
+        except Exception as e:
+            actual = "err:%s" % e
+        lines.append("cart_expected: %s" % expected)
+        lines.append("cart_actual: %s" % actual)
+
+        snap = None
+        try:
+            snap = driver.execute_script(
+                r"""
+                function clip(s, n) {
+                  s = String(s || '');
+                  return s.length > n ? s.slice(0, n) + '...[truncated]' : s;
+                }
+                function vis(el) {
+                  try { return !!(el && el.getClientRects && el.getClientRects().length); }
+                  catch (e) { return false; }
+                }
+                var out = {h1: '', add_buttons: [], sku_text: [], cart_text: [],
+                           body_text: '', html: '', markers: []};
+                var h = document.querySelector('h1, .item_name, [class*="itemName"]');
+                if (h) out.h1 = clip((h.innerText || '').replace(/\s+/g, ' '), 240);
+                var btnSel = [
+                  '#addToCartMainPcButton', '#addToCartFloatingPcButton',
+                  '#purchaseProcedureMainPcButton',
+                  '[irc="AddToCartPurchaseButtonFixed"] button',
+                  '[irc="AddToCartPurchaseButtonFloating"] button',
+                  'button[aria-label*="かご"]', 'button[aria-label*="購入手続き"]'
+                ];
+                var seen = {};
+                btnSel.forEach(function(sel) {
+                  document.querySelectorAll(sel).forEach(function(el) {
+                    var t = ((el.id || '') + ' | ' + (el.getAttribute('aria-label') || '')
+                      + ' | ' + (el.innerText || '')).replace(/\s+/g, ' ').trim();
+                    if (!t || seen[t]) return;
+                    seen[t] = 1;
+                    out.add_buttons.push({
+                      text: clip(t, 120),
+                      visible: vis(el),
+                      html: clip(el.outerHTML || '', 500)
+                    });
+                  });
+                });
+                document.querySelectorAll('select, [class*="sku"], [class*="Sku"], [class*="inventory"]').forEach(function(el) {
+                  if (out.sku_text.length >= 8) return;
+                  var t = (el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+                  if (t) out.sku_text.push(clip(t, 160));
+                });
+                document.querySelectorAll(
+                  'a[href*="/item/"], a[href*="item.rakuten"], [class*="cartItem"], [class*="CartItem"]'
+                ).forEach(function(el) {
+                  if (out.cart_text.length >= 16) return;
+                  var t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                  var href = el.getAttribute && el.getAttribute('href') || '';
+                  if (t.length >= 4 && t.length <= 220)
+                    out.cart_text.push(clip((href ? href + ' :: ' : '') + t, 240));
+                });
+                var body = '';
+                try { body = (document.body && document.body.innerText) || ''; } catch (e) {}
+                var compact = body.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+                ['かごに追加', '購入手続きへ', '売り切れ', '在庫なし', 'カートに商品がありません',
+                 'ログイン', 'この商品は購入できません', 'お取り扱いできません'].forEach(function(m) {
+                  if (body.indexOf(m) >= 0) out.markers.push(m);
+                });
+                out.body_text = clip(compact, 2200);
+                var htmlTarget = document.querySelector(
+                  '#cart, .cart-page, [id*="cartItem"], form[action*="cart"], '
+                  + '[irc="AddToCartPurchaseButtonFixed"], #item, main'
+                ) || document.body;
+                out.html = clip(htmlTarget && htmlTarget.outerHTML || '', 6500);
+                return out;
+                """
+            )
+        except Exception as e:
+            lines.append("js_snap_err: %s" % e)
+
+        if isinstance(snap, dict):
+            if snap.get("h1"):
+                lines.append("h1: %s" % snap.get("h1"))
+            if snap.get("markers"):
+                lines.append("markers: %s" % snap.get("markers"))
+            btns = snap.get("add_buttons") or []
+            if btns:
+                lines.append("add_buttons:")
+                for b in btns[:8]:
+                    if isinstance(b, dict):
+                        lines.append(
+                            "  - vis=%s %s"
+                            % (b.get("visible"), b.get("text") or "")
+                        )
+                        if b.get("html"):
+                            lines.append(
+                                "    html: %s"
+                                % self._feishu_safe_page_html(str(b.get("html")))
+                            )
+            sku = snap.get("sku_text") or []
+            if sku:
+                lines.append("sku_text: %s" % " | ".join(str(x) for x in sku[:8]))
+            cart_text = snap.get("cart_text") or []
+            if cart_text:
+                lines.append("cart_links:")
+                for row in cart_text[:16]:
+                    lines.append("  - %s" % row)
+            if snap.get("body_text"):
+                lines.append("----- body_text -----")
+                lines.append(str(snap.get("body_text")))
+            if snap.get("html"):
+                lines.append("----- html -----")
+                lines.append(self._feishu_safe_page_html(str(snap.get("html"))))
+
+        dump = "\n".join(lines)
+        dump = self._clip_debug_text(dump, 12000)
+        self.logger.warning("乐天市场：加购失败页面快照\n%s", dump[:4000])
+        return dump
+
     def _add_product_to_cart(
         self,
         driver,
@@ -4888,7 +5062,11 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
         ):
             return
 
-        raise RuntimeError("固定区域及浮动区域加购后，购物车均未核验到预期商品")
+        dump = self._capture_add_fail_page_dump(driver, product, expected_products)
+        raise RakutenAddCartVerifyFailed(
+            "固定区域及浮动区域加购后，购物车均未核验到预期商品",
+            dump=dump,
+        )
 
     def _try_claim_coupon(self, driver) -> None:
         """领券默认关闭。历史逻辑保留但不执行，避免打开券页拖慢整单。"""
@@ -5945,9 +6123,25 @@ class RakutenIchibaOrderProcessor(LoggerMixin):
                 else:
                     msg = "加购失败: %s url=%s" % (err_text, purl)
                 self.logger.error(msg)
+                dump = ""
+                if isinstance(e, RakutenAddCartVerifyFailed):
+                    dump = e.dump or ""
+                if not dump:
+                    try:
+                        dump = self._capture_add_fail_page_dump(
+                            driver, product, expected_products
+                        )
+                    except Exception as dump_err:
+                        dump = "页面快照采集失败: %s" % dump_err
+                extra = "乐天市场"
+                if dump:
+                    extra = extra + "\n\n" + dump
                 try:
                     self.feishu_notifier.notify_order_issue(
-                        str(order_id), [msg], user_id=order.get("user_id"), extra="乐天市场"
+                        str(order_id),
+                        [msg],
+                        user_id=order.get("user_id"),
+                        extra=extra,
                     )
                 except Exception:
                     pass
