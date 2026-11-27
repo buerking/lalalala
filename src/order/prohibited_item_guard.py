@@ -190,6 +190,12 @@ _DEFAULT_CATEGORIES: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+# 黑名单词出现时，同一段文本里若同时有任一白名单，则放行该黑名单。
+# 例：剣 + 仮面 → 通过（假面骑士剑）；只有剣 → 拦截。
+_DEFAULT_KEYWORD_WHITELIST: Dict[str, Tuple[str, ...]] = {
+    "剣": ("仮面",),
+}
+
 _lock = threading.Lock()
 
 
@@ -237,9 +243,53 @@ def _categories(config: Optional[Dict[str, Any]]) -> Dict[str, Tuple[str, ...]]:
                 continue
             seen.add(key)
             merged.append(s)
+        disabled = sec.get("disabled_keywords") if isinstance(sec.get("disabled_keywords"), dict) else {}
+        drop = {
+            str(x).strip().casefold()
+            for x in (disabled.get(name) or [])
+            if str(x).strip()
+        }
+        if drop:
+            merged = [k for k in merged if k.casefold() not in drop]
         if merged:
             out[name] = tuple(merged)
     return out
+
+
+def _keyword_whitelist(
+    config: Optional[Dict[str, Any]],
+) -> Dict[str, Tuple[str, ...]]:
+    sec = _section(config)
+    has_yaml = "keyword_whitelist" in sec and isinstance(sec.get("keyword_whitelist"), dict)
+    extra = sec.get("keyword_whitelist") if has_yaml else {}
+    out: Dict[str, List[str]] = {}
+
+    def _put(raw_kw: Any, raw_vals: Any, replace: bool) -> None:
+        kw = str(raw_kw or "").strip().casefold()
+        if not kw:
+            return
+        vals = raw_vals
+        if isinstance(vals, str):
+            vals = [vals]
+        if not isinstance(vals, (list, tuple)):
+            return
+        bucket = [] if replace else list(out.get(kw) or [])
+        seen = {x.casefold() for x in bucket}
+        for item in vals:
+            s = str(item or "").strip()
+            if not s or s.casefold() in seen:
+                continue
+            seen.add(s.casefold())
+            bucket.append(s)
+        out[kw] = bucket
+
+    if not has_yaml:
+        for raw_kw, raw_vals in _DEFAULT_KEYWORD_WHITELIST.items():
+            _put(raw_kw, raw_vals, False)
+    elif isinstance(extra, dict):
+        for raw_kw, raw_vals in extra.items():
+            _put(raw_kw, raw_vals, True)
+    return {k: tuple(v) for k, v in out.items() if v}
 
 
 def _excludes(config: Optional[Dict[str, Any]]) -> Tuple[str, ...]:
@@ -301,6 +351,7 @@ def match_text(
     config: Optional[Dict[str, Any]] = None,
     *,
     field: str = "text",
+    whitelist_context: str = "",
 ) -> Optional[ProhibitedHit]:
     raw = str(text or "")
     if not raw.strip():
@@ -308,14 +359,20 @@ def match_text(
     excludes = _excludes(config)
     hay = _scrub(raw, excludes)
     hay_cf = hay.casefold()
+    allow_cf = (raw + " " + str(whitelist_context or "")).casefold()
+    whitelist = _keyword_whitelist(config)
     for category, keywords in _categories(config).items():
         for kw in keywords:
             needle = kw.casefold()
-            if needle and needle in hay_cf:
-                snippet = raw.replace("\n", " ").strip()
-                if len(snippet) > 180:
-                    snippet = snippet[:180] + "…"
-                return ProhibitedHit(category, kw, field, snippet)
+            if not needle or needle not in hay_cf:
+                continue
+            companions = whitelist.get(needle) or ()
+            if companions and any(c.casefold() in allow_cf for c in companions if c):
+                continue
+            snippet = raw.replace("\n", " ").strip()
+            if len(snippet) > 180:
+                snippet = snippet[:180] + "…"
+            return ProhibitedHit(category, kw, field, snippet)
     return None
 
 
@@ -328,8 +385,11 @@ def inspect_order(
     for product in (order or {}).get("products") or []:
         if not isinstance(product, dict):
             continue
+        combined = " ".join(v for _, v in product_haystack(product))
         for field, text in product_haystack(product):
-            hit = match_text(text, config, field=field)
+            hit = match_text(
+                text, config, field=field, whitelist_context=combined
+            )
             if hit:
                 return hit
     return None
@@ -399,3 +459,67 @@ def mark_notified(config: Optional[Dict[str, Any]], order_id: str) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+
+
+def keyword_editor_state(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """网页编辑器用：合并后的分类关键词 + 白名单。"""
+    cats = {name: list(kws) for name, kws in _categories(config).items()}
+    wl = {k: list(v) for k, v in _keyword_whitelist(config).items()}
+    return {"categories": cats, "whitelist": wl}
+
+
+def prohibited_items_from_editor(
+    categories: Dict[str, Any],
+    whitelist: Dict[str, Any],
+) -> Dict[str, Any]:
+    """把编辑器提交的全量列表拆成 extra / disabled / whitelist，写回 config.yaml。"""
+    extra: Dict[str, List[str]] = {}
+    disabled: Dict[str, List[str]] = {}
+    if not isinstance(categories, dict):
+        categories = {}
+    names = list(_DEFAULT_CATEGORIES.keys())
+    for k in categories:
+        if str(k) not in names:
+            names.append(str(k))
+    for name in names:
+        wanted: List[str] = []
+        seen = set()
+        for x in categories.get(name) or []:
+            s = str(x or "").strip()
+            if not s or s.casefold() in seen:
+                continue
+            seen.add(s.casefold())
+            wanted.append(s)
+        base = list(_DEFAULT_CATEGORIES.get(name) or ())
+        base_cf = {str(b).casefold(): str(b) for b in base}
+        extra_list = [w for w in wanted if w.casefold() not in base_cf]
+        disabled_list = [
+            orig for cf, orig in base_cf.items() if cf not in seen
+        ]
+        if extra_list:
+            extra[name] = extra_list
+        if disabled_list:
+            disabled[name] = disabled_list
+    wl_out: Dict[str, List[str]] = {}
+    if isinstance(whitelist, dict):
+        for raw_kw, raw_vals in whitelist.items():
+            kw = str(raw_kw or "").strip()
+            if not kw:
+                continue
+            vals = raw_vals
+            if isinstance(vals, str):
+                vals = [vals]
+            cleaned: List[str] = []
+            seen_w = set()
+            for item in vals or []:
+                s = str(item or "").strip()
+                if not s or s.casefold() in seen_w:
+                    continue
+                seen_w.add(s.casefold())
+                cleaned.append(s)
+            wl_out[kw] = cleaned
+    return {
+        "extra_keywords": extra,
+        "disabled_keywords": disabled,
+        "keyword_whitelist": wl_out,
+    }

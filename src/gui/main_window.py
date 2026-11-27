@@ -67,6 +67,7 @@ class MainWindow:
         if gui_config.get("show_logs", True):
             self._setup_gui_log_handlers()
 
+        self._start_monitor_web()
         self._update_status()
 
     def _create_widgets(self) -> None:
@@ -129,10 +130,13 @@ class MainWindow:
             fill=tk.X, pady=(10, 0)
         )
         ttk.Button(
-            button_frame, text="打开配置后台", command=self._open_playbook_admin, width=20
+            button_frame, text="打开网页后台", command=self._open_monitor_web, width=20
         ).pack(fill=tk.X, pady=(10, 0))
         ttk.Button(
-            button_frame, text="关闭配置后台", command=self._close_playbook_admin, width=20
+            button_frame, text="打开流程编辑", command=self._open_playbook_admin, width=20
+        ).pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(
+            button_frame, text="复制网页链接", command=self._copy_monitor_url, width=20
         ).pack(fill=tk.X, pady=(4, 0))
         self.process_paypay_button = ttk.Button(
             button_frame,
@@ -182,10 +186,13 @@ class MainWindow:
         top = ttk.Frame(outer)
         top.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 8))
         ttk.Button(top, text="全局：打开配置", command=self._open_settings).pack(side=tk.LEFT)
-        ttk.Button(top, text="打开配置后台", command=self._open_playbook_admin).pack(
+        ttk.Button(top, text="打开网页后台", command=self._open_monitor_web).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        ttk.Button(top, text="关闭配置后台", command=self._close_playbook_admin).pack(
+        ttk.Button(top, text="打开流程编辑", command=self._open_playbook_admin).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        ttk.Button(top, text="复制网页链接", command=self._copy_monitor_url).pack(
             side=tk.LEFT, padx=(8, 0)
         )
         self._add_dev_test_toggle(top, inline=True)
@@ -623,30 +630,259 @@ class MainWindow:
             ensure_playbook_importable()
             from playbook.admin_server import start as admin_start
         except Exception as e:
-            messagebox.showerror("配置后台", "无法加载配置后台: %s" % e)
+            messagebox.showerror("流程编辑", "无法打开流程编辑: %s" % e)
             return
         ok, msg = admin_start(open_browser=True)
         self.logger.info(msg)
         if ok:
-            messagebox.showinfo("配置后台", msg)
+            messagebox.showinfo(
+                "流程编辑",
+                msg + "\n\n已与局域网监控合并为同一地址（端口 8790）。同事用「复制网页链接」即可，点顶部「自动下单流程」。",
+            )
         else:
-            messagebox.showerror("配置后台", msg)
+            messagebox.showerror("流程编辑", msg)
 
-    def _close_playbook_admin(self) -> None:
+    def _start_monitor_web(self) -> None:
         try:
-            from src.config.playbook_path import ensure_playbook_importable
+            from src.monitor import hub
+            from src.monitor.server import start as monitor_start
 
-            ensure_playbook_importable()
-            from playbook.admin_server import stop as admin_stop
+            hub.attach(self)
+            ok, msg = monitor_start(self.config, open_browser=False)
+            if ok:
+                self.logger.info(msg)
+            else:
+                self.logger.warning(msg)
         except Exception as e:
-            messagebox.showerror("配置后台", "无法关闭配置后台: %s" % e)
+            self.logger.warning("局域网监控页启动失败: %s", e, exc_info=True)
+
+    def _open_monitor_web(self) -> None:
+        try:
+            from src.monitor import hub
+            from src.monitor.server import start as monitor_start
+
+            hub.attach(self)
+            ok, msg = monitor_start(self.config, open_browser=True)
+        except Exception as e:
+            messagebox.showerror("网页后台", "无法打开监控页: %s" % e)
             return
-        ok, msg = admin_stop()
         self.logger.info(msg)
         if ok:
-            messagebox.showinfo("配置后台", msg)
+            messagebox.showinfo(
+                "网页后台",
+                msg + "\n\n同一页里有「监控」和「自动下单流程」。同事请用 ZeroTier 网卡那条地址，不要用 127.0.0.1。",
+            )
         else:
-            messagebox.showerror("配置后台", msg)
+            messagebox.showerror("网页后台", msg)
+
+    def _copy_monitor_url(self) -> None:
+        try:
+            from src.monitor.server import base_urls, current_token, is_running, start as monitor_start
+            from src.monitor import hub
+
+            if not is_running():
+                hub.attach(self)
+                ok, msg = monitor_start(self.config, open_browser=False)
+                if not ok:
+                    messagebox.showerror("网页后台", msg)
+                    return
+            urls = base_urls()
+            token = current_token()
+            lan = urls[1] if len(urls) > 1 else urls[0]
+            text = lan.rstrip("/") + "/?token=" + token
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            extra = "\n".join(urls)
+            messagebox.showinfo(
+                "网页链接已复制",
+                "已复制（含口令，发给 ZeroTier 同事即可）:\n%s\n\n本机可发现的地址:\n%s\n\n"
+                "同一页：「监控」改关键词/启停，「自动下单流程」改 playbook 站点。\n"
+                "生产机需保持本窗口运行。若打不开，检查 Windows 防火墙是否放行 TCP 8790。"
+                % (text, extra),
+            )
+        except Exception as e:
+            messagebox.showerror("网页后台", str(e))
+
+    def _find_site_ctx(self, site_id: str) -> Optional[Dict[str, Any]]:
+        want = str(site_id or "").strip()
+        if self.multi_mode:
+            for ctx in self._site_tabs:
+                if str(ctx["runner"].site_id) == want:
+                    return ctx
+            return None
+        if want in ("default", "", self.runners[0].site_id):
+            return None
+        return None
+
+    def monitor_site_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for r in self.runners:
+            status = "运行中" if r.is_running else "未启动"
+            next_t = "--"
+            last_t = "--"
+            if r.scheduler and r.is_running:
+                try:
+                    st = r.scheduler.get_status() or {}
+                    next_t = str(st.get("next_execution_time") or "--")
+                    last_t = str(st.get("last_success_time") or "--")
+                    try:
+                        from datetime import datetime
+
+                        if st.get("next_execution_time"):
+                            next_t = datetime.fromisoformat(st["next_execution_time"]).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                        if st.get("last_success_time"):
+                            last_t = datetime.fromisoformat(st["last_success_time"]).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            rows.append(
+                {
+                    "id": r.site_id,
+                    "name": r.display_name,
+                    "adapter": r.adapter,
+                    "running": bool(r.is_running),
+                    "status": status,
+                    "next": next_t,
+                    "last": last_t,
+                }
+            )
+        return rows
+
+    def monitor_start_site(self, site_id: str) -> str:
+        site_id = str(site_id or "").strip()
+        if site_id in ("all", "*"):
+            return "；".join(self.monitor_start_site(r.site_id) for r in self.runners)
+        if self.multi_mode:
+            ctx = self._find_site_ctx(site_id)
+            if ctx is None:
+                raise RuntimeError("未知站点: %s" % site_id)
+            r: SiteRunner = ctx["runner"]
+            if r.is_running:
+                return "%s 已在运行" % r.display_name
+            ok, msgs = r.preflight_check()
+            if not ok:
+                err = "; ".join(msgs)
+                ctx["status_label"].config(text="启动前自检失败", foreground="red")
+                raise RuntimeError("%s 启动前自检失败: %s" % (r.display_name, err))
+            ctx["start_btn"].config(state=tk.DISABLED)
+            ctx["status_label"].config(text="正在启动浏览器…", foreground="orange")
+
+            def on_ready() -> None:
+                ctx["stop_btn"].config(state=tk.NORMAL)
+                ctx["status_label"].config(text="运行中", foreground="green")
+                if ctx.get("paypay_btn"):
+                    ctx["paypay_btn"].config(state=tk.DISABLED)
+                logging.getLogger("site.%s" % r.site_id).info("远程启动：系统已启动")
+
+            def on_error(exc: Exception) -> None:
+                logging.getLogger("site.%s" % r.site_id).error(
+                    "远程启动失败: %s",
+                    exc if exc is not None else "(异常对象为空)",
+                    exc_info=_exc_info_for_log(exc),
+                )
+                ctx["start_btn"].config(state=tk.NORMAL)
+                ctx["status_label"].config(text="未启动", foreground="red")
+
+            r.start_browser_background(on_ready, on_error)
+            return "%s 正在启动" % r.display_name
+
+        r = self.runners[0]
+        if site_id not in ("", "default", "all", "*", r.site_id):
+            raise RuntimeError("未知站点: %s" % site_id)
+        if r.is_running:
+            return "已在运行"
+        ok, msgs = r.preflight_check()
+        if not ok:
+            raise RuntimeError("启动前自检失败: %s" % "; ".join(msgs))
+        if self.start_button:
+            self.start_button.config(state=tk.DISABLED)
+        if self.status_label:
+            self.status_label.config(text="正在启动浏览器…", foreground="orange")
+
+        def on_ready_legacy() -> None:
+            if self.stop_button:
+                self.stop_button.config(state=tk.NORMAL)
+            if self.status_label:
+                self.status_label.config(text="运行中", foreground="green")
+            if self.process_paypay_button:
+                self.process_paypay_button.config(state=tk.DISABLED)
+            self.logger.info("远程启动：系统已启动")
+
+        def on_error_legacy(exc: Exception) -> None:
+            self.logger.error(
+                "远程启动失败: %s",
+                exc if exc is not None else "(异常对象为空)",
+                exc_info=_exc_info_for_log(exc),
+            )
+            if self.start_button:
+                self.start_button.config(state=tk.NORMAL)
+            if self.status_label:
+                self.status_label.config(text="未启动", foreground="red")
+
+        r.start_browser_background(on_ready_legacy, on_error_legacy)
+        return "正在启动"
+
+    def monitor_stop_site(self, site_id: str) -> str:
+        site_id = str(site_id or "").strip()
+        if site_id in ("all", "*"):
+            return "；".join(self.monitor_stop_site(r.site_id) for r in self.runners)
+        if self.multi_mode:
+            ctx = self._find_site_ctx(site_id)
+            if ctx is None:
+                raise RuntimeError("未知站点: %s" % site_id)
+            r: SiteRunner = ctx["runner"]
+            if not r.is_running:
+                return "%s 未在运行" % r.display_name
+            r.stop()
+            ctx["start_btn"].config(state=tk.NORMAL)
+            ctx["stop_btn"].config(state=tk.DISABLED)
+            ctx["status_label"].config(text="已停止", foreground="red")
+            if ctx.get("paypay_btn"):
+                ctx["paypay_btn"].config(state=tk.NORMAL)
+            logging.getLogger("site.%s" % r.site_id).info("远程停止：已停止")
+            return "%s 已停止" % r.display_name
+
+        r = self.runners[0]
+        if site_id not in ("", "default", "all", "*", r.site_id):
+            raise RuntimeError("未知站点: %s" % site_id)
+        if not r.is_running:
+            return "未在运行"
+        r.stop()
+        if self.start_button:
+            self.start_button.config(state=tk.NORMAL)
+        if self.stop_button:
+            self.stop_button.config(state=tk.DISABLED)
+        if self.status_label:
+            self.status_label.config(text="已停止", foreground="red")
+        if self.process_paypay_button:
+            self.process_paypay_button.config(state=tk.NORMAL)
+        self.logger.info("远程停止：已停止")
+        return "已停止"
+
+    def monitor_apply_prohibited(self, section: Dict[str, Any]) -> None:
+        cfg = ConfigLoader.get_config()
+        self.config = cfg
+        cur = cfg.get("prohibited_items")
+        if not isinstance(cur, dict):
+            cfg["prohibited_items"] = dict(section)
+        else:
+            cur.update(section)
+        for r in self.runners:
+            r.global_config = cfg
+            if r.legacy_single:
+                r.merged_config = cfg
+                continue
+            pi = r.merged_config.get("prohibited_items")
+            if not isinstance(pi, dict):
+                r.merged_config["prohibited_items"] = dict(section)
+            else:
+                pi.update(section)
+        self.logger.info("禁售关键词已由监控页热更新")
 
     def _on_closing(self) -> None:
         for r in self.runners:
@@ -662,6 +898,14 @@ class MainWindow:
             from playbook.admin_server import stop as admin_stop
 
             admin_stop()
+        except Exception:
+            pass
+        try:
+            from src.monitor import hub
+            from src.monitor.server import stop as monitor_stop
+
+            hub.detach(self)
+            monitor_stop()
         except Exception:
             pass
         self.root.destroy()

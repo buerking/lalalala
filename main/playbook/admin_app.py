@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from playbook.loader import (
@@ -36,19 +36,12 @@ class DryRunPayload(BaseModel):
     order: Dict[str, Any] = Field(default_factory=dict)
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="jpgoodbuy 站点配置", docs_url="/docs", redoc_url=None)
+def playbook_index_file() -> Path:
+    return STATIC_DIR / "admin.html"
 
-    @app.get("/")
-    def index():
-        html = STATIC_DIR / "admin.html"
-        if not html.is_file():
-            raise HTTPException(500, "缺少 admin.html")
-        return FileResponse(html)
 
-    @app.get("/api/health")
-    def health():
-        return {"ok": True, "main_dir": str(main_dir())}
+def register_playbook_api(app: FastAPI) -> None:
+    """把流程编辑 API 挂到已有 FastAPI（监控页 8790）。不含 / 与 shutdown。"""
 
     @app.get("/api/sites")
     def api_list_sites():
@@ -108,16 +101,13 @@ def create_app() -> FastAPI:
             "config_snippet": _config_snippet(sid, data),
         }
 
-    @app.get("/api/template")
+    @app.get("/api/playbook/template")
     def api_template():
         return {"data": default_site_template("new_site")}
 
-    @app.post("/api/shutdown")
-    def api_shutdown():
-        from playbook.admin_server import request_stop
-
-        request_stop()
-        return JSONResponse({"ok": True, "message": "正在关闭配置后台"})
+    @app.get("/api/template")
+    def api_template_compat():
+        return {"data": default_site_template("new_site")}
 
     @app.post("/api/sites/{site_id}/dry-run")
     def api_dry_run(site_id: str, body: Optional[DryRunPayload] = None):
@@ -144,6 +134,22 @@ def create_app() -> FastAPI:
         msg = stop_dry_run_browser(site_id)
         return {"ok": True, "message": msg}
 
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="jpgoodbuy 站点配置", docs_url=None, redoc_url=None)
+
+    @app.get("/")
+    def index():
+        html = playbook_index_file()
+        if not html.is_file():
+            raise HTTPException(500, "缺少 admin.html")
+        return FileResponse(html)
+
+    @app.get("/api/health")
+    def health():
+        return {"ok": True, "main_dir": str(main_dir())}
+
+    register_playbook_api(app)
     return app
 
 

@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""GUI 按钮启停本机 FastAPI 配置后台。"""
+"""兼容旧「打开配置后台」：流程编辑已并入 8790 监控页，不再单独开 8787。"""
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 import webbrowser
 from typing import Optional, Tuple
 
@@ -20,70 +19,69 @@ _thread: Optional[threading.Thread] = None
 
 
 def is_running() -> bool:
-    with _lock:
-        srv = _server
-    if srv is None:
+    try:
+        from src.monitor.server import is_running as monitor_running
+
+        return monitor_running()
+    except Exception:
         return False
-    started = getattr(srv, "started", False)
-    should_exit = getattr(srv, "should_exit", False)
-    return bool(started) and not should_exit
 
 
 def base_url() -> str:
-    return "http://%s:%s/" % (HOST, PORT)
+    try:
+        from src.monitor.server import base_urls
+
+        urls = base_urls()
+        return urls[0] if urls else "http://127.0.0.1:8790/"
+    except Exception:
+        return "http://127.0.0.1:8790/#playbook"
 
 
 def start(open_browser: bool = True) -> Tuple[bool, str]:
-    """启动后台。已在跑则只打开浏览器。"""
-    global _server, _thread
-    with _lock:
-        if _server is not None and getattr(_server, "started", False) and not getattr(
-            _server, "should_exit", False
-        ):
-            url = base_url()
-            if open_browser:
-                _open(url)
-            return True, "配置后台已在运行: %s" % url
-        try:
-            import uvicorn
-            from playbook.admin_app import create_app
-        except Exception as e:
-            return False, "无法启动配置后台（请 pip install -r main/requirements.txt）: %s" % e
-
-        config = uvicorn.Config(
-            create_app(),
-            host=HOST,
-            port=PORT,
-            log_level="warning",
-            access_log=False,
-            lifespan="off",
-        )
-        _server = uvicorn.Server(config)
-        _thread = threading.Thread(target=_server.run, name="playbook-admin", daemon=True)
-        _thread.start()
-
-    url = base_url()
-    deadline = time.time() + 8
-    while time.time() < deadline:
-        if getattr(_server, "started", False):
-            if open_browser:
-                _open(url)
-            return True, "配置后台已打开: %s" % url
-        if _thread is not None and not _thread.is_alive():
-            return False, "配置后台线程已退出，端口 %s 可能被占用" % PORT
-        time.sleep(0.1)
+    """打开合并后的监控页「自动下单流程」标签。"""
+    _stop_legacy_8787()
+    try:
+        from src.config.config_loader import ConfigLoader
+        from src.monitor.server import base_urls, current_token, start as monitor_start
+    except Exception as e:
+        return False, "无法打开合并后台: %s" % e
+    cfg = {}
+    try:
+        cfg = ConfigLoader.get_config() or {}
+    except Exception:
+        pass
+    ok, msg = monitor_start(cfg, open_browser=False)
+    if not ok:
+        return False, msg
+    urls = base_urls()
+    token = current_token()
+    home = (urls[0] if urls else "http://127.0.0.1:8790/").rstrip("/") + "/"
+    url = home + "?token=" + token + "#playbook" if token else home + "#playbook"
     if open_browser:
         _open(url)
-    return True, "配置后台已启动（等待端口）: %s" % url
+    return True, "流程编辑已并入监控页: %s" % url
 
 
 def stop() -> Tuple[bool, str]:
+    _stop_legacy_8787()
+    return True, "流程编辑已并入监控页，无需单独关闭（关程序时与监控页一起停）"
+
+
+def request_stop() -> None:
+    try:
+        stop()
+    except Exception as e:
+        _log.warning("关闭旧配置后台失败: %s", e)
+
+
+def _stop_legacy_8787() -> None:
+    """若本进程里还留着旧 8787 uvicorn，关掉。不碰 8790。"""
     global _server, _thread
     with _lock:
         srv = _server
         th = _thread
         if srv is None:
-            return True, "配置后台未运行"
+            return
         srv.should_exit = True
         srv.force_exit = True
     if th is not None:
@@ -91,15 +89,6 @@ def stop() -> Tuple[bool, str]:
     with _lock:
         _server = None
         _thread = None
-    return True, "配置后台已关闭"
-
-
-def request_stop() -> None:
-    """供网页内「关闭」按钮调用。"""
-    try:
-        stop()
-    except Exception as e:
-        _log.warning("配置后台关闭失败: %s", e)
 
 
 def _open(url: str) -> None:

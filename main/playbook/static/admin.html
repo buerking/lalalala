@@ -50,11 +50,11 @@
 </head>
 <body>
   <header>
-    <h1>站点配置后台</h1>
-    <span class="hint">每个输入框右侧确定即保存 · 账密在 config.yaml · 改完重启 Tab</span>
+    <h1>自动下单流程</h1>
+    <span class="hint">playbook 站点 YAML · 每个输入框右侧确定即保存 · 账密在 config.yaml · 改完重启该站 Tab · 乐天/雅虎闲置不在这里改</span>
     <span style="flex:1"></span>
     <button class="ghost" onclick="newSite()">新建站点</button>
-    <button class="danger" onclick="shutdown()">关闭后台</button>
+    <button class="ghost" onclick="goMonitor()">返回监控</button>
   </header>
   <div class="wrap">
     <aside><ul id="list"></ul></aside>
@@ -67,8 +67,17 @@
 const $ = (s, el=document) => el.querySelector(s);
 let currentId = null, currentData = null;
 
+function monitorToken() {
+  return localStorage.getItem("jpgoodbuy_monitor_token")
+    || new URLSearchParams(location.search).get("token")
+    || "";
+}
 async function api(path, opt) {
-  const r = await fetch(path, Object.assign({headers:{"Content-Type":"application/json"}}, opt||{}));
+  const headers = Object.assign({
+    "Content-Type":"application/json",
+    "x-monitor-token": monitorToken()
+  }, (opt && opt.headers) || {});
+  const r = await fetch(path, Object.assign({headers}, opt||{}));
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.detail || j.message || r.statusText);
   return j;
@@ -771,9 +780,12 @@ async function newSite() {
     setStatus("已创建。把底部片段写入 config.yaml 的 sites[] 后重启 GUI。", true);
   } catch (e) { setStatus(String(e.message||e), false); }
 }
-async function shutdown() {
-  try { await api("/api/shutdown", {method:"POST"}); setStatus("正在关闭…", true); }
-  catch (e) { setStatus(String(e.message||e), false); }
+function goMonitor() {
+  if (window.top && window.top !== window) {
+    window.top.location.hash = "ops";
+    return;
+  }
+  location.href = "/#ops";
 }
 async function markPurchase(idx) {
   try {
@@ -791,7 +803,7 @@ async function runDryRun() {
     $("#dry_run_log").textContent = "";
     const r = await fetch("/api/sites/"+encodeURIComponent(currentId)+"/dry-run", {
       method: "POST",
-      headers: {"Content-Type":"application/json"},
+      headers: {"Content-Type":"application/json", "x-monitor-token": monitorToken()},
       body: JSON.stringify({order: (d.dry_run||{}).order || {}}),
     });
     const j = await r.json().catch(() => ({}));

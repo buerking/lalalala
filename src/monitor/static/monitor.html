@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>jpgoodbuy 监控</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a222c;
+      --line: #2c3a48;
+      --text: #e8eef4;
+      --muted: #8ea0b3;
+      --accent: #3d9cf0;
+      --ok: #3ecf8e;
+      --bad: #f07178;
+      --warn: #e6b450;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 22px;
+      border-bottom: 1px solid var(--line);
+      background: #121920;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      gap: 12px;
+    }
+    .tabs { display: flex; gap: 6px; margin-left: 12px; }
+    .tabs button.active { background: var(--accent); }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 18px 22px 48px; }
+    .row { display: flex; gap: 14px; flex-wrap: wrap; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      flex: 1 1 280px;
+    }
+    .site-name { font-size: 16px; font-weight: 600; }
+    .meta { color: var(--muted); font-size: 12px; margin: 6px 0 12px; line-height: 1.6; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      margin-left: 8px;
+    }
+    .on { background: rgba(62, 207, 142, 0.16); color: var(--ok); }
+    .off { background: rgba(240, 113, 120, 0.16); color: var(--bad); }
+    .busy { background: rgba(230, 180, 80, 0.16); color: var(--warn); }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #fff;
+      background: var(--accent);
+    }
+    button.ghost { background: #2a3644; color: var(--text); }
+    button.danger { background: #c44c55; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 32px; }
+    .chip {
+      background: #243140;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 8px 4px 10px;
+      font-size: 13px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .chip button {
+      padding: 0 6px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .add {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    input, textarea {
+      background: #121920;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+      width: 100%;
+    }
+    .cat { margin-bottom: 18px; }
+    .cat h3 { margin: 0 0 8px; font-size: 14px; }
+    .hint { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 8px 6px; text-align: left; vertical-align: top; }
+    #login {
+      position: fixed; inset: 0; background: rgba(8, 12, 16, 0.86);
+      display: flex; align-items: center; justify-content: center; z-index: 20;
+    }
+    #login .box { width: min(420px, 92vw); }
+    .hidden { display: none !important; }
+    #toast {
+      position: fixed; right: 16px; bottom: 16px; background: #243140;
+      border: 1px solid var(--line); padding: 10px 14px; border-radius: 8px;
+      max-width: 420px; display: none; z-index: 30;
+    }
+    #panelPlaybook { height: calc(100vh - 64px); }
+    #pbFrame { width: 100%; height: 100%; border: 0; background: #0f1419; }
+  </style>
+</head>
+<body>
+  <div id="login">
+    <div class="box card">
+      <h1>jpgoodbuy 后台</h1>
+      <p class="hint">向生产机同事要口令。口令在 GUI「复制网页链接」，或项目 <code>data/monitor_token.txt</code>。进入后可切换「监控」与「自动下单流程」。</p>
+      <div class="add" style="margin-top:14px">
+        <input id="tokenInput" type="password" placeholder="口令" />
+        <button id="loginBtn" type="button">进入</button>
+      </div>
+      <p id="loginErr" class="hint" style="color:var(--bad)"></p>
+    </div>
+  </div>
+
+  <header>
+    <div>
+      <h1>jpgoodbuy 后台</h1>
+      <div class="sub" id="headSub">ZeroTier / 局域网 · 监控 · 关键词 · 自动下单流程</div>
+    </div>
+    <div class="tabs">
+      <button class="ghost active" type="button" id="tabOps">监控</button>
+      <button class="ghost" type="button" id="tabPlaybook">自动下单流程</button>
+    </div>
+    <div class="toolbar" id="opsToolbar">
+      <button class="ghost" type="button" id="refreshBtn">刷新</button>
+      <button type="button" id="startAllBtn">全部启动</button>
+      <button class="danger" type="button" id="stopAllBtn">全部停止</button>
+    </div>
+  </header>
+
+  <div class="wrap" id="panelOps">
+    <h2 style="font-size:15px;margin:0 0 10px">站点</h2>
+    <div class="row" id="sites"></div>
+
+    <h2 style="font-size:15px;margin:28px 0 8px">禁售关键词</h2>
+    <p class="hint">点词右侧 × 删除；输入后回车添加。白名单：命中关键词后，若标题里同时出现伴生词则放行（例如 剣 + 仮面）。保存后立即对后续拉单生效，无需重启。</p>
+    <div class="toolbar" style="margin-top:12px">
+      <button type="button" id="saveKw">保存关键词</button>
+    </div>
+    <div id="cats"></div>
+
+    <h2 style="font-size:15px;margin:28px 0 8px">关键词白名单（伴生词）</h2>
+    <table>
+      <thead><tr><th>关键词</th><th>伴生词（逗号分隔，命中任一即放行）</th><th></th></tr></thead>
+      <tbody id="wlBody"></tbody>
+    </table>
+    <div class="add" style="margin-top:10px;max-width:640px">
+      <input id="wlKw" placeholder="关键词，如 剣" />
+      <input id="wlVal" placeholder="伴生词，如 仮面" />
+      <button class="ghost" type="button" id="wlAdd">添加规则</button>
+    </div>
+  </div>
+  <div id="panelPlaybook" class="hidden">
+    <iframe id="pbFrame" title="自动下单流程"></iframe>
+  </div>
+  <div id="toast"></div>
+
+  <script>
+    const TOKEN_KEY = "jpgoodbuy_monitor_token";
+    let token = localStorage.getItem(TOKEN_KEY) || new URLSearchParams(location.search).get("token") || "";
+    let kwState = { categories: {}, whitelist: {} };
+
+    function toast(msg, ok) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.style.display = "block";
+      el.style.borderColor = ok === false ? "var(--bad)" : "var(--line)";
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => { el.style.display = "none"; }, 4200);
+    }
+
+    async function api(path, opt) {
+      const headers = Object.assign({ "x-monitor-token": token }, (opt && opt.headers) || {});
+      if (opt && opt.body && typeof opt.body !== "string") {
+        headers["content-type"] = "application/json";
+        opt = Object.assign({}, opt, { body: JSON.stringify(opt.body) });
+      }
+      const res = await fetch(path, Object.assign({ headers }, opt || {}));
+      let data = null;
+      try { data = await res.json(); } catch (e) { data = {}; }
+      if (!res.ok) throw new Error((data && data.detail) || ("HTTP " + res.status));
+      return data;
+    }
+
+    function showApp() {
+      document.getElementById("login").classList.add("hidden");
+      if (token) localStorage.setItem(TOKEN_KEY, token);
+      showTab(location.hash === "#playbook" ? "playbook" : "ops");
+    }
+
+    function showTab(name) {
+      const ops = name !== "playbook";
+      document.getElementById("panelOps").classList.toggle("hidden", !ops);
+      document.getElementById("panelPlaybook").classList.toggle("hidden", ops);
+      document.getElementById("opsToolbar").classList.toggle("hidden", !ops);
+      document.getElementById("tabOps").classList.toggle("active", ops);
+      document.getElementById("tabPlaybook").classList.toggle("active", !ops);
+      if (!ops) {
+        const fr = document.getElementById("pbFrame");
+        if (!fr.getAttribute("src")) fr.src = "/playbook/";
+      }
+      const want = ops ? "#ops" : "#playbook";
+      if (location.hash !== want) history.replaceState(null, "", want);
+    }
+
+    async function login() {
+      token = document.getElementById("tokenInput").value.trim() || token;
+      document.getElementById("loginErr").textContent = "";
+      try {
+        await api("/api/login", { method: "POST", body: { token } });
+        showApp();
+        await reloadAll();
+      } catch (e) {
+        document.getElementById("loginErr").textContent = e.message || "口令错误";
+      }
+    }
+
+    function badgeClass(row) {
+      if (row.running) return "on";
+      if ((row.status || "").indexOf("启动") >= 0) return "busy";
+      return "off";
+    }
+
+    function renderSites(rows) {
+      const box = document.getElementById("sites");
+      if (!rows || !rows.length) {
+        box.innerHTML = '<div class="card hint">未连上生产机 GUI。请确认生产机已打开本程序。</div>';
+        return;
+      }
+      box.innerHTML = rows.map((r) => `
+        <div class="card">
+          <div class="site-name">${esc(r.name || r.id)}
+            <span class="badge ${badgeClass(r)}">${esc(r.status || (r.running ? "运行中" : "未启动"))}</span>
+          </div>
+          <div class="meta">id: ${esc(r.id)} · ${esc(r.adapter || "")}<br/>下次 ${esc(r.next || "--")} · 上次 ${esc(r.last || "--")}</div>
+          <div class="toolbar">
+            <button type="button" ${r.running ? "disabled" : ""} data-act="start" data-id="${esc(r.id)}">启动自动化</button>
+            <button class="danger" type="button" ${r.running ? "" : "disabled"} data-act="stop" data-id="${esc(r.id)}">停止自动化</button>
+          </div>
+        </div>
+      `).join("");
+      box.querySelectorAll("button[data-act]").forEach((btn) => {
+        btn.onclick = () => siteAct(btn.getAttribute("data-id"), btn.getAttribute("data-act"));
+      });
+    }
+
+    async function siteAct(id, act) {
+      try {
+        const data = await api("/api/sites/" + encodeURIComponent(id) + "/" + act, { method: "POST" });
+        toast(data.message || "已提交");
+        await loadStatus();
+      } catch (e) {
+        toast(e.message, false);
+      }
+    }
+
+    function esc(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function renderKeywords() {
+      const cats = document.getElementById("cats");
+      const names = Object.keys(kwState.categories || {});
+      cats.innerHTML = names.map((name) => {
+        const kws = kwState.categories[name] || [];
+        const chips = kws.map((kw, i) =>
+          `<span class="chip">${esc(kw)}<button type="button" data-cat="${esc(name)}" data-i="${i}">×</button></span>`
+        ).join("");
+        return `<div class="cat card">
+          <h3>${esc(name)} <span class="hint">${kws.length} 个</span></h3>
+          <div class="chips">${chips || '<span class="hint">（空）</span>'}</div>
+          <div class="add"><input placeholder="新词，回车添加" data-add="${esc(name)}" /><button class="ghost" type="button" data-addbtn="${esc(name)}">添加</button></div>
+        </div>`;
+      }).join("");
+      cats.querySelectorAll("button[data-cat]").forEach((btn) => {
+        btn.onclick = () => {
+          const cat = btn.getAttribute("data-cat");
+          const i = Number(btn.getAttribute("data-i"));
+          kwState.categories[cat].splice(i, 1);
+          renderKeywords();
+        };
+      });
+      function addTo(cat, input) {
+        const v = (input.value || "").trim();
+        if (!v) return;
+        const list = kwState.categories[cat] || (kwState.categories[cat] = []);
+        if (!list.some((x) => x.toLowerCase() === v.toLowerCase())) list.push(v);
+        input.value = "";
+        renderKeywords();
+      }
+      cats.querySelectorAll("input[data-add]").forEach((inp) => {
+        inp.onkeydown = (ev) => { if (ev.key === "Enter") addTo(inp.getAttribute("data-add"), inp); };
+      });
+      cats.querySelectorAll("button[data-addbtn]").forEach((btn) => {
+        btn.onclick = () => {
+          const cat = btn.getAttribute("data-addbtn");
+          const inp = cats.querySelector('input[data-add="' + CSS.escape(cat) + '"]');
+          if (inp) addTo(cat, inp);
+        };
+      });
+      renderWhitelist();
+    }
+
+    function renderWhitelist() {
+      const body = document.getElementById("wlBody");
+      const wl = kwState.whitelist || {};
+      const keys = Object.keys(wl);
+      if (!keys.length) {
+        body.innerHTML = '<tr><td colspan="3" class="hint">暂无规则。例：关键词 剣，伴生词 仮面</td></tr>';
+        return;
+      }
+      body.innerHTML = keys.map((k) => `
+        <tr>
+          <td>${esc(k)}</td>
+          <td><input data-wl="${esc(k)}" value="${esc((wl[k] || []).join("，"))}" /></td>
+          <td><button class="ghost" type="button" data-wldel="${esc(k)}">删除</button></td>
+        </tr>
+      `).join("");
+      body.querySelectorAll("input[data-wl]").forEach((inp) => {
+        inp.onchange = () => {
+          const k = inp.getAttribute("data-wl");
+          kwState.whitelist[k] = inp.value.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+        };
+      });
+      body.querySelectorAll("button[data-wldel]").forEach((btn) => {
+        btn.onclick = () => {
+          delete kwState.whitelist[btn.getAttribute("data-wldel")];
+          renderWhitelist();
+        };
+      });
+    }
+
+    async function loadStatus() {
+      const data = await api("/api/status");
+      renderSites(data.sites || []);
+      const gui = data.gui ? "已连接生产机 GUI" : "未连接 GUI";
+      document.getElementById("headSub").textContent = gui + " · ZeroTier / 局域网";
+    }
+
+    async function loadKeywords() {
+      kwState = await api("/api/keywords");
+      if (!kwState.categories) kwState.categories = {};
+      if (!kwState.whitelist) kwState.whitelist = {};
+      renderKeywords();
+    }
+
+    async function saveKeywords() {
+      document.querySelectorAll("input[data-wl]").forEach((inp) => inp.dispatchEvent(new Event("change")));
+      try {
+        await api("/api/keywords", { method: "PUT", body: kwState });
+        toast("关键词已保存并热更新");
+        await loadKeywords();
+      } catch (e) {
+        toast(e.message, false);
+      }
+    }
+
+    async function reloadAll() {
+      await loadStatus();
+      await loadKeywords();
+    }
+
+    document.getElementById("tabOps").onclick = () => showTab("ops");
+    document.getElementById("tabPlaybook").onclick = () => showTab("playbook");
+    window.addEventListener("hashchange", () => {
+      if (document.getElementById("login").classList.contains("hidden")) {
+        showTab(location.hash === "#playbook" ? "playbook" : "ops");
+      }
+    });
+    document.getElementById("loginBtn").onclick = login;
+    document.getElementById("tokenInput").onkeydown = (ev) => { if (ev.key === "Enter") login(); };
+    document.getElementById("refreshBtn").onclick = () => loadStatus().catch((e) => toast(e.message, false));
+    document.getElementById("saveKw").onclick = saveKeywords;
+    document.getElementById("startAllBtn").onclick = () => siteAct("all", "start");
+    document.getElementById("stopAllBtn").onclick = () => siteAct("all", "stop");
+    document.getElementById("wlAdd").onclick = () => {
+      const k = document.getElementById("wlKw").value.trim();
+      const v = document.getElementById("wlVal").value.trim();
+      if (!k) return;
+      kwState.whitelist[k] = v ? v.split(/[,，]/).map((x) => x.trim()).filter(Boolean) : [];
+      document.getElementById("wlKw").value = "";
+      document.getElementById("wlVal").value = "";
+      renderWhitelist();
+    };
+
+    setInterval(() => {
+      if (document.getElementById("login").classList.contains("hidden")) {
+        loadStatus().catch(() => {});
+      }
+    }, 4000);
+
+    (async function boot() {
+      if (token) {
+        try {
+          await api("/api/login", { method: "POST", body: { token } });
+          showApp();
+          await reloadAll();
+          return;
+        } catch (e) {}
+      }
+      document.getElementById("tokenInput").value = token;
+    })();
+  </script>
+</body>
+</html>
