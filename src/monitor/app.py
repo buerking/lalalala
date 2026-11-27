@@ -85,7 +85,10 @@ def create_app() -> FastAPI:
         html = STATIC_DIR / "monitor.html"
         if not html.is_file():
             raise HTTPException(500, "缺少 monitor.html")
-        return FileResponse(html)
+        return FileResponse(
+            html,
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
 
     @app.get("/playbook")
     @app.get("/playbook/")

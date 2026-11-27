@@ -28,6 +28,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
       padding: 12px 22px;
       border-bottom: 1px solid var(--line);
       background: #121920;
@@ -36,7 +37,7 @@
       z-index: 5;
       gap: 12px;
     }
-    .tabs { display: flex; gap: 6px; margin-left: 12px; }
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; }
     .tabs button.active { background: var(--accent); }
     h1 { font-size: 18px; margin: 0; font-weight: 600; }
     .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -170,6 +171,13 @@
   <div class="wrap" id="panelOps">
     <h2 style="font-size:15px;margin:0 0 10px">站点</h2>
     <div class="row" id="sites"></div>
+
+    <h2 style="font-size:15px;margin:28px 0 8px">乐天店铺规则（已有预设）</h2>
+    <p class="hint">按店铺改地址 / 换卡。数据来自你之前提供的 URL 和规则文件，不是空模板。点「打开编辑」可增删。</p>
+    <div class="toolbar" style="margin-top:10px">
+      <button class="ghost" type="button" id="openSrTab">打开编辑</button>
+    </div>
+    <div id="srOpsList" style="margin-top:10px"></div>
 
     <h2 style="font-size:15px;margin:28px 0 8px">禁售关键词</h2>
     <p class="hint">点词右侧 × 删除；输入后回车添加。白名单：命中关键词后，若标题里同时出现伴生词则放行（例如 剣 + 仮面）。保存后立即对后续拉单生效，无需重启。</p>
@@ -489,6 +497,36 @@
       if (a === "both") return "地址+卡";
       return "只改地址";
     }
+    function renderSrOpsSummary() {
+      const rules = srState.rules || [];
+      const tab = document.getElementById("tabRakuten");
+      if (tab) tab.textContent = rules.length ? ("乐天店铺规则 (" + rules.length + ")") : "乐天店铺规则";
+      const box = document.getElementById("srOpsList");
+      if (!box) return;
+      if (srState._loadError) {
+        box.innerHTML = '<div class="card hint" style="color:var(--bad)">读不到已有规则：' + esc(srState._loadError) + '。请完全退出本程序再开一次，然后强制刷新网页（Ctrl+F5）。</div>';
+        return;
+      }
+      if (!rules.length) {
+        box.innerHTML = '<div class="card hint">文件里还没有 rules。请确认生产机 data/rakuten_ichiba_checkout_rules.json 是否存在。</div>';
+        return;
+      }
+      box.innerHTML = '<table><thead><tr><th>店铺 ID</th><th>动作</th><th>地址</th><th>卡</th><th>ID</th><th>备注</th></tr></thead><tbody>'
+        + rules.map((r) => {
+          const shop = (r.url_contains || []).join(", ");
+          const addr = (srState.addresses && srState.addresses[r.address_id] && srState.addresses[r.address_id].label) || r.address_id || "-";
+          const card = r.action === "address" ? "默认 8828" : (r.card_last4 || "-");
+          return `<tr>
+            <td>${esc(shop)}</td>
+            <td>${esc(actionLabel(r.action))}</td>
+            <td>${esc(r.action === "card" ? "默认本田" : addr)}</td>
+            <td>${esc(card)}</td>
+            <td>${esc(r.id || "")}</td>
+            <td class="hint">${esc(r.note || "")}${r.enabled === false ? "（停用）" : ""}</td>
+          </tr>`;
+        }).join("")
+        + "</tbody></table>";
+    }
     function renderSellerRules() {
       document.getElementById("srEnabled").checked = !!srState.enabled;
       document.getElementById("srRestore").checked = srState.restore_on_normal_order !== false;
@@ -561,6 +599,7 @@
         const c = cards[id] || {};
         return `<span class="chip">${esc(c.label || c.last4 || id)}</span>`;
       }).join("") || '<span class="hint">未配置卡</span>';
+      renderSrOpsSummary();
     }
     function collectSellerRules() {
       const data = Object.assign({}, srState);
@@ -573,12 +612,19 @@
       return data;
     }
     async function loadSellerRules() {
-      const res = await api("/api/rakuten-seller-rules");
-      srState = res.data || srState;
-      if (!Array.isArray(srState.rules)) srState.rules = [];
-      if (!srState.addresses) srState.addresses = {};
-      if (!srState.cards) srState.cards = {};
-      renderSellerRules();
+      try {
+        const res = await api("/api/rakuten-seller-rules");
+        srState = res.data || {};
+        srState._loadError = "";
+        if (!Array.isArray(srState.rules)) srState.rules = [];
+        if (!srState.addresses) srState.addresses = {};
+        if (!srState.cards) srState.cards = {};
+        renderSellerRules();
+      } catch (e) {
+        srState._loadError = e.message || String(e);
+        renderSrOpsSummary();
+        throw e;
+      }
     }
     async function saveSellerRules() {
       try {
@@ -593,8 +639,10 @@
     async function reloadAll() {
       await loadStatus();
       await loadKeywords();
+      try { await loadSellerRules(); } catch (e) { toast(e.message, false); }
     }
 
+    document.getElementById("openSrTab").onclick = () => showTab("rakuten");
     document.getElementById("tabOps").onclick = () => showTab("ops");
     document.getElementById("tabRakuten").onclick = () => showTab("rakuten");
     document.getElementById("tabPlaybook").onclick = () => showTab("playbook");
