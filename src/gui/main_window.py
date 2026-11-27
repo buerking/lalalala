@@ -341,11 +341,23 @@ class MainWindow:
 
             def emit(self, record: logging.LogRecord) -> None:
                 msg = self.format(record)
-                self.text_widget.config(state=tk.NORMAL)
-                self.text_widget.insert(tk.END, msg + "\n")
-                if self.auto_scroll_enabled:
-                    self.text_widget.see(tk.END)
-                self.text_widget.config(state=tk.DISABLED)
+                widget = self.text_widget
+                auto_scroll = self.auto_scroll_enabled
+
+                def apply() -> None:
+                    try:
+                        widget.config(state=tk.NORMAL)
+                        widget.insert(tk.END, msg + "\n")
+                        if auto_scroll:
+                            widget.see(tk.END)
+                        widget.config(state=tk.DISABLED)
+                    except tk.TclError:
+                        pass
+
+                try:
+                    widget.after(0, apply)
+                except Exception:
+                    apply()
 
         fmt = logging.Formatter(
             "%(asctime)s - %(levelname)s - %(message)s",
@@ -670,7 +682,7 @@ class MainWindow:
         if ok:
             messagebox.showinfo(
                 "网页后台",
-                msg + "\n\n同一页里有「监控」和「自动下单流程」。同事请用 ZeroTier 网卡那条地址，不要用 127.0.0.1。",
+                msg + "\n\n同一页：「监控」「乐天店铺规则」「自动下单流程」。同事请用 ZeroTier 网卡那条地址，不要用 127.0.0.1。",
             )
         else:
             messagebox.showerror("网页后台", msg)
@@ -696,7 +708,7 @@ class MainWindow:
             messagebox.showinfo(
                 "网页链接已复制",
                 "已复制（含口令，发给 ZeroTier 同事即可）:\n%s\n\n本机可发现的地址:\n%s\n\n"
-                "同一页：「监控」改关键词/启停，「自动下单流程」改 playbook 站点。\n"
+                "同一页：「监控」改关键词/启停，「乐天店铺规则」按店改地址换卡，「自动下单流程」改 playbook。\n"
                 "生产机需保持本窗口运行。若打不开，检查 Windows 防火墙是否放行 TCP 8790。"
                 % (text, extra),
             )

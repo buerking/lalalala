@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -433,6 +434,115 @@ class SellerRulesBundle:
                 if cre.search(blob) or cre.search(url):
                     return url
         return ""
+
+
+def invalidate_cache() -> None:
+    _cache["bundle"] = None
+    _cache["mtime"] = None
+    _cache["path"] = ""
+
+
+def editor_payload(logger=None) -> Dict[str, Any]:
+    bundle = load_seller_rules(logger=logger)
+    return {
+        "path": bundle.path,
+        "data": dict(bundle.raw or {}),
+        "default_address_id": bundle.default_address_id,
+        "default_card_last4": bundle.default_card_last4,
+        "enabled": bundle.enabled,
+    }
+
+
+def preview_intent(urls: Iterable[str], logger=None) -> Dict[str, Any]:
+    bundle = load_seller_rules(logger=logger)
+    intent = bundle.resolve(urls)
+    addr = intent.address
+    return {
+        "describe": intent.describe(),
+        "change_address": intent.change_address,
+        "change_card": intent.change_card,
+        "address_id": addr.address_id if addr else "",
+        "address_label": addr.label if addr else "",
+        "card_last4": intent.card_last4,
+        "matched_rule_ids": list(intent.matched_rule_ids),
+        "restore": intent.restore,
+        "skipped": intent.skipped,
+        "skip_reason": intent.skip_reason,
+        "warnings": list(intent.warnings),
+    }
+
+
+def save_seller_rules(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """写入 data/rakuten_ichiba_checkout_rules.json 并立刻让后续拉单读到新规则。"""
+    if not isinstance(raw, dict):
+        raise ValueError("规则必须是 JSON 对象")
+    path = ensure_runtime_json()
+    current: Dict[str, Any] = {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            current = loaded
+    except Exception:
+        current = {}
+    out = dict(current)
+    for key in ("enabled", "restore_on_normal_order", "defaults", "addresses", "cards", "rules"):
+        if key in raw:
+            out[key] = raw[key]
+    if "_comment" in raw:
+        out["_comment"] = raw["_comment"]
+    rules = out.get("rules")
+    if not isinstance(rules, list):
+        raise ValueError("rules 必须是数组")
+    cleaned: List[Dict[str, Any]] = []
+    for i, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError("第 %s 条规则格式不对" % (i + 1))
+        action = _norm_action(rule.get("action"))
+        if not action:
+            raise ValueError("第 %s 条规则缺少 action（address / card / both）" % (i + 1))
+        contains = [
+            str(x).strip()
+            for x in (rule.get("url_contains") or [])
+            if str(x).strip()
+        ]
+        regexes = [
+            str(x).strip()
+            for x in (rule.get("url_regex") or [])
+            if str(x).strip()
+        ]
+        if not contains and not regexes:
+            raise ValueError("第 %s 条规则请填写店铺 ID（url_contains）" % (i + 1))
+        row = dict(rule)
+        row["action"] = action
+        row["enabled"] = bool(rule.get("enabled", True))
+        row["url_contains"] = contains
+        if regexes:
+            row["url_regex"] = regexes
+        rid = str(rule.get("id") or "").strip() or (contains[0] if contains else "rule-%s" % (i + 1))
+        row["id"] = rid
+        if action in (ACTION_ADDRESS, ACTION_BOTH):
+            row["address_id"] = str(rule.get("address_id") or "nihonbashi").strip() or "nihonbashi"
+        if action in (ACTION_CARD, ACTION_BOTH):
+            last4 = _norm_last4(rule.get("card_last4"))
+            if not last4:
+                raise ValueError("规则 %s 改卡时必须填 card_last4" % rid)
+            row["card_last4"] = last4
+        note = str(rule.get("note") or "").strip()
+        if note:
+            row["note"] = note
+        elif "note" in row:
+            row.pop("note", None)
+        cleaned.append(row)
+    out["rules"] = cleaned
+    out["enabled"] = bool(out.get("enabled", True))
+    out["restore_on_normal_order"] = bool(out.get("restore_on_normal_order", True))
+    text = json.dumps(out, ensure_ascii=False, indent=2)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    invalidate_cache()
+    return {"path": str(path), "data": out}
 
 
 def load_seller_rules(logger=None) -> SellerRulesBundle:

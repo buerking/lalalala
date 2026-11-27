@@ -18,6 +18,11 @@ from src.order.prohibited_item_guard import (
     keyword_editor_state,
     prohibited_items_from_editor,
 )
+from src.order.rakuten_ichiba_seller_rules import (
+    editor_payload as seller_rules_payload,
+    preview_intent as seller_rules_preview,
+    save_seller_rules,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -25,6 +30,14 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 class KeywordsPayload(BaseModel):
     categories: Dict[str, Any] = Field(default_factory=dict)
     whitelist: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SellerRulesPayload(BaseModel):
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SellerPreviewPayload(BaseModel):
+    urls: Any = Field(default_factory=list)
 
 
 def _cfg() -> Dict[str, Any]:
@@ -148,6 +161,31 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(500, "已写入文件但未能热更新 GUI: %s" % e)
         return {"ok": True, "prohibited_items": merged}
+
+    @app.get("/api/rakuten-seller-rules")
+    def get_seller_rules():
+        return seller_rules_payload()
+
+    @app.put("/api/rakuten-seller-rules")
+    def put_seller_rules(body: SellerRulesPayload):
+        try:
+            saved = save_seller_rules(body.data or {})
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(500, str(e))
+        return {"ok": True, **saved}
+
+    @app.post("/api/rakuten-seller-rules/preview")
+    def preview_seller_rules(body: SellerPreviewPayload):
+        raw = body.urls
+        if isinstance(raw, str):
+            urls = [raw]
+        elif isinstance(raw, list):
+            urls = [str(x) for x in raw]
+        else:
+            urls = []
+        return seller_rules_preview(urls)
 
     _mount_playbook(app)
     return app

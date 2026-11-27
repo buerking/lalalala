@@ -123,6 +123,18 @@
     }
     #panelPlaybook { height: calc(100vh - 64px); }
     #pbFrame { width: 100%; height: 100%; border: 0; background: #0f1419; }
+    select {
+      background: #121920;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+    #panelRakuten label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 4px; }
+    label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+    .rule-id { width: 88px; }
+    .rule-shop { min-width: 140px; }
   </style>
 </head>
 <body>
@@ -141,10 +153,11 @@
   <header>
     <div>
       <h1>jpgoodbuy 后台</h1>
-      <div class="sub" id="headSub">ZeroTier / 局域网 · 监控 · 关键词 · 自动下单流程</div>
+      <div class="sub" id="headSub">ZeroTier / 局域网 · 监控 · 乐天店铺规则 · 自动下单流程</div>
     </div>
     <div class="tabs">
       <button class="ghost active" type="button" id="tabOps">监控</button>
+      <button class="ghost" type="button" id="tabRakuten">乐天店铺规则</button>
       <button class="ghost" type="button" id="tabPlaybook">自动下单流程</button>
     </div>
     <div class="toolbar" id="opsToolbar">
@@ -176,6 +189,67 @@
       <button class="ghost" type="button" id="wlAdd">添加规则</button>
     </div>
   </div>
+  <div class="wrap hidden" id="panelRakuten">
+    <h2 style="font-size:15px;margin:0 0 8px">乐天市场 · 按店铺改地址 / 换卡</h2>
+    <p class="hint">命中店铺 ID（如 <code>renet3</code>）则在确认页改地址或信用卡。未命中则恢复默认本田 + 8828。保存后立即对后续乐天单生效，不必重启。</p>
+    <div class="toolbar" style="margin-top:12px;align-items:center">
+      <label class="check"><input type="checkbox" id="srEnabled" /> 启用规则</label>
+      <label class="check"><input type="checkbox" id="srRestore" /> 普通单恢复默认地址和卡</label>
+      <button type="button" id="saveSr">保存规则</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div class="card">
+        <div class="site-name">默认</div>
+        <div class="meta">无特殊规则时落到这里</div>
+        <label>默认地址</label>
+        <select id="srDefAddr"></select>
+        <label style="display:block;margin-top:8px">默认卡尾号</label>
+        <select id="srDefCard"></select>
+      </div>
+      <div class="card">
+        <div class="site-name">试算</div>
+        <div class="meta">贴商品链接或店铺 ID。针对<strong>已保存</strong>规则试算</div>
+        <div class="add">
+          <input id="srPreviewUrl" placeholder="https://item.rakuten.co.jp/renet3/... 或 renet3" />
+          <button class="ghost" type="button" id="srPreviewBtn">试算</button>
+        </div>
+        <p class="hint" id="srPreviewOut" style="margin-top:10px"></p>
+      </div>
+    </div>
+    <h3 style="font-size:14px;margin:22px 0 8px">店铺规则</h3>
+    <div class="card" style="margin-bottom:12px">
+      <div class="row3" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px">
+        <div><label>规则 ID</label><input id="srNewId" placeholder="可空，默认用店铺 ID" /></div>
+        <div><label>店铺 ID</label><input id="srNewShop" placeholder="renet3" /></div>
+        <div>
+          <label>动作</label>
+          <select id="srNewAction">
+            <option value="address">只改地址</option>
+            <option value="card">只换卡</option>
+            <option value="both">地址+卡</option>
+          </select>
+        </div>
+        <div><label>备注</label><input id="srNewNote" placeholder="可选" /></div>
+      </div>
+      <div class="add" style="margin-top:10px;max-width:720px">
+        <select id="srNewAddr"></select>
+        <select id="srNewCard"></select>
+        <button class="ghost" type="button" id="srAdd">添加规则</button>
+      </div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>启用</th><th>ID</th><th>店铺 ID</th><th>动作</th><th>地址</th><th>卡</th><th>备注</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="srBody"></tbody>
+    </table>
+    <h3 style="font-size:14px;margin:22px 0 8px">地址库（页面匹配用）</h3>
+    <div id="srAddrBox"></div>
+    <h3 style="font-size:14px;margin:22px 0 8px">信用卡尾号</h3>
+    <div id="srCardBox" class="chips"></div>
+  </div>
   <div id="panelPlaybook" class="hidden">
     <iframe id="pbFrame" title="自动下单流程"></iframe>
   </div>
@@ -183,8 +257,15 @@
 
   <script>
     const TOKEN_KEY = "jpgoodbuy_monitor_token";
+    const TAB_IDS = ["ops", "rakuten", "playbook"];
     let token = localStorage.getItem(TOKEN_KEY) || new URLSearchParams(location.search).get("token") || "";
     let kwState = { categories: {}, whitelist: {} };
+    let srState = { enabled: true, restore_on_normal_order: true, defaults: {}, addresses: {}, cards: {}, rules: [] };
+
+    function tabFromHash() {
+      const h = (location.hash || "#ops").replace("#", "");
+      return TAB_IDS.indexOf(h) >= 0 ? h : "ops";
+    }
 
     function toast(msg, ok) {
       const el = document.getElementById("toast");
@@ -211,21 +292,24 @@
     function showApp() {
       document.getElementById("login").classList.add("hidden");
       if (token) localStorage.setItem(TOKEN_KEY, token);
-      showTab(location.hash === "#playbook" ? "playbook" : "ops");
+      showTab(tabFromHash());
     }
 
     function showTab(name) {
-      const ops = name !== "playbook";
-      document.getElementById("panelOps").classList.toggle("hidden", !ops);
-      document.getElementById("panelPlaybook").classList.toggle("hidden", ops);
-      document.getElementById("opsToolbar").classList.toggle("hidden", !ops);
-      document.getElementById("tabOps").classList.toggle("active", ops);
-      document.getElementById("tabPlaybook").classList.toggle("active", !ops);
-      if (!ops) {
+      if (TAB_IDS.indexOf(name) < 0) name = "ops";
+      document.getElementById("panelOps").classList.toggle("hidden", name !== "ops");
+      document.getElementById("panelRakuten").classList.toggle("hidden", name !== "rakuten");
+      document.getElementById("panelPlaybook").classList.toggle("hidden", name !== "playbook");
+      document.getElementById("opsToolbar").classList.toggle("hidden", name !== "ops");
+      document.getElementById("tabOps").classList.toggle("active", name === "ops");
+      document.getElementById("tabRakuten").classList.toggle("active", name === "rakuten");
+      document.getElementById("tabPlaybook").classList.toggle("active", name === "playbook");
+      if (name === "playbook") {
         const fr = document.getElementById("pbFrame");
         if (!fr.getAttribute("src")) fr.src = "/playbook/";
       }
-      const want = ops ? "#ops" : "#playbook";
+      if (name === "rakuten") loadSellerRules().catch((e) => toast(e.message, false));
+      const want = "#" + name;
       if (location.hash !== want) history.replaceState(null, "", want);
     }
 
@@ -382,16 +466,141 @@
       }
     }
 
+    function addrOptions(selected) {
+      const addrs = srState.addresses || {};
+      return Object.keys(addrs).map((id) => {
+        const label = (addrs[id] && addrs[id].label) || id;
+        return `<option value="${esc(id)}" ${id === selected ? "selected" : ""}>${esc(label)}</option>`;
+      }).join("");
+    }
+    function cardOptions(selected) {
+      const cards = srState.cards || {};
+      const keys = Object.keys(cards);
+      const extra = selected && keys.indexOf(String(selected)) < 0 ? [String(selected)] : [];
+      return keys.concat(extra).map((id) => {
+        const spec = cards[id] || {};
+        const last4 = spec.last4 || id;
+        const label = spec.label || last4;
+        return `<option value="${esc(last4)}" ${String(last4) === String(selected) ? "selected" : ""}>${esc(label)}</option>`;
+      }).join("");
+    }
+    function actionLabel(a) {
+      if (a === "card") return "只换卡";
+      if (a === "both") return "地址+卡";
+      return "只改地址";
+    }
+    function renderSellerRules() {
+      document.getElementById("srEnabled").checked = !!srState.enabled;
+      document.getElementById("srRestore").checked = srState.restore_on_normal_order !== false;
+      const def = srState.defaults || {};
+      document.getElementById("srDefAddr").innerHTML = addrOptions(def.address_id || "honda");
+      document.getElementById("srDefCard").innerHTML = cardOptions(def.card_last4 || "8828");
+      document.getElementById("srNewAddr").innerHTML = addrOptions("nihonbashi");
+      document.getElementById("srNewCard").innerHTML = cardOptions("6667");
+      const body = document.getElementById("srBody");
+      const rules = srState.rules || [];
+      if (!rules.length) {
+        body.innerHTML = '<tr><td colspan="8" class="hint">还没有店铺规则。上面填店铺 ID 后点「添加规则」，再点「保存规则」。</td></tr>';
+      } else {
+        body.innerHTML = rules.map((r, i) => {
+          const shop = (r.url_contains || []).join(", ");
+          const act = r.action || "address";
+          return `<tr>
+            <td><input type="checkbox" data-sr="en" data-i="${i}" ${r.enabled === false ? "" : "checked"} /></td>
+            <td><input class="rule-id" data-sr="id" data-i="${i}" value="${esc(r.id || "")}" /></td>
+            <td><input class="rule-shop" data-sr="shop" data-i="${i}" value="${esc(shop)}" /></td>
+            <td>
+              <select data-sr="action" data-i="${i}">
+                <option value="address" ${act === "address" ? "selected" : ""}>只改地址</option>
+                <option value="card" ${act === "card" ? "selected" : ""}>只换卡</option>
+                <option value="both" ${act === "both" ? "selected" : ""}>地址+卡</option>
+              </select>
+            </td>
+            <td><select data-sr="addr" data-i="${i}">${addrOptions(r.address_id || "nihonbashi")}</select></td>
+            <td><select data-sr="card" data-i="${i}">${cardOptions(r.card_last4 || "")}</select></td>
+            <td><input data-sr="note" data-i="${i}" value="${esc(r.note || "")}" /></td>
+            <td><button class="ghost" type="button" data-srdel="${i}">删除</button></td>
+          </tr>`;
+        }).join("");
+      }
+      body.querySelectorAll("[data-sr]").forEach((el) => {
+        const apply = () => {
+          const i = Number(el.getAttribute("data-i"));
+          const rule = srState.rules[i];
+          if (!rule) return;
+          const kind = el.getAttribute("data-sr");
+          if (kind === "en") rule.enabled = !!el.checked;
+          if (kind === "id") rule.id = el.value.trim();
+          if (kind === "shop") rule.url_contains = el.value.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
+          if (kind === "action") rule.action = el.value;
+          if (kind === "addr") rule.address_id = el.value;
+          if (kind === "card") rule.card_last4 = el.value;
+          if (kind === "note") rule.note = el.value.trim();
+        };
+        el.onchange = apply;
+        el.oninput = apply;
+      });
+      body.querySelectorAll("[data-srdel]").forEach((btn) => {
+        btn.onclick = () => {
+          srState.rules.splice(Number(btn.getAttribute("data-srdel")), 1);
+          renderSellerRules();
+        };
+      });
+      const addrBox = document.getElementById("srAddrBox");
+      const addrs = srState.addresses || {};
+      addrBox.innerHTML = Object.keys(addrs).map((id) => {
+        const a = addrs[id] || {};
+        return `<div class="card" style="margin-bottom:8px">
+          <div class="site-name">${esc(a.label || id)} <span class="hint">${esc(id)} · ${esc(a.postal_code || "")}</span></div>
+          <p class="hint">匹配文案：${esc((a.match_texts || []).join(" / "))}</p>
+        </div>`;
+      }).join("") || '<p class="hint">地址库为空</p>';
+      const cardBox = document.getElementById("srCardBox");
+      const cards = srState.cards || {};
+      cardBox.innerHTML = Object.keys(cards).map((id) => {
+        const c = cards[id] || {};
+        return `<span class="chip">${esc(c.label || c.last4 || id)}</span>`;
+      }).join("") || '<span class="hint">未配置卡</span>';
+    }
+    function collectSellerRules() {
+      const data = Object.assign({}, srState);
+      data.enabled = document.getElementById("srEnabled").checked;
+      data.restore_on_normal_order = document.getElementById("srRestore").checked;
+      data.defaults = Object.assign({}, data.defaults || {}, {
+        address_id: document.getElementById("srDefAddr").value,
+        card_last4: document.getElementById("srDefCard").value,
+      });
+      return data;
+    }
+    async function loadSellerRules() {
+      const res = await api("/api/rakuten-seller-rules");
+      srState = res.data || srState;
+      if (!Array.isArray(srState.rules)) srState.rules = [];
+      if (!srState.addresses) srState.addresses = {};
+      if (!srState.cards) srState.cards = {};
+      renderSellerRules();
+    }
+    async function saveSellerRules() {
+      try {
+        await api("/api/rakuten-seller-rules", { method: "PUT", body: { data: collectSellerRules() } });
+        toast("乐天店铺规则已保存，后续订单立即生效");
+        await loadSellerRules();
+      } catch (e) {
+        toast(e.message, false);
+      }
+    }
+
     async function reloadAll() {
       await loadStatus();
       await loadKeywords();
     }
 
     document.getElementById("tabOps").onclick = () => showTab("ops");
+    document.getElementById("tabRakuten").onclick = () => showTab("rakuten");
     document.getElementById("tabPlaybook").onclick = () => showTab("playbook");
     window.addEventListener("hashchange", () => {
       if (document.getElementById("login").classList.contains("hidden")) {
-        showTab(location.hash === "#playbook" ? "playbook" : "ops");
+        showTab(tabFromHash());
       }
     });
     document.getElementById("loginBtn").onclick = login;
@@ -400,6 +609,39 @@
     document.getElementById("saveKw").onclick = saveKeywords;
     document.getElementById("startAllBtn").onclick = () => siteAct("all", "start");
     document.getElementById("stopAllBtn").onclick = () => siteAct("all", "stop");
+    document.getElementById("saveSr").onclick = saveSellerRules;
+    document.getElementById("srAdd").onclick = () => {
+      const shop = document.getElementById("srNewShop").value.trim();
+      if (!shop) { toast("请填店铺 ID", false); return; }
+      const action = document.getElementById("srNewAction").value;
+      const shops = shop.split(/[,，\s]+/).map((x) => x.trim()).filter(Boolean);
+      srState.rules = srState.rules || [];
+      srState.rules.push({
+        id: document.getElementById("srNewId").value.trim() || shops[0],
+        enabled: true,
+        action,
+        address_id: document.getElementById("srNewAddr").value,
+        card_last4: document.getElementById("srNewCard").value,
+        url_contains: shops,
+        note: document.getElementById("srNewNote").value.trim(),
+      });
+      document.getElementById("srNewShop").value = "";
+      document.getElementById("srNewId").value = "";
+      document.getElementById("srNewNote").value = "";
+      renderSellerRules();
+    };
+    document.getElementById("srPreviewBtn").onclick = async () => {
+      const url = document.getElementById("srPreviewUrl").value.trim();
+      const out = document.getElementById("srPreviewOut");
+      if (!url) { out.textContent = "请先填链接或店铺 ID"; return; }
+      try {
+        const r = await api("/api/rakuten-seller-rules/preview", { method: "POST", body: { urls: [url] } });
+        out.textContent = (r.describe || "") + (r.matched_rule_ids && r.matched_rule_ids.length ? " · 命中 " + r.matched_rule_ids.join(",") : "");
+        if (r.warnings && r.warnings.length) out.textContent += " · " + r.warnings.join("；");
+      } catch (e) {
+        out.textContent = e.message;
+      }
+    };
     document.getElementById("wlAdd").onclick = () => {
       const k = document.getElementById("wlKw").value.trim();
       const v = document.getElementById("wlVal").value.trim();

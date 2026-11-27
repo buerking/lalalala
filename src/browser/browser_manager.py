@@ -15,6 +15,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from typing import Dict, Any, Optional, Union
 import logging
 import os
+import re
+import subprocess
 from pathlib import Path
 
 from src.utils.logger import LoggerMixin
@@ -128,6 +130,76 @@ class BrowserManager(LoggerMixin):
                 "chrome version",
             )
         )
+
+    @staticmethod
+    def _major_from_text(text: str) -> Optional[int]:
+        m = re.search(r"(\d+)", str(text or ""))
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _win_product_version(path: Path) -> str:
+        try:
+            lit = str(path).replace("'", "''")
+            r = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-Item -LiteralPath '%s').VersionInfo.ProductVersion" % lit,
+                ],
+                capture_output=True,
+                timeout=8,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            return (r.stdout or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _driver_version_text(path: Path) -> str:
+        try:
+            r = subprocess.run(
+                [str(path), "--version"],
+                capture_output=True,
+                timeout=8,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            return ((r.stdout or "") + " " + (r.stderr or "")).strip()
+        except Exception:
+            return ""
+
+    def _skip_mismatched_pinned_driver(
+        self, driver_path: Optional[Path], browser_binary: str
+    ) -> Optional[Path]:
+        """固定驱动大版本对不上时直接跳过，避免先用 105 开一次会话再失败卡住。"""
+        if not driver_path:
+            return None
+        auto_match = self.browser_config.get("driver_auto_match", True)
+        if auto_match is False:
+            return driver_path
+        chrome_maj = self._major_from_text(self._win_product_version(Path(browser_binary)))
+        drv_maj = self._major_from_text(self._driver_version_text(driver_path))
+        if chrome_maj and drv_maj and chrome_maj != drv_maj:
+            self.logger.warning(
+                "跳过固定驱动 %s（驱动大版本 %s，浏览器 %s）。"
+                "将由 Selenium Manager 匹配当前 Chrome，首次可能下载几十秒，不是启动暂停。"
+                "建议把 tools/chromedriver.exe 换成与 Chrome %s 同大版本。",
+                driver_path,
+                drv_maj,
+                chrome_maj,
+                chrome_maj,
+            )
+            return None
+        return driver_path
 
     def _create_webdriver(
         self,
@@ -275,8 +347,14 @@ class BrowserManager(LoggerMixin):
                 self.logger.warning("未配置用户数据目录，登录状态将不会保持")
                 self.logger.warning("建议在config.yaml中配置 browser.user_data_dir")
 
-            driver_path = self._get_driver_binary_path()
+            driver_path = self._skip_mismatched_pinned_driver(
+                self._get_driver_binary_path(), binary
+            )
             self.logger.info("启动浏览器 engine=%s binary=%s", engine, binary)
+            if driver_path is None:
+                self.logger.info(
+                    "正在匹配当前浏览器的驱动（Selenium Manager，可能下载，请等待）…"
+                )
             try:
                 self.driver = self._create_webdriver(engine, options, driver_path)
             except Exception as e:
@@ -287,8 +365,10 @@ class BrowserManager(LoggerMixin):
                     and self._is_driver_version_mismatch(e)
                 ):
                     self.logger.warning(
-                        "固定驱动与浏览器版本不一致，改由 Selenium Manager 自动匹配当前浏览器: %s",
-                        e,
+                        "固定驱动与浏览器版本不一致，改由 Selenium Manager 自动匹配（不再打印完整堆栈）"
+                    )
+                    self.logger.info(
+                        "正在匹配当前浏览器的驱动（Selenium Manager，可能下载，请等待）…"
                     )
                     self.driver = self._create_webdriver(engine, options, None)
                 else:
